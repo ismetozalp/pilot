@@ -498,6 +498,42 @@
         return (i === -1 || i + 1 >= argv.length) ? '' : argv[i + 1];
     }
 
+    // Redact credentials in argv by replacing secret tokens with env var references.
+    function redactArgv(argv, id) {
+        const secret = id === 'tls-duckdns';
+        if (!secret || argv.length === 0) return argv;
+        // DuckDNS token is in the URL: ...token=TOKEN... Replace with ${DUCKDNS_TOKEN}
+        const redacted = [];
+        for (let i = 0; i < argv.length; i++) {
+            const arg = argv[i];
+            if (typeof arg === 'string' && arg.indexOf('token=') !== -1) {
+                redacted.push(arg.replace(/token=[^&]*/, 'token=${DUCKDNS_TOKEN}'));
+            } else {
+                redacted.push(arg);
+            }
+        }
+        return redacted;
+    }
+
+    // Find a collision-free heredoc delimiter by checking content for collisions.
+    function findDelimiter(content) {
+        let num = 0;
+        while (true) {
+            const delim = 'PILOT_EOF_' + num;
+            const contentStr = String(content);
+            const lines = contentStr.split('\n');
+            let collides = false;
+            for (let i = 0; i < lines.length; i++) {
+                if (lines[i] === delim) {
+                    collides = true;
+                    break;
+                }
+            }
+            if (!collides) return delim;
+            num++;
+        }
+    }
+
     function manualScript(plan) {
         assertPlan(plan, 'manualScript');
         const warnings = Array.isArray(plan.warnings) ? plan.warnings : [];
@@ -513,24 +549,43 @@
             out.push('# [' + (i + 1) + '/' + n + '] ' + s.title);
             out.push('# ' + s.why);
             if (s.secret) out.push('# SECRET: this step carries a credential - do not paste it into a shared log.');
+
+            // Render check probes as real guards: if ! check; then cmd; fi
             if (s.check) {
-                out.push('# Already done if this exits ' + (s.check.expect === 'zero' ? 'zero' : 'non-zero') +
-                    ': ' + argvLine(s.check.argv));
+                const checkLine = argvLine(s.check.argv);
+                const expectZero = s.check.expect === 'zero';
+                const condition = expectZero ? '! ' : '';
+                out.push('if ' + condition + checkLine + ' >/dev/null 2>&1; then');
             }
+
             if (s.write) {
                 out.push('install -d -m 0755 ' + q(dirOf(s.write.path)));
-                out.push('cat > ' + q(s.write.path) + " <<'PILOT_EOF'");
+                const delim = findDelimiter(s.write.content);
+                out.push('cat > ' + q(s.write.path) + " <<'" + delim + "'");
                 out.push(String(s.write.content).replace(/\n$/, ''));
-                out.push('PILOT_EOF');
+                out.push(delim);
                 out.push('chmod ' + q(s.write.mode) + ' ' + q(s.write.path));
                 out.push('chown ' + q(s.write.owner) + ' ' + q(s.write.path));
             } else {
-                out.push(argvLine(s.argv));
+                const argv = s.secret ? redactArgv(s.argv, s.id) : s.argv;
+                out.push(argvLine(argv));
+                if (s.secret && s.id === 'tls-duckdns') {
+                    out.push('# Set DUCKDNS_TOKEN before running this script: export DUCKDNS_TOKEN=your-actual-token');
+                }
             }
+
             if (s.sha256) {
                 out.push("printf '%s  %s\\n' " + q(s.sha256) + ' ' + q(destOf(s.argv)) + ' | sha256sum -c -');
             }
+
+            // Close the check guard if present
+            if (s.check) {
+                out.push('else');
+                out.push('echo "skip: ' + s.id + ' (already satisfied)"');
+                out.push('fi');
+            }
         }
+        if (n > 0) out.push('');  // Blank line at end only if there are steps
         out.push('');
         return out.join('\n');
     }

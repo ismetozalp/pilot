@@ -78,22 +78,23 @@ test('a secret step is flagged so it is never pasted into a shared log', () => {
     assert.ok(out.indexOf('# SECRET: this step carries a credential - do not paste it into a shared log.\n') !== -1);
 });
 
-test('an idempotency probe is rendered as a skip hint, not as an executed command', () => {
+test('an idempotency check is rendered as a real guard that skips the step if satisfied', () => {
     const out = P.manualScript(P.build(DET_ADOPT, CH_LOCAL));
-    assert.ok(out.indexOf('# Already done if this exits zero: id -u rustdesk-api\n') !== -1);
-    const probe = out.split('\n').filter((l) => l === 'id -u rustdesk-api');
-    assert.deepEqual(probe, [], 'the probe itself is never emitted as a command');
+    assert.ok(out.indexOf('if ! id -u rustdesk-api >/dev/null 2>&1; then\n') !== -1, 'check condition');
+    assert.ok(out.indexOf("echo \"skip: install-user (already satisfied)\"\n") !== -1, 'skip message');
+    assert.ok(out.indexOf('fi\n') !== -1, 'guard closes with fi');
 });
 
 test('a write step becomes a quoted heredoc plus chmod and chown', () => {
     const plan = P.build(DET_ADOPT, CH_LOCAL);
     const cfg = plan.steps.filter((s) => s.id === 'configure')[0];
     const out = P.manualScript(plan);
-    assert.ok(out.indexOf("cat > /opt/rustdesk-api/conf/config.yaml <<'PILOT_EOF'\n") !== -1);
-    assert.ok(out.indexOf('\nPILOT_EOF\nchmod 0640 /opt/rustdesk-api/conf/config.yaml\n') !== -1);
+    // Delimiter is quoted with nonce to avoid collisions
+    assert.ok(out.indexOf("cat > /opt/rustdesk-api/conf/config.yaml <<'PILOT_EOF_0'\n") !== -1);
+    assert.ok(out.indexOf('\nPILOT_EOF_0\nchmod 0640 /opt/rustdesk-api/conf/config.yaml\n') !== -1);
     assert.ok(out.indexOf('\nchown rustdesk-api:rustdesk-api /opt/rustdesk-api/conf/config.yaml\n') !== -1);
     // The content is reproduced verbatim, with no trailing blank line inside the heredoc.
-    assert.ok(out.indexOf('\n' + cfg.write.content.replace(/\n$/, '') + '\nPILOT_EOF\n') !== -1);
+    assert.ok(out.indexOf('\n' + cfg.write.content.replace(/\n$/, '') + '\nPILOT_EOF_0\n') !== -1);
     // The heredoc delimiter is quoted, so nothing inside is expanded by the shell.
     assert.equal(out.indexOf('<<PILOT_EOF'), -1);
 });
@@ -101,7 +102,7 @@ test('a write step becomes a quoted heredoc plus chmod and chown', () => {
 test('a write step creates its parent directory first', () => {
     const out = P.manualScript(P.build(DET_ADOPT, CH_LOCAL));
     const lines = out.split('\n');
-    const i = lines.indexOf("cat > /etc/systemd/system/rustdesk-api.service <<'PILOT_EOF'");
+    const i = lines.findIndex((l) => l.indexOf("cat > /etc/systemd/system/rustdesk-api.service <<'PILOT_EOF") === 0);
     assert.ok(i > 0);
     assert.equal(lines[i - 1], 'install -d -m 0755 /etc/systemd/system');
 });
@@ -149,4 +150,56 @@ test('manualScript does not mutate the plan it renders', () => {
     const copy = JSON.parse(JSON.stringify(plan));
     P.manualScript(plan);
     assert.deepEqual(plan, copy);
+});
+
+test('a write step with delimiter-collision content is handled safely (delimiter nonce added)', () => {
+    const out = P.manualScript(rawPlan([
+        rawStep({ id: 'w', argv: [], write: { path: '/test', mode: '0600', owner: 'root:root',
+            content: 'line1\nPILOT_EOF_0\nline3\n' } })
+    ]));
+    // Content must be present verbatim
+    assert.ok(out.indexOf('line1\nPILOT_EOF_0\nline3') !== -1, 'content preserved');
+    // Delimiter must be collision-free (PILOT_EOF_1 when PILOT_EOF_0 is in content)
+    assert.ok(out.indexOf("<<'PILOT_EOF_1'") !== -1 || out.indexOf("<<'PILOT_EOF_2'") !== -1, 'delimiter has nonce');
+    // Ensure PILOT_EOF_0 without nonce is not used as delimiter
+    assert.equal(out.indexOf("<<'PILOT_EOF'"), -1, 'plain PILOT_EOF not used as delimiter when collision exists');
+});
+
+test('a write step with dangerous content ($(...), backticks, $VAR) is quoted safely in heredoc', () => {
+    const out = P.manualScript(rawPlan([
+        rawStep({ id: 'w', argv: [], write: { path: '/test', mode: '0600', owner: 'root:root',
+            content: '#!/bin/sh\necho "$(touch /tmp/PWNED)"\necho `id`\necho $HOME\n' } })
+    ]));
+    // Content must appear as-is (no command execution possible)
+    assert.ok(out.indexOf('$(touch /tmp/PWNED)') !== -1);
+    assert.ok(out.indexOf('`id`') !== -1);
+    assert.ok(out.indexOf('$HOME') !== -1);
+    // Delimiter is quoted, so shell does not expand anything inside
+    assert.ok(out.indexOf("<<'PILOT_EOF") !== -1, 'delimiter is quoted');
+});
+
+test('a secret DuckDNS step redacts the token, never emitting it in cleartext', () => {
+    // DuckDNS step has secret: true and the token in argv
+    const out = P.manualScript(rawPlan([
+        rawStep({ id: 'tls-duckdns', argv: ['curl', '-fsS', 'https://www.duckdns.org/update?domains=myhost&token=SECRET123ABC&ip='], secret: true })
+    ]));
+    // The literal token must NOT appear anywhere
+    assert.equal(out.indexOf('SECRET123ABC'), -1, 'literal token does not appear');
+    // Placeholder must be present
+    assert.ok(out.indexOf('${DUCKDNS_TOKEN}') !== -1, 'placeholder present');
+    // Env var instruction must be present
+    assert.ok(out.indexOf('DUCKDNS_TOKEN=') !== -1, 'env var instruction present');
+});
+
+test('an idempotency-checked step is truly skipped on re-run (resumable script)', () => {
+    const plan = rawPlan([
+        rawStep({ id: 'user', argv: ['useradd', 'testuser'], check: { argv: ['id', '-u', 'testuser'], expect: 'zero' } })
+    ]);
+    const out = P.manualScript(plan);
+    // First run: check fails (user does not exist), so useradd runs
+    // Second run: check passes (user exists), so skip message prints instead
+    assert.ok(out.indexOf('if ! id -u testuser >/dev/null 2>&1; then') !== -1);
+    assert.ok(out.indexOf('useradd testuser') !== -1);
+    assert.ok(out.indexOf("echo \"skip: user (already satisfied)\"") !== -1);
+    assert.ok(out.indexOf('fi') !== -1);
 });
