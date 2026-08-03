@@ -97,6 +97,30 @@ test('id and id_like are lowercased so the family table cannot be case-dodged', 
     assert.equal(OT.family(r), 'fedora');
 });
 
+test('CRLF line endings do not produce trailing carriage returns in values', () => {
+    const r = OT.parseOsRelease('ID=fedora\r\nVERSION_ID="42"\r\nPRETTY_NAME="Fedora 42"\r\n');
+    assert.equal(r.id, 'fedora');
+    assert.equal(r.version_id, '42');
+    assert.equal(r.pretty_name, 'Fedora 42');
+    assert.equal(/\r/.test(r.id), false, 'id should not contain \\r');
+    assert.equal(/\r/.test(r.version_id), false, 'version_id should not contain \\r');
+    assert.equal(/\r/.test(r.pretty_name), false, 'pretty_name should not contain \\r');
+});
+
+test('embedded equals signs inside values are preserved, not treated as separators', () => {
+    const r = OT.parseOsRelease('PRETTY_NAME="a=b=c"\nVERSION_ID=x=y=z\nID_LIKE="k1=v1 k2=v2"\n');
+    assert.equal(r.pretty_name, 'a=b=c');
+    assert.equal(r.version_id, 'x=y=z');
+    assert.equal(r.id_like, 'k1=v1 k2=v2');
+});
+
+test('non-ASCII and unicode characters in values round-trip untouched', () => {
+    const r = OT.parseOsRelease('ID=debian\nPRETTY_NAME="日本語 Ünïcödé Français"\nVERSION_ID="12.5"\n');
+    assert.equal(r.id, 'debian');
+    assert.equal(r.pretty_name, '日本語 Ünïcödé Français');
+    assert.equal(r.version_id, '12.5');
+});
+
 // --- family ---------------------------------------------------------------
 
 test('family falls back to ID_LIKE when ID is unknown', () => {
