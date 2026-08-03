@@ -166,9 +166,14 @@ test('installHbbs true against an existing hbbs adopts and warns instead of rein
 // This decision is independent of hbbs's: detection.api drives it, and there is
 // no choices flag for it at all — the task brief's "same for the API server"
 // requirement, which the original hand-written brief implementation omitted.
+//
+// detection.api's shape is PINNED by the --detect task (task-13-brief.md:95,205):
+// exactly { version, port, install }, install being 'binary' or 'unknown' (the
+// API server is never package-installed, so 'deb' is not a legal value here).
+// There is no `dir` field — every fixture below uses the real shape.
 
 test('detection.api present adopts the API server: no fetch/install/configure, no restart', () => {
-    const plan = P.build(detAdopt({ api: { dir: '/opt/rustdesk-api' } }), choices());
+    const plan = P.build(detAdopt({ api: { version: '2.7', port: 21114, install: 'binary' } }), choices());
     const ids = P.stepIds(plan);
     assert.ok(ids.indexOf('adopt-api') !== -1);
     for (const id of ['fetch-api', 'install-dir', 'install-user', 'install', 'install-data',
@@ -177,6 +182,17 @@ test('detection.api present adopts the API server: no fetch/install/configure, n
     for (const s of plan.steps) assert.ok(s.argv.join(' ').indexOf('restart') === -1, s.id);
     assert.equal(byId(plan, 'adopt-api').mutating, false);
     assert.ok(plan.warnings.some((w) => w.indexOf('API server is already present') !== -1), plan.warnings.join('|'));
+});
+
+test('an install:"binary" adoption probes the systemd unit; install:"unknown" probes the process', () => {
+    const bin = P.build(detAdopt({ api: { version: '2.7', port: 21114, install: 'binary' } }), choices());
+    assert.deepEqual(byId(bin, 'adopt-api').argv, ['systemctl', 'is-active', 'rustdesk-api.service']);
+    // 'unknown' is only reachable via a corrupted/hostile detection line in
+    // practice (the real detect script always emits 'binary' when api_present),
+    // but the plan must not assume a Pilot-named systemd unit exists for it.
+    const unknown = P.build(detAdopt({ api: { version: '2.7', port: 21114, install: 'unknown' } }), choices());
+    assert.deepEqual(byId(unknown, 'adopt-api').argv, ['pgrep', '-f', 'apimain']);
+    assert.ok(byId(unknown, 'adopt-api').argv.join(' ').indexOf('systemctl') === -1);
 });
 
 test('detection.api absent installs the API server, independent of the hbbs decision', () => {
@@ -195,11 +211,50 @@ test('hbbs install + API adopt (or the reverse) both work: the two decisions are
     assert.ok(P.stepIds(bothInstall).indexOf('install-hbbs-fetch') !== -1);
     assert.ok(P.stepIds(bothInstall).indexOf('fetch-api') !== -1);
 
-    const hbbsInstallApiAdopt = P.build(detFresh({ api: { dir: '/opt/rustdesk-api' } }), choices({ installHbbs: true }));
+    const hbbsInstallApiAdopt = P.build(detFresh({ api: { version: '2.7', port: 21114, install: 'binary' } }),
+        choices({ installHbbs: true }));
     const ids = P.stepIds(hbbsInstallApiAdopt);
     assert.ok(ids.indexOf('install-hbbs-fetch') !== -1);
     assert.ok(ids.indexOf('adopt-api') !== -1);
     assert.ok(ids.indexOf('fetch-api') === -1);
+});
+
+// --- regression: adopting must use the REAL port, never the wizard default ---
+//
+// This is the exact defect a reviewer found in the first version of this task:
+// the verify step (and the firewall rule, and the Caddyfile upstream) used
+// choices.apiPort unconditionally, so adopting a server that is actually
+// listening on a different port than the wizard's default silently probed,
+// firewalled and proxied the WRONG port. det.api.port must win whenever the
+// API server is adopted; choices.apiPort only applies to a fresh install.
+
+test('REGRESSION: adopting an API server on a non-default port targets det.api.port everywhere, not choices.apiPort', () => {
+    const plan = P.build(detAdopt({ api: { version: '2.7', port: 28114, install: 'binary' } }),
+        choices({ apiPort: 21114 })); // wizard default left untouched
+    assert.ok(byId(plan, 'verify').argv.join(' ').indexOf('127.0.0.1:28114') !== -1,
+        'verify must probe the port the adopted server actually listens on');
+    assert.equal(byId(plan, 'verify').argv.join(' ').indexOf('21114'), -1,
+        'verify must not probe choices.apiPort when adopting');
+});
+
+test('REGRESSION: adopting on a non-default port also drives the firewall rule and the Caddyfile upstream', () => {
+    const fw = P.build(detAdopt({ api: { version: '2.7', port: 28114, install: 'binary' }, firewall: 'ufw' }),
+        choices({ apiPort: 21114, openFirewall: true }));
+    assert.ok(byId(fw, 'fw-ufw-28114-tcp'), 'the firewall must open the port the adopted server is really on');
+    assert.equal(byId(fw, 'fw-ufw-21114-tcp'), null, 'the firewall must not open the unused wizard default');
+
+    const tls = P.build(detAdopt({ api: { version: '2.7', port: 28114, install: 'binary' } }),
+        choices({ apiPort: 21114, tlsTier: 'own', domain: 'rd.example.com' }));
+    assert.ok(byId(tls, 'tls-caddyfile').write.content.indexOf('127.0.0.1:28114') !== -1,
+        'the Caddyfile must proxy to the port the adopted server is really on');
+    assert.equal(byId(tls, 'tls-caddyfile').write.content.indexOf('127.0.0.1:21114'), -1,
+        'the Caddyfile must not proxy to the unused wizard default');
+});
+
+test('a fresh install still uses choices.apiPort — there is no det.api.port to defer to', () => {
+    const plan = P.build(detFresh({ api: null }), choices({ installHbbs: true, apiPort: 28114 }));
+    assert.ok(byId(plan, 'verify').argv.join(' ').indexOf('127.0.0.1:28114') !== -1);
+    assert.ok(byId(plan, 'configure').write.content.indexOf('api-addr: 0.0.0.0:28114') !== -1);
 });
 
 // -------------------------------------------------------------- C14 shape
@@ -538,10 +593,47 @@ test('a traversing or relative hbbs data_dir is rejected', () => {
     }
 });
 
-test('a traversing or relative detection.api dir is rejected the same way', () => {
-    for (const p of ['../../etc', '/opt/../../etc/shadow', 'opt/rustdesk-api', '/opt\x00/x']) {
-        throwsKind(() => P.build(detAdopt({ api: { dir: p } }), choices()), 'GENERIC');
+test('detection.api has no dir field: an invented dir is silently ignored, never read', () => {
+    // Pinned shape is exactly {version, port, install} (task-13-brief.md:95) —
+    // there is nowhere left in this module for a `dir` key to reach, since
+    // adopt-api's install-pipeline is skipped entirely and no other step reads
+    // detection.api.dir. A stray dir must not cause a path-traversal rejection
+    // (there is nothing to validate) and must not appear anywhere in the plan.
+    const plan = P.build(detAdopt({ api: { version: '2.7', port: 21114, install: 'binary',
+        dir: '../../etc/shadow' } }), choices());
+    assert.ok(P.stepIds(plan).indexOf('adopt-api') !== -1);
+    for (const s of plan.steps) assert.equal(JSON.stringify(s).indexOf('etc/shadow'), -1, s.id);
+});
+
+test('detection.api.install is constrained to the pinned enum: only "binary" survives, else "unknown"', () => {
+    for (const bad of ['docker', 'deb', 'rpm', '', null, 42, {}]) {
+        const plan = P.build(detAdopt({ api: { version: '2.7', port: 21114, install: bad } }), choices());
+        assert.deepEqual(byId(plan, 'adopt-api').argv, ['pgrep', '-f', 'apimain'], JSON.stringify(bad));
     }
+});
+
+test('detection.api.port falls back to the same default the detect script uses when unusable', () => {
+    for (const bad of [0, -1, 65536, 1.5, 'not-a-number', null, undefined, NaN]) {
+        const plan = P.build(detAdopt({ api: { version: '2.7', port: bad, install: 'binary' } }), choices());
+        assert.ok(byId(plan, 'verify').argv.join(' ').indexOf('127.0.0.1:21114') !== -1, JSON.stringify(bad));
+    }
+});
+
+test('detection.hbbs.install is constrained to the pinned enum: "deb"/"binary" survive, else "unknown"', () => {
+    // Confirms provision-plan reads only the pinned hbbs fields (version, install,
+    // ports, pubkey, data_dir) and enforces the same install enum the --detect
+    // task's own parser does, rather than passing an arbitrary string through.
+    for (const good of ['deb', 'binary']) {
+        const plan = P.build(detAdopt({ hbbs: { version: '1.1.16', install: good, ports: [],
+            pubkey: 'K', data_dir: '/var/lib/rustdesk-server' } }), choices());
+        assert.ok(plan.steps.length > 0, good);
+    }
+    // 'unknown' install is not otherwise observable from provision-plan's output
+    // (adopt-hbbs's argv does not depend on it), so this only pins that a bogus
+    // value does not throw or otherwise break the plan.
+    const plan = P.build(detAdopt({ hbbs: { version: '1', install: 'rpm', ports: [],
+        pubkey: 'K', data_dir: '/var/lib/rustdesk-server' } }), choices());
+    assert.ok(P.stepIds(plan).indexOf('adopt-hbbs') !== -1);
 });
 
 // -------------------------------------------------------------- toEnvelope

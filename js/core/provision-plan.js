@@ -112,13 +112,24 @@
         if (isObj(d.hbbs)) {
             // An empty data_dir behaves exactly like a missing one — never '//'.
             const dir = cleanAbsDir(d.hbbs.data_dir, HBBS_DATA);
-            hbbs = { version: str(d.hbbs.version), install: str(d.hbbs.install) || 'unknown',
+            // Pinned enum (task-13 --detect contract): install is 'deb'|'binary',
+            // anything else — including a corrupted/hostile detection line — is
+            // 'unknown', exactly like the detect script's own normalization.
+            const hbbsInstall = ['deb', 'binary'].indexOf(d.hbbs.install) === -1 ? 'unknown' : d.hbbs.install;
+            hbbs = { version: str(d.hbbs.version) || 'unknown', install: hbbsInstall,
                 ports: Array.isArray(d.hbbs.ports) ? d.hbbs.ports.filter(isPort) : [],
                 pubkey: str(d.hbbs.pubkey), dataDir: dir };
         }
+        // Pinned shape (task-13 --detect contract, task-13-brief.md:95/205):
+        // detection.api is exactly { version, port, install } — there is no
+        // `dir`. install is 'binary' or 'unknown' (never 'deb': the API server
+        // is never package-installed); port falls back to the same default the
+        // detect script itself uses when its own probe cannot read one.
         let api = null;
         if (isObj(d.api)) {
-            api = { dir: cleanAbsDir(d.api.dir, API_DIR) };
+            const apiInstall = d.api.install === 'binary' ? 'binary' : 'unknown';
+            api = { version: str(d.api.version) || 'unknown', install: apiInstall,
+                port: isPort(d.api.port) ? d.api.port : Ports.API_DEFAULT };
         }
 
         // The public IP is used both as a DNS pre-flight input (tls.js validates
@@ -295,6 +306,13 @@
 
         // ---- API server: adopt vs install, decided by detection alone -------
         const doInstallApi = !det.api;
+        // Precedence: when ADOPTING, the port that matters is the one the
+        // already-running server actually listens on (det.api.port) — never the
+        // wizard's choices.apiPort, which is only a fresh-install choice and may
+        // not match what is really there. Everything downstream that talks to
+        // the live API server (the firewall rule, the Caddyfile upstream, the
+        // health check) must use this effective port, not ch.apiPort directly.
+        const apiPort = det.api ? det.api.port : ch.apiPort;
         if (doInstallApi) {
             const tgz = CACHE + '/' + det.apiAsset.name;
             steps.push(step({ id: 'fetch-api', title: 'Download the API server ' + OsTarget.API_VERSION + ' (' + det.arch + ')',
@@ -333,14 +351,26 @@
                 why: 'enable --now starts the service and survives a reboot; it does not restart an already-running service.',
                 argv: ['systemctl', 'enable', '--now', 'rustdesk-api.service'] }));
         } else {
+            // detection.api.install is 'binary' (found at the same /opt/rustdesk-api
+            // layout Pilot itself installs to — the detect script's only positive
+            // signal) or 'unknown' (present, but not established as a Pilot-shaped
+            // binary install — e.g. a corrupted detection line). Only the 'binary'
+            // case is a fair bet that a rustdesk-api.service systemd unit exists;
+            // for 'unknown' we check the running process directly instead of
+            // assuming a unit name for software Pilot never named.
             steps.push(step({ id: 'adopt-api', title: 'Adopt the existing RustDesk API server', mutating: false,
                 why: 'The API server is already installed; Pilot leaves its binary, config and database untouched.',
-                argv: ['systemctl', 'is-active', 'rustdesk-api.service'] }));
+                argv: det.api.install === 'binary'
+                    ? ['systemctl', 'is-active', 'rustdesk-api.service']
+                    : ['pgrep', '-f', 'apimain'] }));
         }
 
         // ---- host firewall: splice PilotFirewall's Steps verbatim (RULE 1) --
         if (ch.openFirewall) {
-            const reqs = Ports.required(ch);
+            // Ports.required() must open the EFFECTIVE api port (see apiPort
+            // above), not blindly ch.apiPort — adopting a server on a different
+            // port than the wizard default must not open the wrong one.
+            const reqs = Ports.required(Object.assign({}, ch, { apiPort: apiPort }));
             if (det.firewall === 'none') {
                 warnings.push('FIREWALL_UNSUPPORTED: ' + Firewall.warnings('none', reqs)[0]);
             } else {
@@ -372,16 +402,17 @@
             steps.push(step({ id: 'tls-caddyfile', title: 'Write ' + Tls.CADDYFILE_PATH, mutating: true,
                 why: 'One site block proxies the API and both websocket paths, so the web client reaches everything over 443.',
                 write: { path: Tls.CADDYFILE_PATH, mode: Tls.CADDYFILE_MODE, owner: Tls.CADDYFILE_OWNER,
-                    content: Tls.caddyfile({ tier: ch.tlsTier, host: domain, apiPort: ch.apiPort }) } }));
+                    content: Tls.caddyfile({ tier: ch.tlsTier, host: domain, apiPort: apiPort }) } }));
             steps.push(step({ id: 'tls-reload', title: 'Enable Caddy and load the new site', mutating: true,
                 why: 'enable --now applies the new Caddyfile whether or not Caddy was already running.',
                 argv: ['systemctl', 'enable', '--now', 'caddy.service'] }));
         }
 
         steps.push(step({ id: 'verify', title: 'Wait for the API server to answer', mutating: false,
-            why: 'The Swagger document is served only because Pilot writes show-swagger: 1, so this proves both the service and the generated config.',
+            why: 'The Swagger document is served only because Pilot writes show-swagger: 1, so this proves both the service and the generated config. ' +
+                'Probes the port the server is actually on: the already-running port when adopted, the chosen port when freshly installed.',
             argv: ['curl', '-fsS', '--retry', '10', '--retry-delay', '2', '--retry-connrefused', '--max-time', '60',
-                'http://127.0.0.1:' + ch.apiPort + '/admin/swagger/doc.json'] }));
+                'http://127.0.0.1:' + apiPort + '/admin/swagger/doc.json'] }));
         steps.push(step({ id: 'verify-admin', title: 'Capture the generated admin password', mutating: false, secret: true,
             why: 'The API server prints its generated admin password once, into the journal.',
             argv: ['journalctl', '-u', 'rustdesk-api.service', '--no-pager', '-n', '200'] }));
