@@ -9,3 +9,6 @@ docs/
 
 # Build artifact from `make zip`.
 /pilot-*.zip
+
+# Screenshots written by tests/e2e.mjs's shot().
+/tests/e2e-*.png
