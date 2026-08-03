@@ -82,9 +82,32 @@
         for (let i = 1; i <= 4; i++)
             if (Number(m[i]) > 255)
                 throw bad('opts.proxySource is not an IPv4 address or CIDR: ' + label(raw));
-        if (m[5] !== undefined && Number(m[5]) > 32)
+        const prefix = m[5] !== undefined ? Number(m[5]) : 32;
+        if (prefix > 32)
             throw bad('opts.proxySource is not an IPv4 address or CIDR: ' + label(raw));
-        return s;
+
+        // Semantic validation: reject anything broader than /8, and check that it is
+        // loopback (127.0.0.0/8) or private (10/8, 172.16/12, 192.168/16).
+        if (prefix < 8)
+            throw bad('opts.proxySource must be loopback or private RFC1918 (not broader ' +
+                'than /8, not public), got ' + label(raw));
+
+        const a = Number(m[1]);
+        const b = Number(m[2]);
+        const c = Number(m[3]);
+        const d = Number(m[4]);
+
+        // 127.0.0.0/8: loopback
+        if (a === 127) return s;
+        // 10.0.0.0/8: private
+        if (a === 10) return s;
+        // 172.16.0.0/12: private
+        if (a === 172 && b >= 16 && b <= 31) return s;
+        // 192.168.0.0/16: private
+        if (a === 192 && b === 168) return s;
+
+        throw bad('opts.proxySource must be loopback or private RFC1918 (not public), ' +
+            'got ' + label(raw));
     }
 
     function step(id, title, why, argv, write, check) {

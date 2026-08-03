@@ -264,6 +264,33 @@ test('proxySource rejects anything that is not an IPv4 address or CIDR', () => {
     assert.doesNotThrow(() => F.rules('ufw', reqs, { proxySource: null }));
 });
 
+test('proxySource must be loopback or private RFC1918, rejecting public and overly broad ranges', () => {
+    const reqs = [{ port: 21118, proto: 'tcp', scope: 'host', restrictTo: 'proxy' }];
+    // These must be rejected (semantic): public addresses, overly broad prefixes, anything not loopback/private.
+    // Note: IPv6 is caught at syntax, not semantics, so not included here.
+    const reject = ['0.0.0.0/0', '0.0.0.0/1', '8.8.8.8', '1.2.3.0/24',
+        '200.0.0.0/8', '8.8.8.0/24', '44.0.0.0/8'];
+    for (const v of reject) {
+        assert.throws(() => F.rules('ufw', reqs, { proxySource: v }), (e) =>
+            e.kind === 'GENERIC' && /private.*RFC1918|loopback/.test(e.message), v);
+    }
+    // These must be accepted: loopback and private ranges.
+    const accept = ['127.0.0.1', '127.0.0.0/8', '127.255.255.255', '10.0.0.5',
+        '10.0.0.0/8', '172.16.0.1', '172.31.255.255', '192.168.1.10', '192.168.0.0/16'];
+    for (const v of accept) {
+        assert.doesNotThrow(() => F.rules('ufw', reqs, { proxySource: v }), v);
+        assert.doesNotThrow(() => F.nftConfig(reqs, { proxySource: v }), v);
+    }
+});
+
+test('proxySource semantic validation does not affect the default path', () => {
+    // The default (no opts or null proxySource) must still be 127.0.0.1.
+    assert.equal(F.DEFAULT_PROXY, '127.0.0.1');
+    const reqs = [{ port: 21118, proto: 'tcp', scope: 'host', restrictTo: 'proxy' }];
+    assert.ok(F.rules('ufw', reqs)[0].includes('127.0.0.1'));
+    assert.ok(F.nftConfig(reqs).includes('ip saddr 127.0.0.1'));
+});
+
 // --- module hygiene -------------------------------------------------------
 
 test('no generated argv element contains a shell metacharacter or control byte', () => {
@@ -277,9 +304,22 @@ test('no generated argv element contains a shell metacharacter or control byte',
     }
 });
 
-test('loads under node with no window and no cockpit', () => {
+test('module loads and exports pure functions without globals', () => {
+    // The module must not require window or cockpit to be loaded or used.
     assert.equal(typeof globalThis.window, 'undefined');
     assert.equal(typeof globalThis.cockpit, 'undefined');
+    // The module must export the expected surface and work without any global state.
+    assert.ok(typeof F.steps === 'function');
+    assert.ok(typeof F.rules === 'function');
+    assert.ok(typeof F.warnings === 'function');
+    assert.ok(typeof F.nftConfig === 'function');
+    assert.deepEqual(F.BACKENDS, ['firewalld', 'ufw', 'nftables', 'none']);
+    // Pure functions must work: no I/O, no side effects.
+    const reqs = [{ port: 80, proto: 'tcp', scope: 'host', restrictTo: null }];
+    assert.ok(Array.isArray(F.steps('ufw', reqs)));
+    assert.ok(Array.isArray(F.rules('ufw', reqs)));
+    assert.ok(Array.isArray(F.warnings('ufw', reqs)));
+    assert.ok(typeof F.nftConfig(reqs) === 'string');
 });
 
 test('index.html loads firewall.js after ports.js', () => {
