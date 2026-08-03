@@ -1,0 +1,6 @@
+# synthetic - hand-written, not captured from a real host.
+PRETTY_NAME="Debian GNU/Linux 12 (bookworm)"
+NAME="Debian GNU/Linux"
+VERSION_ID="12"
+VERSION="12 (bookworm)"
+ID=debian
