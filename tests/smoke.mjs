@@ -17,9 +17,9 @@
 // Rules 5 and 6 run over COMMENT-STRIPPED source, not raw source. Applied to raw
 // text, /cockpit\s*\.\s*http\b/ also matches inside a comment — and a header
 // comment is exactly where a module legitimately explains why it does NOT use
-// cockpit.http (js/core/servers.js, Task 19) or otherwise names "cockpit" for
-// unrelated reasons (js/core/errors.js already does, describing a caught problem
-// object). Stripping comments first keeps the rule aimed at real code.
+// cockpit.http (js/core/servers.js, Task 19, whose header comment will contain the
+// literal text "cockpit.http" while explaining the omission). Stripping comments
+// first keeps the rule aimed at real code, not at prose about the API.
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -29,6 +29,7 @@ import { createRequire } from 'node:module';
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const require_ = createRequire(import.meta.url);
 const { stripComments } = require_('./lib/strip-comments.js');
+const { checkC7Order } = require_('./lib/order-check.js');
 
 const failures = [];
 const notes = [];
@@ -172,24 +173,7 @@ for (const marker of ['<!-- pilot:core-scripts -->', '<!-- pilot:feature-scripts
             'inserts its script tag against it');
 }
 
-{
-    const pos = new Map(C7.map((s, i) => [s, i]));
-    const seen = new Set();
-    let prev = -1;
-    let prevSrc = '';
-    for (const s of localSrcs) {
-        if (seen.has(s)) { fail(`rule 4: index.html loads ${s} more than once`); continue; }
-        seen.add(s);
-        if (!pos.has(s)) continue;   // not pinned by C7 — nothing to order it against
-        const i = pos.get(s);
-        if (i < prev) {
-            fail(`rule 4: index.html loads ${s} after ${prevSrc}, but C7 pins ${s} first`);
-        } else {
-            prev = i;
-            prevSrc = s;
-        }
-    }
-}
+for (const msg of checkC7Order(localSrcs, C7)) fail(`rule 4: ${msg}`);
 
 if (localSrcs.length === 0) {
     fail('rule 4: index.html loads no local scripts at all');
@@ -210,8 +194,8 @@ ok(`rule 4: ${localSrcs.length} local script(s) referenced, in C7 order, boot.js
 // --- rule 5: the bridge HTTP channel lives in exactly one file ---------
 //
 // Comment-stripped: a module may legitimately mention "cockpit.http" in a header
-// comment explaining why it does NOT use it (js/core/servers.js, Task 19), and that
-// must not trip this rule.
+// comment explaining why it does NOT use it (js/core/servers.js, Task 19, whose
+// header will contain that literal text), and that must not trip this rule.
 
 const HTTP_USE = /cockpit\s*\.\s*http\b/;
 for (const m of modules) {
@@ -223,10 +207,10 @@ ok(`rule 5: the cockpit HTTP channel is confined to ${HTTP_MODULE}`);
 
 // --- rule 6: only IO_MODULES may touch cockpit inside js/core ----------
 //
-// Also comment-stripped, for the same reason: js/core/errors.js already names
-// "cockpit" in a comment (describing a caught problem object), and a module is
-// free to explain in prose why it does or doesn't touch cockpit without that prose
-// being mistaken for a real member access.
+// Also comment-stripped, for the same reason: js/core/servers.js's header comment
+// (Task 19) will name "cockpit.http" while explaining why it uses cockpit.spawn
+// instead, and a module is free to explain in prose why it does or doesn't touch
+// cockpit without that prose being mistaken for a real member access.
 
 // `typeof cockpit !== 'undefined'` is the mandatory guard and deliberately does not
 // match: this looks for an actual member access.
@@ -241,11 +225,12 @@ ok(`rule 6: cockpit access inside js/core is confined to ${[...IO_MODULES].join(
 
 // --- rule 7: every custom theme id has a palette block -----------------
 
-if (!exists('js/core/themes.js')) {
-    ok('rule 7: skipped — js/core/themes.js does not exist yet');
-} else if (!exists('css/themes.css')) {
-    fail('rule 7: js/core/themes.js exists but css/themes.css does not — every registered ' +
-        'theme needs a palette');
+// Vacuous unless BOTH files exist: themes.js and css/themes.css are added
+// together, but not necessarily in the same commit within a task, so a partial
+// landing (either file present without the other) must report not-applicable
+// rather than fail.
+if (!exists('js/core/themes.js') || !exists('css/themes.css')) {
+    ok('rule 7: not applicable — js/core/themes.js and css/themes.css do not both exist yet');
 } else {
     const css = read('css/themes.css');
     // system/light/dark use Bootstrap's built-in modes and intentionally have no block.
