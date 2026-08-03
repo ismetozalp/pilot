@@ -1,0 +1,10 @@
+firewall-cmd --permanent --add-port=80/tcp
+firewall-cmd --permanent --add-port=443/tcp
+firewall-cmd --permanent --add-port=2222/tcp
+firewall-cmd --permanent --add-port=21115/tcp
+firewall-cmd --permanent --add-port=21116/tcp
+firewall-cmd --permanent --add-port=21116/udp
+firewall-cmd --permanent --add-port=21117/tcp
+firewall-cmd --permanent --add-rich-rule=rule family="ipv4" source address="127.0.0.1" port port="21118" protocol="tcp" accept
+firewall-cmd --permanent --add-rich-rule=rule family="ipv4" source address="127.0.0.1" port port="21119" protocol="tcp" accept
+firewall-cmd --reload

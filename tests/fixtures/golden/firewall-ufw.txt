@@ -1,0 +1,9 @@
+ufw allow 80/tcp
+ufw allow 443/tcp
+ufw allow 2222/tcp
+ufw allow 21115/tcp
+ufw allow 21116/tcp
+ufw allow 21116/udp
+ufw allow 21117/tcp
+ufw allow from 127.0.0.1 to any port 21118 proto tcp
+ufw allow from 127.0.0.1 to any port 21119 proto tcp
