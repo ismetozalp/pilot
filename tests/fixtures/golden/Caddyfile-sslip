@@ -1,0 +1,43 @@
+# Managed by Pilot. Regenerated on every run - do not edit by hand.
+# Tier: automatic sslip.io hostname.
+# sslip.io is not on the Public Suffix List, so every sslip.io name shares
+# one Let's Encrypt rate-limit bucket and issuance can need a retry.
+#
+# Caddy listens on 443 and nothing else: the RustDesk client appends no
+# port to the api-server URL, so a custom port silently breaks the web client
+# and both wss:// endpoints below.
+#
+# X-Real-IP and X-Forwarded-For are SET, not appended: 21118 and 21119 are
+# reachable directly, so a header supplied by the client would otherwise be
+# trusted and forge the logged address.
+https://203.0.113.10.sslip.io {
+    encode zstd gzip
+
+    # hbbs websocket rendezvous. handle, not handle_path: hbbs matches on the
+    # full path, so /ws/id must survive the proxy.
+    handle /ws/id {
+        reverse_proxy 127.0.0.1:21118 {
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-For {remote_host}
+            header_up X-Forwarded-Proto {scheme}
+        }
+    }
+
+    # hbbr websocket relay, likewise path-preserving.
+    handle /ws/relay {
+        reverse_proxy 127.0.0.1:21119 {
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-For {remote_host}
+            header_up X-Forwarded-Proto {scheme}
+        }
+    }
+
+    # Everything else is the API server and its web client.
+    handle {
+        reverse_proxy 127.0.0.1:21114 {
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-For {remote_host}
+            header_up X-Forwarded-Proto {scheme}
+        }
+    }
+}
