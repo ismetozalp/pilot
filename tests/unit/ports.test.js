@@ -91,9 +91,12 @@ test('a custom API port is honoured when TLS is off', () => {
 
 test('every requirement is fully shaped and frozen', () => {
     const reqs = P.required({ ...BASE, target: 'ssh', tlsTier: 'own' });
+    const requiredKeys = ['component', 'port', 'proto', 'restrictTo', 'scope', 'why'];
     for (const r of reqs) {
-        assert.deepEqual(Object.keys(r).sort(),
-            ['component', 'port', 'proto', 'restrictTo', 'scope', 'why']);
+        // Check that required keys exist with correct types; allow future additions.
+        for (const k of requiredKeys) {
+            assert.ok(k in r, 'requirement must have ' + k);
+        }
         assert.equal(Number.isInteger(r.port), true);
         assert.ok(r.port >= 1 && r.port <= 65535);
         assert.ok(r.proto === 'tcp' || r.proto === 'udp');
@@ -111,6 +114,40 @@ test('no configuration ever produces a duplicate port/proto pair', () => {
             assert.equal(new Set(keys).size, keys.length, tier + '/' + target);
         }
     }
+});
+
+test('a custom apiPort colliding with a fixed RustDesk port throws and names it', () => {
+    for (const port of [21115, 21116, 21117, 21118, 21119]) {
+        assert.throws(() => P.required({ ...BASE, apiPort: port }), (e) => {
+            assert.equal(e.kind, 'GENERIC');
+            assert.match(e.message, /apiPort/);
+            assert.match(e.message, new RegExp(port.toString()));
+            return true;
+        }, 'apiPort ' + port);
+    }
+});
+
+test('a custom sshPort colliding with a fixed RustDesk port throws and names it', () => {
+    // Without TLS: hbbs ports + websockets
+    for (const port of [21115, 21116, 21117, 21118, 21119]) {
+        assert.throws(() => P.required({ ...BASE, target: 'ssh', sshPort: port }), (e) => {
+            assert.equal(e.kind, 'GENERIC');
+            assert.match(e.message, /sshPort/);
+            assert.match(e.message, new RegExp(port.toString()));
+            return true;
+        }, 'sshPort ' + port + ' without TLS');
+    }
+    // With TLS: also collide with acme and https
+    for (const port of [80, 443]) {
+        assert.throws(() => P.required({ ...BASE, target: 'ssh', tlsTier: 'own', sshPort: port }),
+            (e) => e.kind === 'GENERIC' && /sshPort/.test(e.message), 'sshPort ' + port + ' with TLS');
+    }
+});
+
+test('required() tolerates unknown extra keys in choices', () => {
+    const reqs = P.required({ ...BASE, unknownKey: 'ignored', anotherUnknown: 42 });
+    assert.ok(reqs.length > 0);
+    assert.ok(reqs.some((r) => r.component === 'hbbs'));
 });
 
 // --- hostile choices ------------------------------------------------------
@@ -328,6 +365,39 @@ test('awsIngressArgv refuses a security group id it cannot vouch for', () => {
         'sg-0123abcd\nmalice', null, undefined, 42, {}])
         assert.throws(() => P.awsIngressArgv(req, g), (e) =>
             e.kind === 'GENERIC', JSON.stringify(g));
+});
+
+test('awsIngressArgv rejects proxy-restricted ports that must not be internet-facing', () => {
+    // Proxy-restricted ports (21118, 21119) under TLS must not be opened to the internet.
+    const tlsReqs = P.required({ ...BASE, tlsTier: 'own' });
+    for (const port of [21118, 21119]) {
+        const req = tlsReqs.find((r) => r.port === port);
+        assert.equal(req.restrictTo, 'proxy');
+        assert.throws(() => P.awsIngressArgv(req, 'sg-0123abcd'), (e) =>
+            e.kind === 'GENERIC' && /proxy/i.test(e.message), port + ' must be proxy-only');
+    }
+});
+
+test('awsIngressArgv rejects host-only ports that are not cloud-edge concerns', () => {
+    // SSH is host-only; the 21114 API port under TLS is not cloud-edge either.
+    const reqs = P.required({ ...BASE, target: 'ssh', tlsTier: 'own' });
+    const sshReq = reqs.find((r) => r.component === 'ssh');
+    assert.equal(sshReq.scope, 'host');
+    assert.throws(() => P.awsIngressArgv(sshReq, 'sg-0123abcd'), (e) =>
+        e.kind === 'GENERIC' && /host-only/.test(e.message), 'SSH is host-only');
+});
+
+test('awsIngressArgv succeeds for genuinely cloud-edge ports', () => {
+    // Ports with scope 'both' or 'edge' and no proxy restriction should work.
+    const reqs = P.required({ ...BASE, tlsTier: 'own' });
+    const edgeReqs = P.cloudEdge(reqs);
+    assert.ok(edgeReqs.length > 0);
+    for (const req of edgeReqs) {
+        const argv = P.awsIngressArgv(req, 'sg-0123abcd');
+        assert.ok(Array.isArray(argv));
+        assert.ok(argv.includes('--port'));
+        assert.ok(argv.includes('--cidr'));
+    }
 });
 
 test('describe renders a requirement as one readable line', () => {
