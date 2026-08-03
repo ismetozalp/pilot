@@ -1,0 +1,16 @@
+{
+    "version": 0,
+    "name": "pilot",
+    "requires": { "cockpit": "300" },
+    "tools": {
+        "index": {
+            "label": "Pilot",
+            "path": "index.html",
+            "order": 53,
+            "keywords": [
+                { "matches": ["rustdesk","remote","desktop","support","hbbs","hbbr","relay","address book","devices"], "weight": 3 }
+            ]
+        }
+    },
+    "content-security-policy": "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-eval' 'unsafe-inline'; connect-src 'self'; font-src 'self' data:; object-src 'none'"
+}

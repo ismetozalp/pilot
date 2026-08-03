@@ -1,3 +1,11 @@
 node_modules/
 *.log
 docs/
+
+# Vendor bundles fetched by `make vendor` — third-party, not committed.
+/js/alpine.min.js
+/js/bootstrap.bundle.min.js
+/css/bootstrap.min.css
+
+# Build artifact from `make zip`.
+/pilot-*.zip

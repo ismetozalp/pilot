@@ -1,0 +1,95 @@
+/* pilot.css — plugin styling layered over Bootstrap.
+ *
+ * The provisioning transcript is the only genuinely custom widget; everything else
+ * leans on Bootstrap so the plugin inherits light/dark switching for free. Pilot's
+ * own accents are namespaced --pl-* (mirroring manifest's --mf-*) and are DERIVED
+ * from Bootstrap's semantic colours wherever possible, so a palette added later in
+ * css/themes.css restyles the transcript, the step icons and the status dots
+ * without touching this file.
+ */
+
+:root {
+    --pl-gutter: 1rem;
+
+    /* Transcript pane: a terminal surface, so it is deliberately its own colour
+       pair rather than the page background — an operator reads it as output. */
+    --pl-log-bg: #1c1f24;
+    --pl-log-fg: #d7dae0;
+
+    /* Step status in the progress list. */
+    --pl-step-ok: var(--bs-success, #2e7d32);
+    --pl-step-fail: var(--bs-danger, #c62828);
+    --pl-step-running: var(--bs-primary, #0d6efd);
+
+    /* Device online state. */
+    --pl-dot-online: var(--bs-success, #2e7d32);
+    --pl-dot-offline: var(--bs-secondary-color, #6c757d);
+
+    --pl-progress-fg: var(--bs-primary, #0d6efd);
+    --pl-row-selected-bg: var(--bs-tertiary-bg, #f1f3f5);
+}
+
+[data-bs-theme="dark"] {
+    --pl-log-bg: #101317;
+    --pl-log-fg: #e6e9ef;
+    --pl-row-selected-bg: var(--bs-tertiary-bg, #2b3035);
+}
+
+body {
+    margin: 0;
+    font-size: 0.9rem;
+}
+
+[x-cloak] { display: none !important; }
+
+.pilot-shell {
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    overflow: hidden;
+}
+
+.pilot-header {
+    flex: 0 0 auto;
+    padding: 0.6rem var(--pl-gutter);
+    border-bottom: 1px solid var(--bs-border-color, rgba(0, 0, 0, 0.15));
+}
+
+.pilot-body {
+    flex: 1 1 auto;
+    overflow: auto;
+    padding: var(--pl-gutter);
+}
+
+/* The live transcript from libexec/pilot-exec. Monospace, auto-scrolling, and
+   selectable as a block so "Copy full transcript" is a real affordance. */
+.pilot-log {
+    background: var(--pl-log-bg);
+    color: var(--pl-log-fg);
+    font-family: var(--bs-font-monospace, monospace);
+    font-size: 0.8rem;
+    line-height: 1.35;
+    padding: 0.6rem 0.75rem;
+    border-radius: 0.375rem;
+    max-height: 22rem;
+    overflow: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.pilot-step-ok      { color: var(--pl-step-ok); }
+.pilot-step-fail    { color: var(--pl-step-fail); }
+.pilot-step-running { color: var(--pl-step-running); }
+
+.pilot-dot {
+    display: inline-block;
+    width: 0.55rem;
+    height: 0.55rem;
+    border-radius: 50%;
+    background: var(--pl-dot-offline);
+}
+.pilot-dot.online { background: var(--pl-dot-online); }
+
+.pilot-progress .progress-bar { background-color: var(--pl-progress-fg); }
+
+.pilot-table tr.selected > td { background: var(--pl-row-selected-bg); }
