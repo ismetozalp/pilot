@@ -109,17 +109,15 @@
     const PEM_RE = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/;
     const AUTHS = ['password', 'pem', 'agent'];
 
-    // A DNS label: alnum at each end, alnum/hyphen in the middle. Applied per
-    // label of a dotted name, and to a bare (undotted) name as a whole.
-    const LABEL_RE = /^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$/;
+    // A DNS label per RFC 1123: 1-63 chars, alnum at each end, alnum/hyphen in
+    // the middle. Applied per label of a dotted name, and to a bare (undotted)
+    // name as a whole — a real SSH target is routinely just "server" or
+    // "rustdesk" with no dot and no digit in sight, so bare names get exactly
+    // the same rule as dotted ones, not a stricter invented one.
+    const LABEL_RE = /^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$/;
     // Loose IPv6 literal in the bracket form ssh already requires (RFC 3986).
     const IPV6_BRACKET_RE = /^\[[0-9A-Fa-f:]+\]$/;
 
-    // A bare (undotted) label is common as a short hostname ('srv1', a single
-    // letter) but is also exactly what a stray placeholder or copy-paste
-    // artifact looks like ('host'). A digit is cheap, real-world evidence that
-    // someone typed an actual name rather than left a template word behind —
-    // except for a single character, which is unambiguous either way.
     function hostError(host) {
         if (host === '') return 'Enter a hostname or IP address.';
         if (host.length > 253) return 'Hostname is longer than 253 characters.';
@@ -128,15 +126,16 @@
         if (/[^\x20-\x7e]/.test(host)) return 'Hostname contains non-ASCII characters.';
         if (host.indexOf('/') >= 0) return 'Hostname contains a path separator.';
         if (IPV6_BRACKET_RE.test(host)) return '';
-        if (host.indexOf('.') >= 0) {
-            const labels = host.split('.');
-            for (let i = 0; i < labels.length; i++)
-                if (!LABEL_RE.test(labels[i])) return 'Hostname is not a valid host or IP address.';
-            return '';
-        }
-        if (!LABEL_RE.test(host)) return 'Hostname is not a valid host or IP address.';
-        if (host.length > 1 && !/[0-9]/.test(host))
-            return 'Hostname is not a valid host or IP address.';
+        // Narrow, deliberate carve-out: the bare literal "host" — the name of
+        // this very field — is rejected on the theory that it is far more
+        // likely to be an unedited form placeholder than a real target. This
+        // is NOT a stand-in for real validation: every other bare or dotted
+        // name (including ordinary short hostnames like "server", "nas" or
+        // "rustdesk") is judged on RFC 1123 label rules alone, below.
+        if (host === 'host') return 'Hostname is not a valid host or IP address.';
+        const labels = host.indexOf('.') >= 0 ? host.split('.') : [host];
+        for (let i = 0; i < labels.length; i++)
+            if (!LABEL_RE.test(labels[i])) return 'Hostname is not a valid host or IP address.';
         return '';
     }
 
@@ -198,8 +197,11 @@
                 p < 1 || p > 65535) continue;
             const proto = str(r.proto).toLowerCase();
             if (proto !== 'tcp' && proto !== 'udp') continue;
-            const component = cleanTag(r.component);
-            const why = cleanTag(r.why);
+            // component/why are prose, not tags — control characters are
+            // stripped but interior spaces are content and must survive
+            // ("hbbs NAT type test" is not "hbbsNATtypetest").
+            const component = clean(r.component);
+            const why = clean(r.why);
             if (fixable) host.push({ port: p, proto: proto, component: component, why: why, scope: 'host' });
             cloud.push({ port: p, proto: proto, component: component, why: why, scope: 'cloud' });
         }
@@ -495,8 +497,10 @@
         if (pw === '') errors.password = 'Choose a new administrator password.';
         else if (pw.length < 12) errors.password = 'Use at least 12 characters.';
         else if (pw.length > 256) errors.password = 'Use at most 256 characters.';
-        else if (/[\x00-\x1f\x7f]/.test(pw) || pw !== pw.trim())
-            errors.password = 'The password contains control characters or leading/trailing whitespace.';
+        else if (/[\x00-\x1f\x7f]/.test(pw))
+            errors.password = 'The password contains control characters.';
+        else if (pw !== pw.trim())
+            errors.password = 'Remove the leading or trailing whitespace from the password.';
         else if (generated !== null && generated !== undefined && pw === str(generated))
             errors.password = 'This is still the generated password. Choose your own.';
         if (confirm !== pw) errors.confirm = 'The two passwords do not match.';

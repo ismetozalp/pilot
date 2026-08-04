@@ -119,6 +119,38 @@ test('IPv4, IPv6 and plain short hostnames are accepted', () => {
         assert.equal(UI.validateTarget(Object.assign({}, base, { host })).ok, true, host);
 });
 
+// A wizard whose whole job is provisioning RustDesk over SSH must not refuse
+// the literal word "rustdesk" (or any other ordinary bare hostname) as a
+// target — bare names get the same RFC 1123 label rule as dotted ones, not an
+// invented stricter one. Only the literal placeholder-shaped "host" (the name
+// of this very field) is carved out below.
+test('realistic bare hostnames used for real SSH targets are all accepted', () => {
+    const base = { target: 'ssh', port: 22, user: 'root', auth: 'agent' };
+    for (const host of ['server', 'nas', 'rustdesk', 'prod', 'db', 'web', 'vpn',
+        'gateway', 'router', 'my-server', 'RustDesk'])
+        assert.equal(UI.validateTarget(Object.assign({}, base, { host })).ok, true, host);
+});
+
+test('a DNS label over 63 characters is rejected even under the 253-character overall cap', () => {
+    const base = { target: 'ssh', port: 22, user: 'root', auth: 'agent' };
+    const r = UI.validateTarget(Object.assign({}, base, { host: 'a'.repeat(64) }));
+    assert.equal(r.ok, false);
+    assert.equal(typeof r.errors.host, 'string');
+    assert.equal(UI.validateTarget(Object.assign({}, base, { host: 'a'.repeat(63) })).ok, true);
+});
+
+test('a leading or trailing dot is rejected as an empty label', () => {
+    const base = { target: 'ssh', port: 22, user: 'root', auth: 'agent' };
+    for (const host of ['.example.com', 'example.com.', '.', 'a..b'])
+        assert.equal(UI.validateTarget(Object.assign({}, base, { host })).ok, false, host);
+});
+
+test('embedded null bytes and unicode in a hostname are rejected', () => {
+    const base = { target: 'ssh', port: 22, user: 'root', auth: 'agent' };
+    for (const host of ['a\x00b', 'héllo.com', 'srv\x00'])
+        assert.equal(UI.validateTarget(Object.assign({}, base, { host })).ok, false, JSON.stringify(host));
+});
+
 test('the SSH port must be a whole number in range', () => {
     const base = { target: 'ssh', host: 'h', user: 'root', auth: 'agent' };
     for (const port of [0, -1, 65536, 22.5, NaN, Infinity, '22', null, undefined])
@@ -209,11 +241,30 @@ test('malformed port records are dropped rather than rendered', () => {
 });
 
 test('control characters in a port label never survive into a row', () => {
-    const r = UI.portRows([{ port: 443, proto: 'TCP', component: 'ca ddy', why: 'ab' }],
+    // The fixture carries a real control byte (\x07), not a plain space —
+    // component/why are prose, and a plain interior space is content, not
+    // corruption; see the next test.
+    const r = UI.portRows([{ port: 443, proto: 'TCP', component: 'ca\x07ddy', why: 'a\x01b' }],
         'firewalld');
     assert.equal(r.host[0].component, 'caddy');
     assert.equal(r.host[0].why, 'ab');
     assert.equal(r.host[0].proto, 'tcp');
+});
+
+test('a multi-word port-row label keeps its interior spaces intact', () => {
+    const r = UI.portRows([
+        { port: 21114, proto: 'tcp', component: 'hbbs NAT type test', why: 'no TLS' }
+    ], 'firewalld');
+    assert.equal(r.host[0].component, 'hbbs NAT type test');
+    assert.equal(r.host[0].why, 'no TLS');
+});
+
+test('control characters are stripped from a prose label without removing its spaces', () => {
+    const r = UI.portRows([
+        { port: 443, proto: 'tcp', component: 'ca\x07 ddy label', why: 'x\x01y z' }
+    ], 'firewalld');
+    assert.equal(r.host[0].component, 'ca ddy label');
+    assert.equal(r.host[0].why, 'xy z');
 });
 
 // ------------------------------------------------------------ awsCommand
@@ -627,8 +678,14 @@ test('the password gate rejects empty, short, oversized, control-laden and misma
     assert.match(UI.passwordGate({ password: 'short', confirm: 'short' }, 'g').errors.password, /12/);
     assert.match(UI.passwordGate({ password: 'a'.repeat(257), confirm: 'a'.repeat(257) }, 'g')
         .errors.password, /256/);
-    assert.match(UI.passwordGate({ password: 'abcdefghijkl ', confirm: 'abcdefghijkl ' }, 'g')
+    // A genuine control byte gets its own, accurately-worded message...
+    assert.match(UI.passwordGate({ password: 'abcdefgh\x01ijkl', confirm: 'abcdefgh\x01ijkl' }, 'g')
         .errors.password, /control/i);
+    // ...distinct from mere leading/trailing whitespace, which is a different
+    // mistake (an accidental copy-paste space) and is named as such rather
+    // than being blamed on "control characters" it does not contain.
+    assert.match(UI.passwordGate({ password: 'abcdefghijkl ', confirm: 'abcdefghijkl ' }, 'g')
+        .errors.password, /whitespace/i);
     assert.match(UI.passwordGate({ password: 'abcdefghijkl', confirm: 'abcdefghijkm' }, 'g')
         .errors.confirm, /match/i);
     assert.equal(UI.passwordGate(null, 'g').ok, false);
