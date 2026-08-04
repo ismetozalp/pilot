@@ -22,8 +22,9 @@
      "Run setup" and js/features/overview.js's "Set up TLS" CTAs both dispatch it
      ({} and {step:'tls', serverId} respectively), but had zero production
      listeners until now. This switches the tab; #pilot-setup below has its own
-     listener for the same event to take the wizard to a specific step, since
-     that is a separate x-data scope this one cannot reach into. -->
+     listener for the same event to take the wizard to a specific step (the TLS
+     CTA lands on the wizard's 'tls' step), since that is a separate x-data
+     scope this one cannot reach into. -->
 <div class="pilot-shell" x-data="pilotApp()" x-cloak
      @pilot:server-changed.document="switchServer($event.detail.id)"
      @pilot:open-wizard.document="openWizard($event.detail)">
@@ -225,7 +226,7 @@
             <div class="alert alert-danger" data-testid="execute-error" x-show="error">
               <span data-testid="execute-error-message" x-text="error ? error.message : ''"></span>
               <span class="fw-semibold ms-1" data-testid="execute-remediation"
-                    x-text="error ? (error.remediation || '') : ''"></span>
+                    x-text="remediationText(error)"></span>
             </div>
             <div data-testid="transcript">
               <template x-for="s in exec.steps" :key="s.id">
@@ -261,8 +262,11 @@
               <p class="mb-1">This server could not be registered, so the other tabs will stay empty:
                 <span data-testid="registration-error-message"
                       x-text="registrationError ? registrationError.message : ''"></span></p>
+              <p class="mb-1" data-testid="registration-cause" x-show="registrationError && registrationError.cause">
+                Reason reported by the system: <span x-text="registrationError ? registrationError.cause : ''"></span></p>
               <p class="mb-1 fw-semibold" data-testid="registration-remediation"
-                 x-text="registrationError ? (registrationError.remediation || '') : ''"></p>
+                 x-show="remediationText(registrationError)"
+                 x-text="remediationText(registrationError)"></p>
               <button class="btn btn-sm btn-outline-dark" data-testid="registration-retry"
                       @click="registerServer()">Try registering again</button>
             </div>

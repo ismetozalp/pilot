@@ -832,3 +832,41 @@ test('switching server re-loads the books and drops the previous selection', asy
     assert.equal(api.calls.filter((x) => x[0] === 'books').length, 2,
         'address books are per server, so they must be re-fetched');
 });
+
+test('Refresh keeps the book the operator chose, and only re-defaults when it is gone', async () => {
+    const api = fakeApi();
+    const c = component({ api });
+    await c.loadBooks();
+    c.selectBook('shared-1');
+    // Refresh is exactly what an operator clicks after creating a book on the
+    // Address Book tab. It re-runs loadBooks(), which used to reset the
+    // selection to the personal book unconditionally -- so the next
+    // "Add to address book" silently went somewhere the operator never chose.
+    await c.loadBooks();
+    assert.equal(c.book, 'shared-1', 'an explicit selection survives a reload that still offers it');
+    assert.deepEqual((await c.addToBook({ id: 'dev-9' }), api.calls.filter((x) => x[0] === 'addToAddressBook').pop()),
+        ['addToAddressBook', 'dev-9', 'shared-1']);
+});
+
+test('Refresh re-defaults when the chosen book no longer exists on the server', async () => {
+    const api = fakeApi();
+    const c = component({ api });
+    await c.loadBooks();
+    c.selectBook('shared-1');
+    // The book was deleted elsewhere: keeping a dangling guid would send every
+    // later add to a book that is not there.
+    c.api = fakeApi({ addressbook: { books: async () => ({ data: { profiles: [
+        { guid: '', name: 'Personal', personal: true }
+    ] } }) } });
+    await c.loadBooks();
+    assert.deepEqual(c.books.map((b) => b.guid), ['']);
+    assert.equal(c.book, '', 'a selection the server no longer offers falls back to the first book');
+});
+
+test('a null selection (fresh load) still takes the default -- "" is a real guid, not "unset"', async () => {
+    const api = fakeApi();
+    const c = component({ api });
+    assert.equal(c.book, null, 'null means nothing chosen yet; "" means the personal book');
+    await c.loadBooks();
+    assert.equal(c.book, '');
+});

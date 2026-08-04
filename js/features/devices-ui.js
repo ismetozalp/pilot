@@ -386,7 +386,17 @@
                 // Default to the first book (the personal one, which
                 // booksFrom() guarantees is present whenever the call
                 // succeeded) so the action is usable without a second click.
-                this.book = this.books.length ? this.books[0].guid : null;
+                //
+                // But KEEP an existing selection that still exists. refresh()
+                // re-runs this, and Refresh is exactly what an operator clicks
+                // after creating a book on the Address Book tab -- resetting
+                // unconditionally threw away the choice they had just made and
+                // silently sent the next "Add to address book" to the personal
+                // book instead. Note '' is a real guid (the personal book), so
+                // the "has a selection" test is null-vs-string, not truthiness.
+                const keep = typeof this.book === 'string'
+                    && this.books.some(function (b) { return b.guid === this.book; }, this);
+                if (!keep) this.book = this.books.length ? this.books[0].guid : null;
                 return this.books;
             },
             selectBook(guid) {

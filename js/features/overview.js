@@ -114,7 +114,14 @@
         if (!validDomain(raw))
             return { enabled: false, url: null, reason: REASON.badDomain, action: 'wizard-tls' };
         // No port: Caddy listens on 443 because the client appends none (C17).
-        return { enabled: true, url: 'https://' + normDomain(raw) + '/', reason: '', action: 'open' };
+        // PilotTls.webClientUrl() IS that rule -- building the string inline
+        // here made a third copy of it, which is the same divergence risk that
+        // made validDomain/normDomain below delegate. It returns '' for
+        // anything it will not vouch for, so an empty answer stays disabled
+        // rather than rendering an href to nowhere.
+        const url = Tls && typeof Tls.webClientUrl === 'function' ? Tls.webClientUrl(raw) : '';
+        if (!url) return { enabled: false, url: null, reason: REASON.badDomain, action: 'wizard-tls' };
+        return { enabled: true, url: url, reason: '', action: 'open' };
     }
 
     // ----------------------------------------------------------- servers

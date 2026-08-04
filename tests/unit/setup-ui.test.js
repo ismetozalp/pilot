@@ -1,4 +1,4 @@
-// tests/unit/setup-ui.test.js — the pure half of the six-step setup wizard.
+// tests/unit/setup-ui.test.js — the pure half of the seven-step setup wizard.
 //
 // Everything here runs with no DOM and no cockpit global. The reducer is fed the
 // exact C4 JSON-line shapes plus the hostile variants a real helper can emit:
@@ -7,6 +7,9 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const ROOT = path.join(__dirname, '..', '..');
 
 const UI = require('../../js/features/setup-ui.js');
 
@@ -1623,4 +1626,76 @@ test('acmeFailureFrom classifies a failed tls step through PilotTls.classifyAcme
     assert.equal(UI.acmeFailureFrom({ steps: [{ id: 'fetch-api', status: 'failed', lines: [] }] }), null,
         'a non-tls failure is not an ACME failure either');
     assert.equal(UI.acmeFailureFrom(null), null);
+});
+
+// ------------------------------------------ the remediation VOCABULARY never ships
+
+test('remediationText() renders a sentence, never PilotErrors\' internal token', () => {
+    const c = UI.pilotSetupUi();
+    const Errors = require('../../js/core/errors.js');
+    // Every kind, exhaustively: whatever remediation() answers, what reaches the
+    // screen must be prose or nothing. A bold red "none" under a failure reads
+    // as a second, nonsense error -- and 'none' is what GENERIC earns, which is
+    // every write failure out of js/core/servers.js.
+    const tokens = Object.keys(Errors.KIND).map((k) => Errors.remediation(Errors.KIND[k]));
+    assert.ok(tokens.includes('none'), 'guard: some kind must answer none, or this test proves nothing');
+    for (const t of tokens) {
+        const out = c.remediationText({ remediation: t });
+        assert.equal(typeof out, 'string');
+        assert.ok(!/^(none|retry|reauthorize|manual-mode|fix-dns|open-ports|hard-stop)$/.test(out),
+            'the raw token "' + t + '" must never be what the user reads');
+    }
+    assert.equal(c.remediationText({ remediation: 'none' }), '');
+    assert.match(c.remediationText({ remediation: 'fix-dns' }), /DNS/);
+    assert.equal(c.remediationText(null), '');
+    assert.equal(c.remediationText({}), '');
+    assert.equal(c.remediationText({ remediation: 'not-a-token' }), '');
+});
+
+test('index.html renders remediation through remediationText(), never the raw field', () => {
+    const html = fs.readFileSync(path.join(ROOT, 'index.html'), 'utf8');
+    assert.ok(!/x-text="[^"]*\.remediation\b/.test(html),
+        'no binding may print an error.remediation token straight to the page');
+    assert.match(html, /data-testid="registration-remediation"[\s\S]{0,200}remediationText\(/);
+    assert.match(html, /data-testid="execute-remediation"[\s\S]{0,200}remediationText\(/);
+});
+
+test('a GENERIC write failure keeps the system\'s own reason, and index.html shows it', async () => {
+    // js/core/errors.js's convention for GENERIC is that the UI surfaces the raw
+    // detail verbatim (§8): GENERIC earns no remediation, so detail.problem is
+    // the ONLY thing that says what went wrong. 'access-denied' (a Limited-access
+    // Cockpit session -- the default for every account) and 'not-found' need
+    // completely different next actions from the operator.
+    const { fake } = fakeServersRecorder({
+        write() {
+            return Promise.reject(Object.assign(new Error('could not write /etc/pilot/servers/local.json'), {
+                name: 'PilotError', kind: 'GENERIC',
+                detail: { op: 'write', path: '/etc/pilot/servers/local.json', problem: 'access-denied' }
+            }));
+        }
+    });
+    await withFakeDocument(() => withFakeServers(fake, async () => {
+        const c = UI.pilotSetupUi();
+        c.choices.target = 'local';
+        assert.equal(await c.registerServer(), false);
+        assert.equal(c.registrationError.cause, 'access-denied');
+        assert.equal(c.remediationText(c.registrationError), '', 'GENERIC has no one-click fix, so no sentence');
+    }));
+    const html = fs.readFileSync(path.join(ROOT, 'index.html'), 'utf8');
+    assert.match(html, /data-testid="registration-cause"/);
+    assert.match(html, /registrationError\.cause/);
+});
+
+test('an error with no detail reports no cause rather than an empty "Reason:" line', async () => {
+    const { fake } = fakeServersRecorder({
+        write() { return Promise.reject(Object.assign(new Error('disk full'), { name: 'PilotError', kind: 'GENERIC' })); }
+    });
+    await withFakeDocument(() => withFakeServers(fake, async () => {
+        const c = UI.pilotSetupUi();
+        c.choices.target = 'local';
+        await c.registerServer();
+        assert.equal(c.registrationError.cause, null);
+    }));
+    const html = fs.readFileSync(path.join(ROOT, 'index.html'), 'utf8');
+    assert.match(html, /data-testid="registration-cause"[\s\S]{0,120}x-show="registrationError && registrationError\.cause"/);
 });

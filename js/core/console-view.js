@@ -100,6 +100,30 @@
         none: ''
     };
 
+    // REMEDIATION_LABEL above is button text. This is the sentence a banner
+    // prints beneath the message. PilotErrors.remediation() returns a token
+    // from a closed vocabulary ('none', 'fix-dns', …) that must NEVER reach a
+    // screen — a bold red "none" under a failure reads as a second, nonsense
+    // error. Every surface renders through this instead of the raw token.
+    // Wording matches js/features/devices-ui.js and js/features/overview.js.
+    const REMEDIATION_SENTENCE = {
+        retry: 'Recommended: try again.',
+        reauthorize: 'Recommended: sign in again on this server.',
+        'manual-mode': 'Recommended: follow the manual steps for this target.',
+        'fix-dns': 'Recommended: check the DNS record for this server.',
+        'open-ports': 'Recommended: open the required ports and try again.',
+        'hard-stop': 'This cannot be resolved automatically.',
+        none: ''
+    };
+
+    // Takes the remediation TOKEN, not an error — callers that already carry a
+    // shaped {kind, message, remediation} pass `.remediation` straight in.
+    function remediationSentence(remediation) {
+        if (typeof remediation !== 'string') return '';
+        return Object.prototype.hasOwnProperty.call(REMEDIATION_SENTENCE, remediation)
+            ? REMEDIATION_SENTENCE[remediation] : '';
+    }
+
     function errorView(err, context) {
         const Errors = root.PilotErrors || null;
         const raw = (err && typeof err === 'object') ? err.kind : null;
@@ -130,8 +154,9 @@
     }
 
     const PilotConsoleView = {
-        MAX_TEXT, REMEDIATION_LABEL,
-        text, hasControl, first, idOf, count, clampInt, page, errorView, mountInto
+        MAX_TEXT, REMEDIATION_LABEL, REMEDIATION_SENTENCE,
+        text, hasControl, first, idOf, count, clampInt, page, errorView, mountInto,
+        remediationSentence
     };
     root.PilotConsoleView = PilotConsoleView;
     if (typeof module !== 'undefined' && module.exports) module.exports = PilotConsoleView;

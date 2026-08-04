@@ -893,7 +893,11 @@ async function runBody(ctx) {
             spawn: { 'pilot-exec --detect': DETECTION, 'pilot-exec --run': RUN_OK },
             // cockpit-stub.js rejects read AND replace for a file scripted with
             // {error:true} -- exactly what an unwritable /etc/pilot looks like.
-            files: { '/etc/pilot/servers/local.json': { error: true, message: 'permission denied' } }
+            // 'access-denied' is what the real bridge reports for a
+            // Limited-access Cockpit session, which is the DEFAULT for every
+            // account -- by far the most likely way this fails in the field.
+            files: { '/etc/pilot/servers/local.json':
+                { error: true, message: 'permission denied', problem: 'access-denied' } }
         };
         await withPage(ctx, stub, async (page) => {
             await page.selectOption('[data-testid="target"]', 'local');
@@ -915,8 +919,22 @@ async function runBody(ctx) {
             assertMatch(await page.textContent('[data-testid="registration-error-message"]'),
                 /could not write \/etc\/pilot\/servers\/local\.json/i,
                 'and it must name the operation and path that actually failed');
-            assertOk((await page.textContent('[data-testid="registration-remediation"]')).trim().length > 0,
-                'with the PilotErrors remediation for its kind, not just a bare message');
+            // GENERIC earns NO one-click remediation, so the sentence line is
+            // absent -- and must be, because PilotErrors.remediation() answers
+            // the internal token 'none' for it, and a bold red "none" under a
+            // failure reads as a second, nonsense error.
+            assertOk(!(await visible(page, '[data-testid="registration-remediation"]')),
+                'a kind with no remediation shows no remediation line at all');
+            const shown = await page.textContent('[data-testid="registration-error"]');
+            assertOk(!/\b(none|retry|reauthorize|manual-mode|fix-dns|open-ports|hard-stop)\b/.test(shown),
+                'the remediation VOCABULARY must never reach the screen: ' + JSON.stringify(shown));
+            // What GENERIC does carry is the system's own reason -- and it is
+            // the only thing that says what went wrong (js/core/errors.js: the
+            // UI surfaces the raw detail verbatim, §8).
+            assertOk(await visible(page, '[data-testid="registration-cause"]'),
+                'a GENERIC failure must show the reason the bridge reported');
+            assertMatch(await page.textContent('[data-testid="registration-cause"]'), /access-denied|denied|not-found/i,
+                'and that reason must be the real problem, not a placeholder');
             assertOk(!(await visible(page, '[data-testid="registered"]')),
                 'it must NOT also claim the server was registered');
             assertOk(await visible(page, '[data-testid="registration-retry"]'),

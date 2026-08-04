@@ -37,10 +37,14 @@ test('module loads with no DOM and no cockpit global', () => {
 test('the module never touches cockpit and never builds an API URL (C12)', () => {
     const src = fs.readFileSync(path.join(ROOT, 'js/features/overview.js'), 'utf8');
     assert.ok(!/cockpit\./.test(src));
-    // The only URL this screen forms is the web client's own https:// address.
+    // This screen forms NO url of its own. It used to inline the web client's
+    // 'https://' + domain + '/', which was a third copy of a rule that lives in
+    // js/core/tls.js (webClientUrl); it now delegates, so zero URL literals is
+    // the property -- strictly stronger than the "exactly one" this asserted
+    // while the duplicate existed.
     const code = src.replace(/^\s*\/\/.*$/gm, '');
     const urls = code.match(/'https?:\/\//g) || [];
-    assert.equal(urls.length, 1, 'exactly one URL literal: the web client scheme');
+    assert.equal(urls.length, 0, 'no URL literal: the web client address comes from PilotTls');
 });
 
 test('index.html loads overview.js after devices-ui.js and before js/app.js', () => {
@@ -636,4 +640,22 @@ test('mount injects the template once and creates its host if the page has none'
     assert.equal(O.mount(doc), false);
     assert.equal(host.innerHTML, 'untouched');
     for (const bad of [null, undefined, {}, 'x', 7]) assert.equal(O.mount(bad), false, String(bad));
+});
+
+test('the web client address comes from PilotTls.webClientUrl, not a local copy of the rule', () => {
+    const Tls = require('../../js/core/tls.js');
+    const server = { id: 'a', tlsTier: 'own', domain: 'rd.example.com' };
+    const link = O.webClientLink(server);
+    assert.equal(link.enabled, true);
+    assert.equal(link.url, Tls.webClientUrl('rd.example.com'),
+        'the two must be the same string because there is only one rule');
+    assert.equal(link.url, 'https://rd.example.com/');
+    // And whatever PilotTls refuses to vouch for stays disabled rather than
+    // rendering an href to nowhere: webClientUrl() answers '' for those.
+    for (const bad of ['1.2.3.4', 'localhost', 'not a host', 'rd.example.com:8443', '*.example.com']) {
+        const l = O.webClientLink({ id: 'a', tlsTier: 'own', domain: bad });
+        assert.equal(l.enabled, false, bad + ' must not produce a web client link');
+        assert.equal(l.url, null);
+        assert.ok(l.reason, 'a disabled link always says why');
+    }
 });

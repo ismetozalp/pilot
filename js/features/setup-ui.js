@@ -40,6 +40,12 @@
         return underNode ? require('../core/tls.js') : null;
     }
 
+    // Same late-bound accessor, for the shared remediation sentence table.
+    function consoleView() {
+        if (root.PilotConsoleView) return root.PilotConsoleView;
+        return underNode ? require('../core/console-view.js') : null;
+    }
+
     // The TLS step sits between detect and ports because BOTH of the things it
     // feeds only exist once the other two have run: the sslip tier needs the
     // public IP that --detect reports, and the ports step must list 80/443 (and
@@ -159,17 +165,16 @@
     }
 
     // GAP B (task 33): the 'pilot:open-wizard' event js/features/overview.js's
-    // "Set up TLS" CTA dispatches carries {step:'tls', serverId} — but 'tls' is
-    // not one of this wizard's steps and never has been: TLS choice is a field
-    // on the FIRST step (blankState().choices.tls), not a step of its own, and
-    // no task has ever added a "reconfigure TLS on an existing server" mode to
-    // this wizard. js/features/server-ops-ui.js's "Run setup" CTA dispatches
-    // the same event with no step at all ({}). Only a step id that is a member
-    // of THIS state's own visibleSteps() is honoured — jumping to an id this
-    // wizard does not recognise, or one that exists but is hidden for the
-    // current target (hostkey on localhost), would leave every pane's
-    // isStep(id) false and the wizard body blank, which is worse than simply
-    // not moving. Pure, so the mapping is unit-testable with no DOM.
+    // "Set up TLS" CTA dispatches carries {step:'tls', serverId}, and
+    // js/features/server-ops-ui.js's "Run setup" CTA dispatches the same event
+    // with no step at all ({}). 'tls' is a real step of this wizard (STEP_IDS),
+    // so the TLS CTA lands on it; a missing or unknown step id leaves the
+    // wizard where it is. Only a step id that is a member of THIS state's own
+    // visibleSteps() is honoured — jumping to an id this wizard does not
+    // recognise, or one that exists but is hidden for the current target
+    // (hostkey on localhost), would leave every pane's isStep(id) false and
+    // the wizard body blank, which is worse than simply not moving. Pure, so
+    // the mapping is unit-testable with no DOM.
     function applyWizardStep(state, detail) {
         const id = (detail && typeof detail === 'object' && typeof detail.step === 'string')
             ? detail.step : null;
@@ -1051,11 +1056,27 @@
         return { kind: obj.kind, message: str(obj.message) || obj.kind };
     }
 
+    // js/core/errors.js's convention for GENERIC is that the UI surfaces the raw
+    // detail verbatim (§8) -- GENERIC earns no one-click remediation, so the
+    // detail is the ONLY thing that says what actually went wrong. Every write
+    // failure out of js/core/servers.js is GENERIC with the bridge's own
+    // `problem` in detail, and 'access-denied' (a Limited-access session, the
+    // Cockpit default) vs 'not-found' are two completely different next actions.
+    // Dropping detail here left the registration pane saying only "could not
+    // write /etc/pilot/servers/local.json", with the reason discarded.
+    function causeOf(err) {
+        const d = (err && typeof err === 'object') ? err.detail : null;
+        if (!d || typeof d !== 'object') return null;
+        const p = str(d.problem);
+        return p === '' ? null : p;
+    }
+
     function describe(err) {
         if (err && typeof err === 'object' && typeof err.kind === 'string') {
             return {
                 kind: err.kind,
                 message: str(err.message),
+                cause: causeOf(err),
                 remediation: (Errors && typeof Errors.remediation === 'function')
                     ? Errors.remediation(err.kind) : null
             };
@@ -1065,6 +1086,7 @@
             return {
                 kind: unwrapped.kind,
                 message: unwrapped.message,
+                cause: null,
                 remediation: (Errors && typeof Errors.remediation === 'function')
                     ? Errors.remediation(unwrapped.kind) : null
             };
@@ -1075,6 +1097,7 @@
         return {
             kind: e.kind,
             message: str(e.message),
+            cause: causeOf(err),
             remediation: (Errors && typeof Errors.remediation === 'function')
                 ? Errors.remediation(e.kind) : null
         };
@@ -1131,6 +1154,17 @@
                     ? STEP_TITLES[str(id)] : str(id);
             },
             isStep(id) { return this.step === id; },
+            // describe() carries PilotErrors' remediation TOKEN ('none',
+            // 'fix-dns', …). Binding that token straight to x-text printed a
+            // bold "none" under every GENERIC failure — including the
+            // registration failure this pane exists to explain. Everything
+            // rendered goes through the shared sentence table instead.
+            remediationText(e) {
+                const CV = consoleView();
+                const r = (e && typeof e === 'object') ? e.remediation : null;
+                if (CV && typeof CV.remediationSentence === 'function') return CV.remediationSentence(r);
+                return '';
+            },
             // Wired in index.html: @pilot:open-wizard.document="onOpenWizard($event.detail)"
             // on #pilot-setup itself (a separate x-data scope from the outer
             // shell's tab switch in js/app.js's openWizard() — this is the
