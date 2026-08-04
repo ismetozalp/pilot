@@ -12,3 +12,12 @@ docs/
 
 # Screenshots written by tests/e2e.mjs's shot().
 /tests/e2e-*.png
+
+# Python bytecode left by running libexec/pilot-exec (the integration tier runs
+# it directly). Both `make install` and `make zip` also strip it, so it can
+# never reach a release artifact, but it must not be committed either.
+libexec/__pycache__/
+*.pyc
+
+# Scratch directory written by the Chrome DevTools / Playwright MCP tooling.
+.playwright-mcp/

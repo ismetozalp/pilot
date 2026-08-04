@@ -607,7 +607,7 @@ test('the template renders every peer/tag value with x-text, never x-html or x-s
 test('a peer or tag containing markup, control bytes, an RTL override or a very long value is stored as plain text', async () => {
     const hostileAlias = '<img src=x onerror="window.__xss=1">';
     const hostileTag = '<script>alert(1)</script>';
-    const rtl = '‮exe.txt';
+    const rtl = '\u202eexe.txt';
     const long = 'z'.repeat(500);
     const api = fakeApi({
         peers: async () => ({

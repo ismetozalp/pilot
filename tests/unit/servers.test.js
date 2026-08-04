@@ -130,7 +130,7 @@ test('validateId: accepts the documented id shape', () => {
     ['slash', 'a/b'], ['backslash', 'a\\b'], ['dot dot', '..'], ['traversal', '../../etc/shadow'],
     ['leading slash', '/etc/passwd'], ['NUL', 'prod\x00'], ['newline', 'prod\nx'],
     ['CR', 'prod\r'], ['tab', 'prod\tx'], ['DEL', 'prod\x7f'], ['unicode', 'pröd'],
-    ['emoji', 'prod\u{1f4be}'], ['zero width joiner', 'pro‍d'],
+    ['emoji', 'prod\u{1f4be}'], ['zero width joiner', 'pro\u200dd'],
     ['url encoded traversal', '%2e%2e%2f'], ['too long', 'a'.repeat(65)],
     ['pathological', 'a'.repeat(100000)]
 ].forEach(([label, id]) => {

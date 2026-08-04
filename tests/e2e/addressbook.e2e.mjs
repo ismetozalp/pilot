@@ -331,7 +331,7 @@ export default async function run(ctx) {
         const hostile = [{
             id: 'h1',
             alias: '<img src=x onerror="window.__xss=1">',
-            hostname: '‮txt.exe',
+            hostname: '\u202etxt.exe',
             platform: 'z'.repeat(500),
             tags: ['<script>window.__xss2=1</script>']
         }];

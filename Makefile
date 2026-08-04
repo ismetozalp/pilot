@@ -50,6 +50,11 @@ install:
 	@# The plugin is built incrementally, so html/ or libexec/ may not exist yet.
 	@# A missing entry must not abort the install.
 	@for f in $(FILES); do if [ -e "$$f" ]; then cp -r "$$f" $(INSTALL_DIR)/; fi; done
+	@# FILES includes libexec/ and the recipe copies it wholesale, so a stale
+	@# __pycache__ from a test run would otherwise ship 67 KB of bytecode into
+	@# $(INSTALL_DIR) -- which is also what the self-updater installs over.
+	@find $(INSTALL_DIR) -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
+	@find $(INSTALL_DIR) -name '*.py[co]' -type f -delete 2>/dev/null || true
 	install -d $(LIBEXEC)
 	@if [ -f libexec/pilot-exec ]; then install -m 0755 libexec/pilot-exec $(LIBEXEC)/pilot-exec; fi
 	install -d -m 0755 $(SYSCONF)
@@ -70,6 +75,8 @@ zip:
 	@tmp=$$(mktemp -d); \
 	mkdir "$$tmp/pilot"; \
 	for f in $(FILES); do [ -e "$$f" ] && cp -r "$$f" "$$tmp/pilot/"; done; \
+	find "$$tmp/pilot" -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true; \
+	find "$$tmp/pilot" -name '*.py[co]' -type f -delete 2>/dev/null || true; \
 	(cd "$$tmp" && zip -rq "pilot-$(VERSION).zip" pilot); \
 	mv "$$tmp/pilot-$(VERSION).zip" .; \
 	rm -rf "$$tmp"; \

@@ -46,7 +46,7 @@ test('isSafeTheme rejects anything that could escape a CSS selector or a path', 
         '', ' ', 'Dark', 'DARK', 'dark ', ' dark', '-dark', '9dark',
         'dark\n', 'dark\r', 'dark\t', 'dark\x00', 'da\x1frk', 'dark\x7f',
         'a/b', '../../etc/passwd', 'a\\b', 'a.b', 'a_b', 'a"b', "a'b",
-        'dárk', '‮dark', 'a'.repeat(33),
+        'dárk', '\u202edark', 'a'.repeat(33),
         null, undefined, 0, 1, {}, [], ['dark'], true, false, () => 'dark'
     ];
     for (const v of hostile) {
@@ -148,7 +148,7 @@ test('parse recovers to defaults from every malformed document', () => {
         '', '   ', '\n', '{', '}', '[', '{"ui":', '{"ui":{"theme":}',
         '{"ui":{"theme":"nord"}', 'null', 'true', '42', '"a string"', '[]', '[1,2]',
         'not json at all', '\x00', '{"ui":{"theme":"nord"}}trailing',
-        '<!DOCTYPE html>', '﻿{"ui":{"theme":"nord"}}'
+        '<!DOCTYPE html>', '\ufeff{"ui":{"theme":"nord"}}'
     ];
     for (const t of bad) {
         assert.deepEqual(S.parse(t), S.DEFAULTS, JSON.stringify(t));

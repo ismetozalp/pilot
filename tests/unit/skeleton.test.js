@@ -215,3 +215,101 @@ test('app.js and boot.js carry the house dual-export tail', () => {
         assert.ok(!/^\s*(import|export)\s/m.test(t), `${f} uses no ES module syntax`);
     }
 });
+
+// =================================================== FINAL REVIEW, FINDING 5
+//
+// FILES includes libexec/ and both recipes copy it wholesale, so a stale
+// __pycache__ left by a test run shipped 67 KB of Python bytecode into
+// pilot-<VERSION>.zip AND into /usr/share/cockpit/pilot -- which is also what
+// the self-updater installs over. This builds the REAL archive and looks
+// inside it, rather than asserting the recipe merely contains a string.
+test('make zip ships no Python bytecode', { skip: !hasZip() }, () => {
+    const { execFileSync } = require('node:child_process');
+    const os = require('node:os');
+    const stage = fs.mkdtempSync(path.join(os.tmpdir(), 'pilot-zip-'));
+    // A stale __pycache__ is exactly the state a machine that has run the
+    // integration tier is in, so create one deliberately rather than hoping.
+    const cache = path.join(ROOT, 'libexec', '__pycache__');
+    fs.mkdirSync(cache, { recursive: true });
+    fs.writeFileSync(path.join(cache, 'pilot-exec.test-marker.pyc'), 'stale bytecode');
+    let listing = '';
+    try {
+        execFileSync('make', ['zip'], { cwd: ROOT, stdio: 'pipe' });
+        const version = fs.readFileSync(path.join(ROOT, 'VERSION'), 'utf8').trim();
+        const zip = path.join(ROOT, `pilot-${version}.zip`);
+        listing = execFileSync('unzip', ['-Z1', zip], { encoding: 'utf8' });
+        fs.rmSync(zip, { force: true });
+    } finally {
+        fs.rmSync(path.join(cache, 'pilot-exec.test-marker.pyc'), { force: true });
+        fs.rmSync(stage, { recursive: true, force: true });
+    }
+    const entries = listing.split('\n').filter(Boolean);
+    assert.ok(entries.some((e) => e === 'pilot/libexec/pilot-exec'),
+        'the helper itself must still be in the archive');
+    for (const e of entries) {
+        assert.ok(!/__pycache__|\.py[co]$/.test(e), `the archive ships bytecode: ${e}`);
+    }
+});
+
+function hasZip() {
+    const { execFileSync } = require('node:child_process');
+    for (const bin of ['zip', 'unzip', 'make']) {
+        try { execFileSync('command', ['-v', bin], { shell: true, stdio: 'ignore' }); }
+        catch (e) { return false; }
+    }
+    return true;
+}
+
+// =================================================== FINAL REVIEW, FINDING 6
+//
+// The project's own convention — a control/bidi character is written as an
+// escape, never as a literal byte — was not held: four files carried literal
+// U+202E / U+200D / U+FEFF, two of which the ledger never recorded. A literal
+// invisible is unreviewable (it does not survive a copy-paste, and it reverses
+// the rendering of the line it is on), which is precisely why a test suite full
+// of hostile-input cases must write them as escapes.
+test('no source file contains a literal invisible or bidi character', () => {
+    const INVISIBLE = /[\u200b-\u200f\u202a-\u202e\u2060\u00ad\ufeff]/;
+    // The shipped plugin and its own test suite. The SDD briefs and the design
+    // plan under .superpowers/ and docs/ are prose that legitimately QUOTES
+    // these characters while discussing them, and neither is shipped or executed.
+    const skip = new Set(['node_modules', '.git', '.playwright-mcp', '.superpowers', 'docs']);
+    const offenders = [];
+    (function walk(d) {
+        for (const e of fs.readdirSync(path.join(ROOT, d), { withFileTypes: true })) {
+            const rel = d ? d + '/' + e.name : e.name;
+            if (skip.has(e.name)) continue;
+            if (e.isDirectory()) { walk(rel); continue; }
+            if (!/\.(js|mjs|html|css|json|md)$/.test(e.name)) continue;
+            if (rel.endsWith('.min.js') || rel.endsWith('.min.css')) continue;
+            const text = fs.readFileSync(path.join(ROOT, rel), 'utf8');
+            const lines = text.split('\n');
+            for (let i = 0; i < lines.length; i++)
+                if (INVISIBLE.test(lines[i])) offenders.push(`${rel}:${i + 1}`);
+        }
+    })('');
+    assert.deepEqual(offenders, [],
+        'write these as escape sequences (\'\\u202e\') so they are visible to a reviewer');
+});
+
+test('.gitignore covers the artifacts this repo actually produces', () => {
+    const ignore = read('.gitignore');
+    for (const pattern of ['libexec/__pycache__/', '.playwright-mcp/']) {
+        assert.ok(ignore.includes(pattern), `.gitignore must ignore ${pattern}`);
+    }
+});
+
+test('the files the Makefile ships and the release notes point at all exist', () => {
+    // FILES named README.md and CHANGELOG.md and neither existed; the `[ -e ]`
+    // guard meant install/zip worked and the plugin simply shipped with no
+    // README at all.
+    const mk = read('Makefile');
+    const files = /^FILES = (.*)$/m.exec(mk);
+    assert.ok(files, 'Makefile declares FILES');
+    for (const f of files[1].trim().split(/\s+/)) {
+        assert.ok(exists(f), `Makefile ships ${f}, which does not exist`);
+    }
+    const version = read('VERSION').trim();
+    assert.match(read('CHANGELOG.md'), new RegExp('##\\s*' + version.replace(/\./g, '\\.')),
+        `CHANGELOG.md must have an entry for the current version ${version}`);
+});
