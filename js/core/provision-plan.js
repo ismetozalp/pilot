@@ -498,47 +498,47 @@
         return (i === -1 || i + 1 >= argv.length) ? '' : argv[i + 1];
     }
 
-    // Recognizes credential material actually present in a step's own argv —
-    // e.g. a token=... query parameter or an "Authorization: Bearer ..."
-    // header value — as opposed to a step whose argv is entirely plain but
-    // whose OUTPUT happens to be sensitive (verify-admin's journalctl call is
-    // the latter: nothing in its argv is secret, only what it prints is).
-    // This is what drives the secret/argv split below, and it is deliberately
-    // NOT an id list: any step, present or future, is classified by what is
-    // actually in its own argv, never by an allowlist of "known safe" ids.
-    const CREDENTIAL_ARGV_PATTERNS = [
-        /[?&](?:token|apikey|api_key|password|secret|pwd)=([^&\s]+)/i,
-        /Authorization:\s*(?:Bearer|Basic)\s+(\S+)/i
-    ];
-    function findEmbeddedCredential(argv) {
-        const list = Array.isArray(argv) ? argv : [];
-        for (let i = 0; i < list.length; i++) {
-            const s = String(list[i]);
-            for (let p = 0; p < CREDENTIAL_ARGV_PATTERNS.length; p++) {
-                const m = s.match(CREDENTIAL_ARGV_PATTERNS[p]);
-                if (m) return m[1];
-            }
-        }
-        return null;
+    // Whether a step's argv carries a credential is, in general, UNDECIDABLE:
+    // a heuristic that infers "safe" from the absence of a recognized pattern
+    // fails OPEN — flag-space-value (--token X), curl -u basic auth, non-
+    // Authorization headers (X-Api-Key, Cookie), JSON bodies, positional
+    // args and env-var assignments are all ordinary ways to pass a credential,
+    // and none of them look like the others. Guessing at that shape is a
+    // losing game, so this renderer does not try.
+    //
+    // What IS decidable is that one SPECIFIC, Pilot-authored command is safe:
+    // verify-admin's argv is always exactly this fixed journalctl invocation,
+    // with no runtime-supplied value in it at all. That is checked by exact
+    // match, not by inference, and is the only entry in ARGV_SAFE_STEPS.
+    // Enrolling a step here is a deliberate, reviewable decision — it is the
+    // opt-in allow-path, never the default.
+    function isVerifyAdminArgv(argv) {
+        const expected = ['journalctl', '-u', 'rustdesk-api.service', '--no-pager', '-n', '200'];
+        if (!Array.isArray(argv) || argv.length !== expected.length) return false;
+        for (let i = 0; i < expected.length; i++) if (argv[i] !== expected[i]) return false;
+        return true;
     }
+    const ARGV_SAFE_STEPS = { 'verify-admin': isVerifyAdminArgv };
 
     // For secret steps, render variable assignments before the command.
     // Returns { preLines, commandLine, mustRunManually, outputSensitive }:
     //   - preLines: setup lines (env checks, variable assignments)
     //   - commandLine: full rendered command (or null to use normal argv rendering)
-    //   - mustRunManually: true if this secret step's argv itself carries a
-    //     credential we have no safe rewrite for, and cannot be safely shared
-    //   - outputSensitive: true if the argv embeds nothing sensitive and the
-    //     command is safe to run and share as-is — only its OUTPUT is secret
+    //   - mustRunManually: true if this secret step's argv is not on the
+    //     explicit allow-path and has no safe rewrite — the FAIL-CLOSED default
+    //   - outputSensitive: true only for a step that matched its exact,
+    //     enrolled allow-path entry — never set from an inference
     function renderSecretStep(step) {
         const preLines = [];
         if (!step.secret) return { preLines: [], commandLine: null, mustRunManually: false, outputSensitive: false };
 
-        // Nothing in this step's own argv looks like a credential: the
-        // command itself is safe to run and safe to share. Render it as-is —
-        // e.g. verify-admin's `journalctl ...` carries no secret in its argv,
-        // only in what it prints.
-        if (!findEmbeddedCredential(step.argv)) {
+        // Explicit, opt-in allow-path: render only if this step's id is
+        // enrolled AND its argv matches that enrollment's exact expected
+        // shape. This is the ONLY way a secret:true step's command is
+        // rendered instead of suppressed — never inferred from what the
+        // argv appears not to contain.
+        const validator = ARGV_SAFE_STEPS[step.id];
+        if (validator && validator(step.argv)) {
             return { preLines: [], commandLine: null, mustRunManually: false, outputSensitive: true };
         }
 
@@ -591,8 +591,8 @@
             }
         }
 
-        // The argv embeds a credential we have no safe rewrite for: refuse
-        // to render it in cleartext.
+        // Fail closed: not on the explicit allow-path above and not the
+        // DuckDNS special case, so refuse to render it in cleartext.
         return { preLines: [], commandLine: null, mustRunManually: true, outputSensitive: false };
     }
 

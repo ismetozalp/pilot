@@ -236,3 +236,33 @@ test('a secret step with a non-duckdns id does not leak credentials in rendered 
     // The actual command is NOT included in the rendered script
     assert.equal(out.indexOf('curl -fsS -H'), -1, 'command with secret not included');
 });
+
+// Adversarial argv shapes that all carry a real credential, in the common
+// (not exotic) ways commands actually pass one. A classifier that infers
+// "safe" from the ABSENCE of a recognized pattern fails open on all of these
+// except the one shape it happens to recognize — this closes that class by
+// requiring every one of them to render with the secret nowhere in the
+// output, regardless of what patterns the renderer does or does not know.
+const ADVERSARIAL_SECRET_ARGVS = [
+    ['some-cli', '--token', 'SECRET123'],
+    ['curl', '-u', 'user:SECRET123', 'https://example.com'],
+    ['curl', '--header', 'X-Api-Key: SECRET123', 'https://example.com'],
+    ['curl', 'https://example.com/api?access_token=SECRET123'],
+    ['some-cli', 'SECRET123'],
+    ['curl', '--data', '{"token":"SECRET123"}', 'https://example.com'],
+    ['curl', '-H', 'Cookie: session=SECRET123', 'https://example.com'],
+    ['env', 'API_TOKEN=SECRET123', 'some-cli'],
+    ['curl', '-H', 'Authorization: Basic U0VDUkVUMTIz', 'https://example.com']
+];
+
+test('every adversarial secret-argv shape renders with the credential nowhere in the script', () => {
+    for (const argv of ADVERSARIAL_SECRET_ARGVS) {
+        const out = P.manualScript(rawPlan([rawStep({ id: 'adversarial', secret: true, argv: argv })]));
+        assert.equal(out.indexOf('SECRET123'), -1, 'leaked for argv: ' + JSON.stringify(argv));
+        // Only enrolled, exact-argv allow-path steps may claim safety; every
+        // one of these must fall back to full suppression instead.
+        assert.ok(out.indexOf('MANUAL STEP') !== -1, 'not marked manual for argv: ' + JSON.stringify(argv));
+        assert.equal(out.indexOf('safe to run and safe to share'), -1,
+            'falsely claimed safe for argv: ' + JSON.stringify(argv));
+    }
+});
