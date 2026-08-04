@@ -1,0 +1,530 @@
+#!/usr/bin/python3
+# pilot-exec — privileged provisioning helper for the Pilot Cockpit plugin.
+#
+# One executor, two transports. Everything above the transport — step sequencing,
+# the JSON-line protocol, redaction, idempotency probes, SHA256 enforcement — is
+# shared, so a localhost install and a remote install are the same code path with
+# the same tests. Only where a command runs differs.
+#
+# python3 is a safe dependency: cockpit-bridge is Python, so every host that can
+# run Cockpit already has it.
+#
+# CLI (exactly one mode flag is required; there is NO --transport flag — the
+# transport comes from envelope.transport):
+#
+#   --run              read Envelope v1 on stdin, execute it, stream JSON lines
+#   --detect           read a DetectRequest on stdin, emit a Detection document
+#   --check-hostkey    read {host,port} on stdin, emit {fingerprint,known,kind}
+#   --print-plan       read Envelope v1, print the steps, execute NOTHING
+#   --selftest-redact  self-test the redactor; no network, no SSH
+#
+# EXIT CODE CONTRACT — the single table. Nothing in this file overloads a code
+# with a second meaning.
+#
+#   0  the mode completed; for --run every step ended ok or skipped
+#   1  --run completed but at least one step failed (run-end partial|failed)
+#   2  usage error: no mode flag, two mode flags, a repeated mode flag, or an
+#      unknown argument
+#   3  the stdin document is not valid JSON or violates the schema
+#   4  SSH host key unknown and no accept_fingerprint was supplied
+#      (SSH_HOSTKEY_UNKNOWN)
+#   5  SSH host key CHANGED — hard stop, never auto-accepted
+#      (SSH_HOSTKEY_CHANGED)
+#   6  SHA256 mismatch on a downloaded file — hard stop (CHECKSUM_MISMATCH)
+#   7  the transport could not be established (SSH_UNREACHABLE/SSH_AUTH_FAILED)
+#
+# Credentials arrive in the stdin envelope ONLY. They are never accepted in argv
+# (world-readable via /proc/<pid>/cmdline) and never written to a log line.
+# Redaction happens at the emitter, in this file, never in the UI.
+
+import base64
+import json
+import os
+import re
+import shlex
+import sys
+
+VERSION = 1
+
+EXIT_OK = 0
+EXIT_RUN_FAILED = 1
+EXIT_USAGE = 2
+EXIT_BAD_STDIN = 3
+EXIT_HOSTKEY_UNKNOWN = 4
+EXIT_HOSTKEY_CHANGED = 5
+EXIT_CHECKSUM = 6
+EXIT_TRANSPORT = 7
+
+# One name per override. No aliases: a second accepted name is how transcripts
+# silently land in two different directories.
+RUNS_DIR = os.environ.get("PILOT_RUNS_DIR", "/var/lib/pilot/runs")
+KNOWN_HOSTS = os.environ.get("PILOT_KNOWN_HOSTS", "/etc/pilot/known_hosts")
+
+MODES = ("--run", "--detect", "--check-hostkey", "--print-plan", "--selftest-redact")
+
+# Handlers are registered at the bottom of the file as they are implemented.
+# Nothing ever replaces an entry — each mode is registered exactly once.
+MODE_HANDLERS = {}
+
+SECRET_MASK = "••••••"
+
+MAX_STDIN = 4 * 1024 * 1024
+MAX_STEPS = 200
+PATH_MAX = 4096
+
+# Escapes only — a literal control byte in a character class is invisible in an
+# editor and does not survive copy-paste.
+CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
+STEP_ID_RE = re.compile(r"\A[a-z0-9][a-z0-9-]{0,62}\Z")
+RUN_ID_RE = re.compile(r"\A[0-9]{8}T[0-9]{6}Z\Z")
+HOST_RE = re.compile(r"\A[A-Za-z0-9._:-]{1,255}\Z")
+USER_RE = re.compile(r"\A[A-Za-z0-9._-]{1,32}\Z")
+# OpenSSH prints SHA256 fingerprints as unpadded base64 of a 32-byte digest,
+# which is always exactly 43 characters. Nothing else is accepted — not the MD5
+# colon form, not a padded variant.
+FINGERPRINT_RE = re.compile(r"\ASHA256:[A-Za-z0-9+/]{43}\Z")
+FILE_MODE_RE = re.compile(r"\A0[0-7]{3}\Z")
+OWNER_RE = re.compile(r"\A[A-Za-z0-9._-]{1,32}:[A-Za-z0-9._-]{1,32}\Z")
+SHA256_RE = re.compile(r"\A[0-9a-f]{64}\Z")
+
+ENVELOPE_KEYS = ("version", "transport", "run_id", "ssh", "credentials", "steps")
+SSH_KEYS = ("host", "port", "user", "auth", "accept_fingerprint")
+CRED_KEYS = ("password", "pem")
+STEP_KEYS = ("id", "title", "mutating", "why", "argv", "write", "check", "sha256", "secret")
+WRITE_KEYS = ("path", "mode", "content", "owner")
+CHECK_KEYS = ("argv", "expect")
+
+
+class Fail(Exception):
+    """A fatal condition carrying both the process exit code and a C6 error kind."""
+
+    def __init__(self, code, kind, message):
+        Exception.__init__(self, message)
+        self.code = code
+        self.kind = kind
+        self.message = message
+
+
+class Redactor:
+    """Replaces every known form of a secret with SECRET_MASK.
+
+    Registered forms: the secret itself, its untrimmed original, each
+    sufficiently long line of it (so a PEM body line pasted into a log is caught
+    even when the whole key is not), and its base64 encoding (so an HTTP Basic
+    header is caught). Needles are applied longest-first so a whole PEM is
+    masked as one unit rather than line by line.
+    """
+
+    def __init__(self):
+        self._needles = []
+
+    def add(self, secret):
+        if not isinstance(secret, str):
+            return
+        forms = set()
+        stripped = secret.strip()
+        if len(stripped) >= 4:
+            forms.add(stripped)
+        if secret != stripped and len(secret) >= 4:
+            forms.add(secret)
+        for raw in stripped.splitlines():
+            line = raw.strip()
+            if len(line) >= 12 and not line.startswith("-----"):
+                forms.add(line)
+        if len(stripped) >= 4:
+            try:
+                encoded = base64.b64encode(stripped.encode("utf-8")).decode("ascii")
+                if len(encoded) >= 8:
+                    forms.add(encoded)
+            except (UnicodeError, ValueError):
+                pass
+        for form in forms:
+            if form not in self._needles:
+                self._needles.append(form)
+        self._needles.sort(key=len, reverse=True)
+
+    def scrub(self, text):
+        if not isinstance(text, str) or not self._needles:
+            return text
+        for needle in self._needles:
+            if needle in text:
+                text = text.replace(needle, SECRET_MASK)
+        return text
+
+    def scrub_obj(self, obj):
+        if isinstance(obj, str):
+            return self.scrub(obj)
+        if isinstance(obj, list):
+            return [self.scrub_obj(item) for item in obj]
+        if isinstance(obj, dict):
+            return dict((key, self.scrub_obj(value)) for key, value in obj.items())
+        return obj
+
+
+# ---- validation primitives --------------------------------------------------
+#
+# Defined exactly once each. Later tasks in this section reuse them and never
+# introduce a second function with the same name and a different signature.
+
+def _obj(value, path, allowed):
+    if not isinstance(value, dict):
+        raise Fail(EXIT_BAD_STDIN, "GENERIC", path + " must be an object")
+    extra = sorted(key for key in value.keys() if key not in allowed)
+    if extra:
+        raise Fail(EXIT_BAD_STDIN, "GENERIC",
+                   path + " has unknown key(s): " + ", ".join(extra))
+    missing = sorted(key for key in allowed if key not in value)
+    if missing:
+        raise Fail(EXIT_BAD_STDIN, "GENERIC",
+                   path + " is missing key(s): " + ", ".join(missing))
+    return value
+
+
+def _text(value, path, maxlen, allow_empty=False, allow_ctrl=False):
+    if not isinstance(value, str):
+        raise Fail(EXIT_BAD_STDIN, "GENERIC", path + " must be a string")
+    if len(value) > maxlen:
+        raise Fail(EXIT_BAD_STDIN, "GENERIC",
+                   path + " is longer than " + str(maxlen) + " characters")
+    if not allow_empty and value == "":
+        raise Fail(EXIT_BAD_STDIN, "GENERIC", path + " must not be empty")
+    if not allow_ctrl and CTRL_RE.search(value):
+        raise Fail(EXIT_BAD_STDIN, "GENERIC", path + " contains a control character")
+    return value
+
+
+def _bool(value, path):
+    if not isinstance(value, bool):
+        raise Fail(EXIT_BAD_STDIN, "GENERIC", path + " must be true or false")
+    return value
+
+
+def _int(value, path, lo, hi):
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise Fail(EXIT_BAD_STDIN, "GENERIC", path + " must be an integer")
+    if value < lo or value > hi:
+        raise Fail(EXIT_BAD_STDIN, "GENERIC",
+                   path + " must be between " + str(lo) + " and " + str(hi))
+    return value
+
+
+def _abs_path(value, path, maxlen=PATH_MAX):
+    text = _text(value, path, maxlen)
+    if not text.startswith("/"):
+        raise Fail(EXIT_BAD_STDIN, "GENERIC", path + " must be an absolute path")
+    segments = text.split("/")
+    if ".." in segments or "." in segments:
+        raise Fail(EXIT_BAD_STDIN, "GENERIC",
+                   path + " must not contain '.' or '..' segments")
+    return text
+
+
+def _argv(value, path, allow_empty):
+    if not isinstance(value, list):
+        raise Fail(EXIT_BAD_STDIN, "GENERIC", path + " must be an array of strings")
+    if not allow_empty and not value:
+        raise Fail(EXIT_BAD_STDIN, "GENERIC", path + " must not be empty")
+    if len(value) > 64:
+        raise Fail(EXIT_BAD_STDIN, "GENERIC", path + " has more than 64 elements")
+    return [_text(item, path + "[" + str(i) + "]", PATH_MAX, allow_empty=True)
+            for i, item in enumerate(value)]
+
+
+def download_target(argv):
+    """The destination of a download step, per C14.
+
+    `-o` (or `--output`) is its OWN argv element, immediately followed by the
+    destination. An `-o` buried inside a shell string is deliberately NOT a
+    match: that ambiguity is what broke two previous rounds.
+    """
+    for i in range(len(argv) - 1):
+        if argv[i] in ("-o", "--output"):
+            return argv[i + 1]
+    return None
+
+
+def shell_join(argv):
+    return " ".join(shlex.quote(item) for item in argv)
+
+
+# ---- Envelope v1 (C2) -------------------------------------------------------
+
+def validate_step(raw, path):
+    src = _obj(raw, path, STEP_KEYS)
+    step = {}
+    step["id"] = _text(src["id"], path + ".id", 64)
+    if not STEP_ID_RE.match(step["id"]):
+        raise Fail(EXIT_BAD_STDIN, "GENERIC",
+                   path + ".id must be a lowercase slug like 'fetch-api'")
+    step["title"] = _text(src["title"], path + ".title", 200)
+    step["mutating"] = _bool(src["mutating"], path + ".mutating")
+    step["why"] = _text(src["why"], path + ".why", 500)
+    step["secret"] = _bool(src["secret"], path + ".secret")
+
+    if src["write"] is None:
+        step["write"] = None
+    else:
+        w = _obj(src["write"], path + ".write", WRITE_KEYS)
+        mode = _text(w["mode"], path + ".write.mode", 4)
+        if not FILE_MODE_RE.match(mode):
+            raise Fail(EXIT_BAD_STDIN, "GENERIC",
+                       path + ".write.mode must look like 0644")
+        owner = _text(w["owner"], path + ".write.owner", 65)
+        if not OWNER_RE.match(owner):
+            raise Fail(EXIT_BAD_STDIN, "GENERIC",
+                       path + ".write.owner must look like user:group")
+        step["write"] = {
+            "path": _abs_path(w["path"], path + ".write.path"),
+            "mode": mode,
+            # File content legitimately contains newlines, so control characters
+            # are allowed here and nowhere else.
+            "content": _text(w["content"], path + ".write.content",
+                             1024 * 1024, allow_empty=True, allow_ctrl=True),
+            "owner": owner,
+        }
+
+    step["argv"] = _argv(src["argv"], path + ".argv",
+                         allow_empty=step["write"] is not None)
+    if step["write"] is not None and step["argv"]:
+        raise Fail(EXIT_BAD_STDIN, "GENERIC",
+                   path + " has both write and argv; a write step must have argv []")
+
+    if src["check"] is None:
+        step["check"] = None
+    else:
+        c = _obj(src["check"], path + ".check", CHECK_KEYS)
+        expect = _text(c["expect"], path + ".check.expect", 8)
+        if expect not in ("zero", "nonzero"):
+            raise Fail(EXIT_BAD_STDIN, "GENERIC",
+                       path + ".check.expect must be 'zero' or 'nonzero'")
+        step["check"] = {"argv": _argv(c["argv"], path + ".check.argv", False),
+                         "expect": expect}
+
+    if src["sha256"] is None:
+        step["sha256"] = None
+    else:
+        digest = _text(src["sha256"], path + ".sha256", 64)
+        if not SHA256_RE.match(digest):
+            raise Fail(EXIT_BAD_STDIN, "GENERIC",
+                       path + ".sha256 must be 64 lowercase hex characters")
+        target = download_target(step["argv"])
+        if target is None:
+            raise Fail(EXIT_BAD_STDIN, "GENERIC",
+                       path + " carries sha256 but its argv has no '-o <path>' "
+                       "element pair; download steps are literal argv, never shell "
+                       "strings (C14)")
+        _abs_path(target, path + ".argv '-o' destination")
+        step["sha256"] = digest
+
+    return step
+
+
+def validate_ssh(raw, transport, path="envelope.ssh"):
+    if transport == "local":
+        if raw is not None:
+            raise Fail(EXIT_BAD_STDIN, "GENERIC",
+                       path + " must be null when transport is 'local'")
+        return None
+    if raw is None:
+        raise Fail(EXIT_BAD_STDIN, "GENERIC",
+                   path + " is required when transport is 'ssh'")
+    src = _obj(raw, path, SSH_KEYS)
+    host = _text(src["host"], path + ".host", 255)
+    if not HOST_RE.match(host):
+        raise Fail(EXIT_BAD_STDIN, "GENERIC",
+                   path + ".host is not a valid hostname or address")
+    user = _text(src["user"], path + ".user", 32)
+    if not USER_RE.match(user):
+        raise Fail(EXIT_BAD_STDIN, "GENERIC", path + ".user is not a valid username")
+    auth = _text(src["auth"], path + ".auth", 8)
+    if auth not in ("password", "pem", "agent"):
+        raise Fail(EXIT_BAD_STDIN, "GENERIC",
+                   path + ".auth must be 'password', 'pem' or 'agent'")
+    fingerprint = src["accept_fingerprint"]
+    if fingerprint is not None:
+        fingerprint = _text(fingerprint, path + ".accept_fingerprint", 64)
+        if not FINGERPRINT_RE.match(fingerprint):
+            raise Fail(EXIT_BAD_STDIN, "GENERIC",
+                       path + ".accept_fingerprint must look like "
+                       "SHA256:<43 base64 characters>")
+    return {"host": host, "port": _int(src["port"], path + ".port", 1, 65535),
+            "user": user, "auth": auth, "accept_fingerprint": fingerprint}
+
+
+def validate_credentials(raw, path="envelope.credentials"):
+    if raw is None:
+        return None
+    src = _obj(raw, path, CRED_KEYS)
+    password = src["password"]
+    if password is not None:
+        password = _text(password, path + ".password", 1024)
+    pem = src["pem"]
+    if pem is not None:
+        pem = _text(pem, path + ".pem", 64 * 1024, allow_ctrl=True)
+    return {"password": password, "pem": pem}
+
+
+def validate_envelope(raw):
+    src = _obj(raw, "envelope", ENVELOPE_KEYS)
+    if isinstance(src["version"], bool) or src["version"] != VERSION:
+        raise Fail(EXIT_BAD_STDIN, "GENERIC", "envelope.version must be 1")
+    transport = _text(src["transport"], "envelope.transport", 8)
+    if transport not in ("local", "ssh"):
+        raise Fail(EXIT_BAD_STDIN, "GENERIC",
+                   "envelope.transport must be 'local' or 'ssh'")
+    run_id = _text(src["run_id"], "envelope.run_id", 32)
+    if not RUN_ID_RE.match(run_id):
+        raise Fail(EXIT_BAD_STDIN, "GENERIC",
+                   "envelope.run_id must look like 20260803T204500Z")
+    raw_steps = src["steps"]
+    if not isinstance(raw_steps, list) or not raw_steps:
+        raise Fail(EXIT_BAD_STDIN, "GENERIC", "envelope.steps must be a non-empty array")
+    if len(raw_steps) > MAX_STEPS:
+        raise Fail(EXIT_BAD_STDIN, "GENERIC",
+                   "envelope.steps has more than " + str(MAX_STEPS) + " steps")
+    steps = []
+    seen = set()
+    for i, raw_step in enumerate(raw_steps):
+        step = validate_step(raw_step, "envelope.steps[" + str(i) + "]")
+        if step["id"] in seen:
+            raise Fail(EXIT_BAD_STDIN, "GENERIC",
+                       "envelope.steps has a duplicate step id: " + step["id"])
+        seen.add(step["id"])
+        steps.append(step)
+    return {"version": VERSION, "transport": transport, "run_id": run_id,
+            "ssh": validate_ssh(src["ssh"], transport),
+            "credentials": validate_credentials(src["credentials"]),
+            "steps": steps}
+
+
+def read_stdin_json(stdin):
+    data = stdin.read(MAX_STDIN + 1)
+    if len(data) > MAX_STDIN:
+        raise Fail(EXIT_BAD_STDIN, "GENERIC",
+                   "stdin document is larger than " + str(MAX_STDIN) + " bytes")
+    if not data.strip():
+        raise Fail(EXIT_BAD_STDIN, "GENERIC", "stdin document is empty")
+    try:
+        doc = json.loads(data)
+    except ValueError as exc:
+        raise Fail(EXIT_BAD_STDIN, "GENERIC", "stdin is not valid JSON: " + str(exc))
+    if not isinstance(doc, dict):
+        raise Fail(EXIT_BAD_STDIN, "GENERIC", "stdin document must be a JSON object")
+    return doc
+
+
+# ---- modes that touch nothing ----------------------------------------------
+
+def cmd_print_plan(stdin, out):
+    env = validate_envelope(read_stdin_json(stdin))
+    out.write(json.dumps({"t": "plan", "run_id": env["run_id"],
+                          "transport": env["transport"],
+                          "steps": len(env["steps"])}) + "\n")
+    for step in env["steps"]:
+        if step["secret"]:
+            cmd = SECRET_MASK
+        elif step["write"] is not None:
+            cmd = "write " + step["write"]["path"]
+        else:
+            cmd = shell_join(step["argv"])
+        out.write(json.dumps({
+            "t": "plan-step",
+            "id": step["id"],
+            "title": step["title"],
+            "mutating": step["mutating"],
+            "why": step["why"],
+            "cmd": cmd,
+            "write": None if step["write"] is None else step["write"]["path"],
+            "check": None if step["check"] is None else shell_join(step["check"]["argv"]),
+            "sha256": step["sha256"],
+            "sha256_target": download_target(step["argv"]),
+            "secret": step["secret"],
+        }, ensure_ascii=False) + "\n")
+    out.flush()
+    return EXIT_OK
+
+
+def cmd_selftest_redact(stdin, out):
+    password = "hunter2horse"
+    pem_body = "b3BlbnNzaC1rZXktdjEAAAAABG5vbmU"
+    pem = ("-----BEGIN OPENSSH PRIVATE KEY-----\n" + pem_body +
+           "\n-----END OPENSSH PRIVATE KEY-----")
+    redactor = Redactor()
+    redactor.add(password)
+    redactor.add(pem)
+    encoded = base64.b64encode(password.encode("utf-8")).decode("ascii")
+
+    cases = []
+
+    def case(name, text, forbidden):
+        got = redactor.scrub(text)
+        cases.append({"name": name,
+                      "ok": forbidden not in got and SECRET_MASK in got})
+
+    case("plain", password, password)
+    case("embedded-in-argv", "sshpass -p " + password + " ssh root@host", password)
+    case("repeated", password + " and again " + password, password)
+    case("unicode-neighbours", "é" + password + "中", password)
+    case("base64-basic-auth", "Authorization: Basic " + encoded, encoded)
+    case("whole-pem", pem, pem_body)
+    case("single-pem-line", "read key material: " + pem_body, pem_body)
+
+    scrubbed = redactor.scrub_obj({"cmd": "echo " + password,
+                                   "lines": [pem_body], "exit": 7})
+    dumped = json.dumps(scrubbed)
+    cases.append({"name": "nested-object",
+                  "ok": password not in dumped and pem_body not in dumped
+                  and scrubbed["exit"] == 7})
+    cases.append({"name": "clean-text-untouched",
+                  "ok": redactor.scrub("nothing secret here") == "nothing secret here"})
+
+    ok = all(entry["ok"] for entry in cases)
+    out.write(json.dumps({"t": "selftest", "ok": ok, "mask": SECRET_MASK,
+                          "cases": cases}, ensure_ascii=False) + "\n")
+    out.flush()
+    return EXIT_OK if ok else EXIT_RUN_FAILED
+
+
+# ---- entry point ------------------------------------------------------------
+
+def parse_args(argv):
+    modes = []
+    for arg in argv:
+        if arg in MODES:
+            if arg in modes:
+                raise Fail(EXIT_USAGE, "GENERIC", "repeated mode flag: " + arg)
+            modes.append(arg)
+        else:
+            raise Fail(EXIT_USAGE, "GENERIC", "unknown argument: " + arg)
+    if len(modes) != 1:
+        raise Fail(EXIT_USAGE, "GENERIC",
+                   "exactly one mode flag is required, one of: " + " ".join(MODES))
+    return modes[0]
+
+
+def main(argv, stdin, out, err):
+    try:
+        mode = parse_args(argv)
+        handler = MODE_HANDLERS.get(mode)
+        if handler is None:
+            raise Fail(EXIT_USAGE, "GENERIC",
+                       "mode is not implemented in this build: " + mode)
+        return handler(stdin, out)
+    except Fail as exc:
+        err.write(json.dumps({"t": "fatal", "kind": exc.kind,
+                              "message": exc.message}, ensure_ascii=False) + "\n")
+        err.flush()
+        return exc.code
+    except BrokenPipeError:
+        return EXIT_RUN_FAILED
+
+
+# ---- mode registry ----------------------------------------------------------
+#
+# One line per mode, appended as each mode is implemented. An entry is never
+# replaced and a handler is never redefined.
+MODE_HANDLERS["--print-plan"] = cmd_print_plan
+MODE_HANDLERS["--selftest-redact"] = cmd_selftest_redact
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:], sys.stdin, sys.stdout, sys.stderr))
