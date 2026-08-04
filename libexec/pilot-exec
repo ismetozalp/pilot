@@ -38,11 +38,16 @@
 # Redaction happens at the emitter, in this file, never in the UI.
 
 import base64
+import hashlib
 import json
 import os
 import re
 import shlex
+import subprocess
 import sys
+import tempfile
+import threading
+import time
 
 VERSION = 1
 
@@ -358,6 +363,14 @@ def validate_credentials(raw, path="envelope.credentials"):
     password = src["password"]
     if password is not None:
         password = _text(password, path + ".password", 1024)
+        # Redactor.add() deliberately ignores needles under 4 characters to avoid
+        # mass over-redaction (a 1-character secret would mask itself out of every
+        # log line). A password that short would therefore reach --run and never
+        # be masked, so it is refused here instead of silently shipping unmasked.
+        if len(password) < 4:
+            raise Fail(EXIT_BAD_STDIN, "GENERIC",
+                       path + ".password must be at least 4 characters so the "
+                       "redactor can mask it")
     pem = src["pem"]
     if pem is not None:
         pem = _text(pem, path + ".pem", 64 * 1024, allow_ctrl=True)
@@ -485,6 +498,596 @@ def cmd_selftest_redact(stdin, out):
     return EXIT_OK if ok else EXIT_RUN_FAILED
 
 
+# ---- the transport boundary -------------------------------------------------
+#
+# Everything above this line is shared by both targets. A localhost install and a
+# remote install differ only in which Transport instance run_steps() is handed,
+# which is what makes "the same plan behaves identically on both" a testable
+# claim rather than an aspiration.
+
+DEFAULT_TIMEOUT = float(os.environ.get("PILOT_STEP_TIMEOUT", "900"))
+
+# Preference order when a host offers several key types. Ed25519 first: it is the
+# type OpenSSH itself prefers, so the fingerprint the user confirms is the one
+# their own ssh client would show.
+KEY_PREFERENCE = ("ssh-ed25519", "ecdsa-sha2-nistp256", "ssh-rsa")
+
+
+def _now_ms():
+    return int(time.monotonic() * 1000)
+
+
+def _pump(proc, on_line, stdin_text, timeout):
+    """Stream both output channels live, then reap the process.
+
+    Reader threads rather than a poll loop: the transcript is the feature, and a
+    step that produces no output for ten minutes must not look hung while a step
+    that produces a great deal must not deadlock on a full pipe.
+
+    Each reader iterates its handle in TEXT mode, which means it only ever yields
+    a COMPLETE line (readline() keeps pulling from the underlying pipe until it
+    sees '\\n' or EOF) — a secret split across two 4KB read() calls is reassembled
+    here, before on_line (and therefore Redactor.scrub) ever sees it. Redaction
+    is never applied to a raw partial chunk.
+    """
+    threads = []
+
+    def reader(handle, stream):
+        try:
+            for raw in handle:
+                on_line(stream, raw.rstrip("\r\n"))
+        except (IOError, ValueError):
+            pass
+        finally:
+            try:
+                handle.close()
+            except (IOError, ValueError):
+                pass
+
+    for handle, stream in ((proc.stdout, "stdout"), (proc.stderr, "stderr")):
+        thread = threading.Thread(target=reader, args=(handle, stream))
+        thread.daemon = True
+        thread.start()
+        threads.append(thread)
+
+    if stdin_text is not None and proc.stdin is not None:
+        try:
+            proc.stdin.write(stdin_text)
+            proc.stdin.close()
+        except (IOError, ValueError):
+            pass
+
+    try:
+        rc = proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        rc = proc.wait()
+        on_line("stderr", "pilot-exec: step timed out after " + str(timeout) + "s")
+    for thread in threads:
+        thread.join(timeout=5)
+    return rc
+
+
+class Emitter:
+    """The single place a protocol line is produced — and therefore the single
+    place redaction can be enforced. Nothing else writes to stdout during a run."""
+
+    def __init__(self, out, redactor, run_id, runs_dir=None):
+        self._out = out
+        self._redactor = redactor
+        self._lock = threading.Lock()
+        self._handle = None
+        directory = RUNS_DIR if runs_dir is None else runs_dir
+        try:
+            os.makedirs(directory, exist_ok=True)
+            # run_id is validated against RUN_ID_RE before we get here, so it
+            # cannot escape the directory.
+            self._handle = open(os.path.join(directory, run_id + ".jsonl"),
+                                "a", encoding="utf-8")
+        except (IOError, OSError):
+            self._handle = None
+
+    def emit(self, obj):
+        line = json.dumps(self._redactor.scrub_obj(obj), ensure_ascii=False)
+        with self._lock:
+            self._out.write(line + "\n")
+            self._out.flush()
+            if self._handle is not None:
+                try:
+                    self._handle.write(line + "\n")
+                    self._handle.flush()
+                except (IOError, OSError):
+                    pass
+
+    def close(self):
+        if self._handle is not None:
+            try:
+                self._handle.close()
+            except (IOError, OSError):
+                pass
+            self._handle = None
+
+
+class Transport:
+    """The whole seam between shared orchestration and where a step runs."""
+
+    name = "base"
+
+    def start(self, emitter=None):
+        return None
+
+    def run(self, argv, on_line, stdin_text=None, timeout=None):
+        raise NotImplementedError
+
+    def capture(self, argv, stdin_text=None, timeout=None):
+        out_lines = []
+        err_lines = []
+
+        def sink(stream, line):
+            (out_lines if stream == "stdout" else err_lines).append(line)
+
+        rc = self.run(argv, sink, stdin_text, timeout)
+        return rc, "\n".join(out_lines), "\n".join(err_lines)
+
+    def write_file(self, path, content, mode, owner):
+        raise NotImplementedError
+
+    def sha256(self, path):
+        raise NotImplementedError
+
+    def close(self):
+        return None
+
+
+class LocalTransport(Transport):
+    name = "local"
+
+    def __init__(self, timeout=None):
+        self._timeout = DEFAULT_TIMEOUT if timeout is None else timeout
+
+    def run(self, argv, on_line, stdin_text=None, timeout=None):
+        if not argv:
+            on_line("stderr", "pilot-exec: empty argv")
+            return 127
+        try:
+            proc = subprocess.Popen(
+                argv,
+                stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                universal_newlines=True, bufsize=1)
+        except OSError as exc:
+            on_line("stderr", "pilot-exec: cannot run " + argv[0] + ": " + str(exc))
+            return 127
+        return _pump(proc, on_line, stdin_text,
+                     self._timeout if timeout is None else timeout)
+
+    def write_file(self, path, content, mode, owner):
+        directory = os.path.dirname(path) or "/"
+        try:
+            if not os.path.isdir(directory):
+                os.makedirs(directory, mode=0o755, exist_ok=True)
+            tmp = path + ".pilot-tmp"
+            with open(tmp, "w", encoding="utf-8") as handle:
+                handle.write(content)
+            os.chmod(tmp, int(mode, 8))
+        except (IOError, OSError) as exc:
+            return 1, "pilot-exec: cannot write " + path + ": " + str(exc)
+        rc, _out, err = self.capture(["chown", owner, tmp])
+        if rc != 0:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            return rc, err or ("chown " + owner + " failed with exit " + str(rc))
+        try:
+            os.replace(tmp, path)
+        except OSError as exc:
+            return 1, "pilot-exec: cannot install " + path + ": " + str(exc)
+        return 0, ""
+
+    def sha256(self, path):
+        digest = hashlib.sha256()
+        try:
+            with open(path, "rb") as handle:
+                while True:
+                    chunk = handle.read(65536)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+        except (IOError, OSError) as exc:
+            return None, str(exc)
+        return digest.hexdigest(), ""
+
+
+# ---- TOFU host keys ---------------------------------------------------------
+#
+# A turnkey installer that silently accepts any host key is a turnkey MITM, so
+# the key is never accepted by ssh's own prompt. Pilot keeps its own known_hosts
+# in OpenSSH's format, which means the file it writes is one an administrator can
+# read, audit and edit.
+
+def _kh_id(host, port):
+    return host if int(port) == 22 else "[" + host + "]:" + str(int(port))
+
+
+def read_known_hosts(path=None):
+    target = KNOWN_HOSTS if path is None else path
+    entries = []
+    try:
+        with open(target, "r", encoding="utf-8") as handle:
+            for raw in handle:
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split()
+                if len(parts) < 3:
+                    continue
+                entries.append({"id": parts[0], "keytype": parts[1], "key": parts[2]})
+    except (IOError, OSError):
+        return []
+    return entries
+
+
+def known_hosts_lookup(host, port, path=None):
+    wanted = _kh_id(host, port)
+    return [entry for entry in read_known_hosts(path) if entry["id"] == wanted]
+
+
+def known_hosts_record(host, port, keytype, key, path=None):
+    target = KNOWN_HOSTS if path is None else path
+    directory = os.path.dirname(target) or "."
+    if not os.path.isdir(directory):
+        os.makedirs(directory, mode=0o755, exist_ok=True)
+    line = _kh_id(host, port) + " " + keytype + " " + key + "\n"
+    existing = []
+    try:
+        with open(target, "r", encoding="utf-8") as handle:
+            existing = handle.readlines()
+    except (IOError, OSError):
+        existing = []
+    if line in existing:
+        return
+    with open(target, "a", encoding="utf-8") as handle:
+        handle.write(line)
+    try:
+        os.chmod(target, 0o644)
+    except OSError:
+        pass
+
+
+def openssh_fingerprint(key_b64):
+    try:
+        blob = base64.b64decode(key_b64, validate=True)
+    except (ValueError, TypeError):
+        return None
+    digest = hashlib.sha256(blob).digest()
+    return "SHA256:" + base64.b64encode(digest).decode("ascii").rstrip("=")
+
+
+def scan_hostkeys(host, port, timeout=15):
+    argv = ["ssh-keyscan", "-T", "10", "-p", str(int(port)), host]
+    try:
+        proc = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              universal_newlines=True, timeout=timeout)
+    except OSError:
+        raise Fail(EXIT_TRANSPORT, "SSH_UNREACHABLE",
+                   "ssh-keyscan is not installed on the Cockpit host")
+    except subprocess.TimeoutExpired:
+        raise Fail(EXIT_TRANSPORT, "SSH_UNREACHABLE",
+                   "timed out reading the host key of " + host)
+    keys = []
+    for raw in proc.stdout.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        keys.append({"keytype": parts[1], "key": parts[2]})
+    if not keys:
+        raise Fail(EXIT_TRANSPORT, "SSH_UNREACHABLE",
+                   "no SSH host key was offered by " + host + ":" + str(int(port)))
+    keys.sort(key=lambda entry: KEY_PREFERENCE.index(entry["keytype"])
+              if entry["keytype"] in KEY_PREFERENCE else len(KEY_PREFERENCE))
+    return keys
+
+
+def hostkey_status(host, port):
+    offered = scan_hostkeys(host, port)
+    best = offered[0]
+    fingerprint = openssh_fingerprint(best["key"])
+    if fingerprint is None:
+        raise Fail(EXIT_TRANSPORT, "SSH_UNREACHABLE",
+                   "the host key offered by " + host + " is not valid base64")
+    recorded = known_hosts_lookup(host, port)
+    if not recorded:
+        return {"fingerprint": fingerprint, "known": False,
+                "kind": "SSH_HOSTKEY_UNKNOWN",
+                "keytype": best["keytype"], "key": best["key"]}
+    offered_keys = set(entry["key"] for entry in offered)
+    for entry in recorded:
+        if entry["key"] in offered_keys:
+            return {"fingerprint": openssh_fingerprint(entry["key"]), "known": True,
+                    "kind": "OK", "keytype": entry["keytype"], "key": entry["key"]}
+    # The host is known and the key is not the one recorded. This is the single
+    # condition that is never "warn and continue".
+    return {"fingerprint": fingerprint, "known": True,
+            "kind": "SSH_HOSTKEY_CHANGED",
+            "keytype": best["keytype"], "key": best["key"]}
+
+
+def hostkey_gate(ssh):
+    status = hostkey_status(ssh["host"], ssh["port"])
+    if status["kind"] == "SSH_HOSTKEY_CHANGED":
+        raise Fail(EXIT_HOSTKEY_CHANGED, "SSH_HOSTKEY_CHANGED",
+                   "the SSH host key of " + ssh["host"] + " has CHANGED; refusing to "
+                   "connect. The offered key is " + status["fingerprint"])
+    if not status["known"]:
+        accepted = ssh.get("accept_fingerprint")
+        if not accepted:
+            raise Fail(EXIT_HOSTKEY_UNKNOWN, "SSH_HOSTKEY_UNKNOWN",
+                       "unknown host key " + status["fingerprint"] + "; confirm it "
+                       "and re-run with ssh.accept_fingerprint set")
+        if accepted != status["fingerprint"]:
+            raise Fail(EXIT_HOSTKEY_CHANGED, "SSH_HOSTKEY_CHANGED",
+                       "the confirmed fingerprint " + accepted + " does not match "
+                       "the offered " + status["fingerprint"])
+        known_hosts_record(ssh["host"], ssh["port"], status["keytype"], status["key"])
+    return status
+
+
+class SshTransport(Transport):
+    name = "ssh"
+
+    def __init__(self, ssh, credentials, timeout=None):
+        self._ssh = ssh
+        self._creds = credentials or {"password": None, "pem": None}
+        self._timeout = DEFAULT_TIMEOUT if timeout is None else timeout
+        self._pem_file = None
+        self._kh_file = None
+
+    def start(self, emitter=None):
+        status = hostkey_gate(self._ssh)
+        handle, self._kh_file = tempfile.mkstemp(prefix="pilot-kh-")
+        with os.fdopen(handle, "w") as fh:
+            fh.write(_kh_id(self._ssh["host"], self._ssh["port"]) + " " +
+                     status["keytype"] + " " + status["key"] + "\n")
+        os.chmod(self._kh_file, 0o600)
+        if self._ssh["auth"] == "pem":
+            pem = self._creds.get("pem")
+            if not pem:
+                raise Fail(EXIT_TRANSPORT, "SSH_AUTH_FAILED",
+                           "ssh.auth is 'pem' but credentials.pem is empty")
+            handle, self._pem_file = tempfile.mkstemp(prefix="pilot-pem-")
+            with os.fdopen(handle, "w") as fh:
+                fh.write(pem if pem.endswith("\n") else pem + "\n")
+            os.chmod(self._pem_file, 0o600)
+        elif self._ssh["auth"] == "password":
+            if not self._creds.get("password"):
+                raise Fail(EXIT_TRANSPORT, "SSH_AUTH_FAILED",
+                           "ssh.auth is 'password' but credentials.password is empty")
+        return status
+
+    def _base_argv(self):
+        argv = ["ssh", "-p", str(int(self._ssh["port"])),
+                "-o", "StrictHostKeyChecking=yes",
+                "-o", "UserKnownHostsFile=" + self._kh_file,
+                "-o", "GlobalKnownHostsFile=/dev/null",
+                "-o", "ConnectTimeout=15",
+                "-o", "NumberOfPasswordPrompts=1"]
+        if self._ssh["auth"] == "pem":
+            argv += ["-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes",
+                     "-i", self._pem_file]
+        elif self._ssh["auth"] == "agent":
+            argv += ["-o", "BatchMode=yes", "-o", "PreferredAuthentications=publickey"]
+        else:
+            argv += ["-o", "BatchMode=no", "-o", "PubkeyAuthentication=no",
+                     "-o", "PreferredAuthentications=password,keyboard-interactive"]
+        argv.append(self._ssh["user"] + "@" + self._ssh["host"])
+        return argv
+
+    def _wrap(self, argv):
+        """Builds the full local argv for one remote command, plus any file
+        descriptors that must survive exec into the child.
+
+        Password auth NEVER appears in argv or in the environment: both
+        /proc/<pid>/cmdline and /proc/<pid>/environ are readable by anyone who
+        can already inspect this process, so either one is a leak. Instead the
+        password travels down a pipe this process opens and writes exactly once;
+        sshpass's own `-d <fd>` reads it from there. Only the (non-secret) file
+        descriptor NUMBER appears in argv — never the secret itself — and the
+        descriptor is closed on our side the moment the child has it.
+        """
+        remote = " ".join(shlex.quote(item) for item in argv)
+        base = self._base_argv() + [remote]
+        if self._ssh["auth"] != "password":
+            return base, ()
+        read_fd, write_fd = os.pipe()
+        os.write(write_fd, (self._creds["password"] + "\n").encode("utf-8"))
+        os.close(write_fd)
+        return ["sshpass", "-d", str(read_fd)] + base, (read_fd,)
+
+    def run(self, argv, on_line, stdin_text=None, timeout=None):
+        if not argv:
+            on_line("stderr", "pilot-exec: empty argv")
+            return 127
+        full, extra_fds = self._wrap(argv)
+        try:
+            try:
+                proc = subprocess.Popen(
+                    full,
+                    stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    universal_newlines=True, bufsize=1, pass_fds=extra_fds)
+            except OSError as exc:
+                on_line("stderr", "pilot-exec: cannot run " + full[0] + ": " + str(exc))
+                return 127
+        finally:
+            # The child received its own copy across fork(); our copy is no
+            # longer needed whether or not the exec succeeded.
+            for fd in extra_fds:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+        return _pump(proc, on_line, stdin_text,
+                     self._timeout if timeout is None else timeout)
+
+    def write_file(self, path, content, mode, owner):
+        quote = shlex.quote
+        script = ("set -e; umask 077; "
+                  "d=$(dirname " + quote(path) + "); mkdir -p \"$d\"; "
+                  "t=" + quote(path + ".pilot-tmp") + "; "
+                  "base64 -d > \"$t\"; "
+                  "chmod " + quote(mode) + " \"$t\"; "
+                  "chown " + quote(owner) + " \"$t\"; "
+                  "mv -f \"$t\" " + quote(path))
+        payload = base64.b64encode(content.encode("utf-8")).decode("ascii")
+        rc, _out, err = self.capture(["/bin/sh", "-c", script],
+                                     stdin_text=payload + "\n")
+        if rc != 0:
+            return rc, err or ("remote write of " + path + " failed with exit " + str(rc))
+        return 0, ""
+
+    def sha256(self, path):
+        rc, out, err = self.capture(["sha256sum", "--", path])
+        if rc != 0:
+            return None, err or ("sha256sum failed with exit " + str(rc))
+        tokens = out.strip().split()
+        if not tokens or not SHA256_RE.match(tokens[0].lower()):
+            return None, "could not read a digest from sha256sum output"
+        return tokens[0].lower(), ""
+
+    def close(self):
+        for temp in (self._pem_file, self._kh_file):
+            if temp:
+                try:
+                    os.unlink(temp)
+                except OSError:
+                    pass
+        self._pem_file = None
+        self._kh_file = None
+
+
+def make_transport(doc):
+    """Builds the transport from the document's own transport field.
+
+    Accepts an Envelope or a DetectRequest: both carry transport/ssh/credentials
+    with identical meaning, which is why there is no --transport flag to disagree
+    with them.
+    """
+    if doc["transport"] == "local":
+        return LocalTransport()
+    return SshTransport(doc["ssh"], doc["credentials"])
+
+
+# ---- the shared run engine --------------------------------------------------
+
+def _verify_sha256(step, transport, emitter):
+    target = download_target(step["argv"])
+    digest, message = transport.sha256(target)
+    if digest is None:
+        emitter.emit({"t": "output", "id": step["id"], "stream": "stderr",
+                      "line": "pilot-exec: cannot hash " + target + ": " + message})
+        return 1, "CHECKSUM_MISMATCH"
+    if digest != step["sha256"]:
+        emitter.emit({"t": "output", "id": step["id"], "stream": "stderr",
+                      "line": "pilot-exec: sha256 mismatch for " + target +
+                              ": expected " + step["sha256"] + ", got " + digest})
+        return 1, "CHECKSUM_MISMATCH"
+    emitter.emit({"t": "output", "id": step["id"], "stream": "stdout",
+                  "line": "pilot-exec: sha256 verified for " + target})
+    return 0, None
+
+
+def run_steps(env, transport, emitter):
+    completed = 0
+    for step in env["steps"]:
+        if step["secret"]:
+            cmd = SECRET_MASK
+        elif step["write"] is not None:
+            cmd = "write " + step["write"]["path"]
+        else:
+            cmd = shell_join(step["argv"])
+        emitter.emit({"t": "step-start", "id": step["id"],
+                      "title": step["title"], "cmd": cmd})
+        started = _now_ms()
+
+        if step["check"] is not None:
+            rc, _out, _err = transport.capture(step["check"]["argv"])
+            satisfied = (rc == 0) if step["check"]["expect"] == "zero" else (rc != 0)
+            if satisfied:
+                emitter.emit({"t": "step-end", "id": step["id"], "status": "skipped",
+                              "exit": rc, "ms": _now_ms() - started})
+                completed += 1
+                continue
+
+        if step["write"] is not None:
+            rc, message = transport.write_file(step["write"]["path"],
+                                               step["write"]["content"],
+                                               step["write"]["mode"],
+                                               step["write"]["owner"])
+            if rc != 0 and message:
+                emitter.emit({"t": "output", "id": step["id"],
+                              "stream": "stderr", "line": message})
+        else:
+            def on_line(stream, line, step_id=step["id"]):
+                emitter.emit({"t": "output", "id": step_id,
+                              "stream": stream, "line": line})
+            rc = transport.run(step["argv"], on_line)
+
+        if rc == 0 and step["sha256"] is not None:
+            rc, kind = _verify_sha256(step, transport, emitter)
+            if kind is not None:
+                emitter.emit({"t": "step-end", "id": step["id"], "status": "failed",
+                              "exit": rc, "ms": _now_ms() - started})
+                emitter.emit({"t": "run-end", "status": "failed", "kind": kind})
+                failure = Fail(EXIT_CHECKSUM, kind,
+                               "sha256 mismatch on " + str(download_target(step["argv"])))
+                failure.run_end_emitted = True
+                raise failure
+
+        emitter.emit({"t": "step-end", "id": step["id"],
+                      "status": "ok" if rc == 0 else "failed",
+                      "exit": rc, "ms": _now_ms() - started})
+        if rc != 0:
+            return ("partial" if completed else "failed"), "GENERIC"
+        completed += 1
+    return "ok", None
+
+
+def cmd_run(stdin, out):
+    env = validate_envelope(read_stdin_json(stdin))
+    redactor = Redactor()
+    creds = env["credentials"] or {}
+    redactor.add(creds.get("password") or "")
+    redactor.add(creds.get("pem") or "")
+    for step in env["steps"]:
+        if step["secret"] and step["write"] is not None:
+            redactor.add(step["write"]["content"])
+
+    emitter = Emitter(out, redactor, env["run_id"])
+    transport = None
+    try:
+        # run-start is emitted before the host-key gate so the UI always has a
+        # frame to attach a failure to, including a hard stop on the key itself.
+        emitter.emit({"t": "run-start", "run_id": env["run_id"],
+                      "transport": env["transport"], "steps": len(env["steps"])})
+        transport = make_transport(env)
+        transport.start(emitter)
+        status, kind = run_steps(env, transport, emitter)
+        emitter.emit({"t": "run-end", "status": status, "kind": kind})
+        return EXIT_OK if status == "ok" else EXIT_RUN_FAILED
+    except Fail as exc:
+        if not getattr(exc, "run_end_emitted", False):
+            emitter.emit({"t": "run-end", "status": "failed", "kind": exc.kind})
+        raise
+    finally:
+        if transport is not None:
+            transport.close()
+        emitter.close()
+
+
 # ---- entry point ------------------------------------------------------------
 
 def parse_args(argv):
@@ -525,6 +1128,7 @@ def main(argv, stdin, out, err):
 # replaced and a handler is never redefined.
 MODE_HANDLERS["--print-plan"] = cmd_print_plan
 MODE_HANDLERS["--selftest-redact"] = cmd_selftest_redact
+MODE_HANDLERS["--run"] = cmd_run
 
 if __name__ == "__main__":
     sys.exit(main(sys.argv[1:], sys.stdin, sys.stdout, sys.stderr))
