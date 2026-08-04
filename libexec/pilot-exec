@@ -1232,15 +1232,25 @@ def parse_detection(text):
     def get(name):
         return _clean(values.get(name, ""))
 
+    # A probe running on a machine we do not control can emit a digit run of
+    # any length. Python's int() refuses to convert a string of more than 4300
+    # digits (a guard against a quadratic-time DoS), which would otherwise
+    # escape parse_detection as a raw ValueError instead of this file's
+    # {"t":"fatal",...} contract. 15 digits is far beyond any plausible port
+    # or disk size, so the digit run is bounded to that before int() ever
+    # sees it — an oversized value collapses to the default/out-of-range path
+    # exactly like any other hostile input, it does not raise.
+    NUMBER_DIGITS_MAX = 15
+
     def number(name, default):
-        digits = re.sub(r"[^0-9]", "", values.get(name, ""))
+        digits = re.sub(r"[^0-9]", "", values.get(name, ""))[:NUMBER_DIGITS_MAX]
         return int(digits) if digits else default
 
     hbbs = None
     if values.get("hbbs_present") == "true":
         ports = []
         for token in values.get("hbbs_ports", "").split(","):
-            digits = re.sub(r"[^0-9]", "", token)
+            digits = re.sub(r"[^0-9]", "", token)[:NUMBER_DIGITS_MAX]
             if not digits:
                 continue
             port = int(digits)
@@ -1264,8 +1274,14 @@ def parse_detection(text):
     api = None
     if values.get("api_present") == "true":
         install = get("api_install")
+        # Same out-of-range-collapses-to-default treatment as hbbs_ports below,
+        # rather than only catching the falsy (zero) case: an oversized or
+        # otherwise nonsensical port is exactly as "not a real port" as 0 is.
+        api_port = number("api_port", 21114)
+        if not 0 < api_port < 65536:
+            api_port = 21114
         api = {"version": get("api_version") or "unknown",
-               "port": number("api_port", 21114) or 21114,
+               "port": api_port,
                "install": install if install == "binary" else "unknown"}
 
     init = get("init")

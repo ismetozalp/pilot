@@ -233,6 +233,64 @@ test('probe output cannot inject control characters or unbounded fields', () => 
     assert.equal(d.public_ip, null, 'a non-address must not be reported as a public IP');
 });
 
+// Python's int() refuses to convert a digit string of more than 4300 characters
+// (a guard against a quadratic-time DoS) — a probe running on a machine we do
+// not control can trivially emit one. Each numeric field must bound the digit
+// run before conversion, the same way the string fields are bounded by
+// _clean's maxlen, so a hostile probe degrades to a safe default instead of
+// escaping parse_detection as a raw, uncaught ValueError.
+
+test('an oversized digit run in disk_free_mb does not raise and stays a finite integer', () => {
+    const d = detect('disk_free_mb=' + '9'.repeat(5000));
+    assert.equal(typeof d.disk_free_mb, 'number');
+    assert.ok(Number.isFinite(d.disk_free_mb));
+    assert.ok(Number.isInteger(d.disk_free_mb));
+});
+
+test('an oversized digit run in api_port does not raise and collapses to the safe default port', () => {
+    const d = detect(['api_present=true', 'api_port=' + '9'.repeat(5000)].join('\n'));
+    assert.equal(d.api.port, 21114, 'an out-of-range port must collapse to the default, not report a bogus port number');
+});
+
+test('an oversized digit run in an hbbs_ports token does not raise and is dropped as out of range', () => {
+    const d = detect(['hbbs_present=true',
+        'hbbs_ports=' + '9'.repeat(5000) + ',22,' + '8'.repeat(6000)].join('\n'));
+    assert.deepEqual(d.hbbs.ports, [22], 'the one in-range port survives; the oversized tokens are dropped, not crashed on');
+});
+
+test('a payload with hostile oversized numeric fields everywhere at once degrades safely as a whole', () => {
+    // Closes the class generally rather than field by field: every numeric
+    // field hostile at the same time, in one probe.
+    const d = detect([
+        'disk_free_mb=' + '7'.repeat(6000),
+        'api_present=true',
+        'api_port=' + '8'.repeat(6000),
+        'hbbs_present=true',
+        'hbbs_ports=' + '6'.repeat(6000) + ',21116,' + '5'.repeat(6000),
+    ].join('\n'));
+    assert.equal(typeof d.disk_free_mb, 'number');
+    assert.ok(Number.isFinite(d.disk_free_mb));
+    assert.equal(d.api.port, 21114);
+    assert.deepEqual(d.hbbs.ports, [21116]);
+});
+
+test('a totally malformed --detect stdin document still produces a structured fatal line, never a traceback', () => {
+    // This exercises the full CLI path (not just the parser in isolation):
+    // whatever is thrown must surface through main()'s Fail/BrokenPipeError
+    // handling as {"t":"fatal",...} on stderr with a clean exit code, never an
+    // uncaught Python traceback.
+    for (const raw of ['{"version":1', '[]', '', 'not json at all', '{}']) {
+        const r = run(['--detect'], raw);
+        assert.equal(r.code, 3, 'raw=' + JSON.stringify(raw));
+        assert.doesNotMatch(r.err, /Traceback/);
+        let parsed;
+        assert.doesNotThrow(() => { parsed = JSON.parse(r.err.trim()); }, 'stderr must be one JSON fatal line: ' + r.err);
+        assert.equal(parsed.t, 'fatal');
+        assert.equal(typeof parsed.kind, 'string');
+        assert.equal(typeof parsed.message, 'string');
+    }
+});
+
 test('a key repeated by the probe takes its last value, deterministically', () => {
     const d = detect(['arch=x86_64', 'arch=aarch64'].join('\n'));
     assert.equal(d.arch, 'aarch64');
