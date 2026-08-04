@@ -34,6 +34,12 @@
     // Escapes only — a literal control byte in a source file is invisible and does
     // not survive copy-paste.
     const CTRL = /[\x00-\x1f\x7f]/;
+    // note is the one field allowed to contain \n (folded from \r\n/\r), but every
+    // OTHER control byte is still forbidden in it -- including a literal tab
+    // (\x09), which is deliberate: a tab inside note has no legitimate rendering
+    // in a single-line CSV cell or a form field, so it is rejected everywhere, not
+    // just here. Nothing upstream of this file spells that out, so this comment is
+    // the pinned decision Task 23 should rely on.
     const CTRL_NO_LF = /[\x00-\x09\x0b-\x1f\x7f]/;
     const ID_RE = /^[A-Za-z0-9_-]+$/;
     const TEXT_FIELDS = ['alias', 'username', 'hostname', 'platform'];
@@ -107,22 +113,35 @@
         return { ok: problems.length === 0, peer, problems };
     }
 
+    // dedupePeers has no notion of "book" -- Peer carries no book/guid field (that
+    // lives on Book, a separate record), so identity here is id ALONE. A caller
+    // that gathers peers from more than one book before calling this MUST
+    // partition its own list by book first, or two genuinely different machines
+    // that happen to share an id will fuse. Rather than leave that as an
+    // unenforced convention, every discarded conflicting field value is reported
+    // in `conflicts` -- a caller can inspect it and refuse, warn on, or undo a
+    // fusion it did not intend. `merged` (the pinned shape) only ever names WHICH
+    // ids were touched; `conflicts` says what was lost doing it.
     function dedupePeers(list) {
         const byId = new Map();
         const order = [];
         const merged = [];
+        const conflicts = [];
         for (const raw of (Array.isArray(list) ? list : [])) {
             const peer = normalizePeer(raw);
             if (!peer.id) continue;
             if (!byId.has(peer.id)) { byId.set(peer.id, peer); order.push(peer.id); continue; }
             const kept = byId.get(peer.id);
-            for (const f of TEXT_FIELDS.concat(['note']))
-                if (!kept[f] && peer[f]) kept[f] = peer[f];
+            for (const f of TEXT_FIELDS.concat(['note'])) {
+                if (!kept[f] && peer[f]) { kept[f] = peer[f]; continue; }
+                if (kept[f] && peer[f] && kept[f] !== peer[f])
+                    conflicts.push({ id: peer.id, field: f, kept: kept[f], discarded: peer[f] });
+            }
             for (const t of peer.tags)
                 if (kept.tags.indexOf(t) === -1 && kept.tags.length < LIMITS.tagsPerPeer) kept.tags.push(t);
             if (merged.indexOf(peer.id) === -1) merged.push(peer.id);
         }
-        return { peers: order.map((k) => byId.get(k)), merged };
+        return { peers: order.map((k) => byId.get(k)), merged, conflicts };
     }
 
     function withTags(peer, tags, mode) {
@@ -233,11 +252,19 @@
     // A field a spreadsheet would evaluate gets one apostrophe in front. The
     // apostrophe itself is in the trigger set, so guarding is injective and
     // unguardFormula() restores the original for EVERY string, including "'=x".
+    //
+    // The trigger check looks PAST a run of known zero-width/invisible characters
+    // (zero-width space/non-joiner/joiner, BOM, word joiner) rather than only the
+    // literal first byte: a field that is invisible-char + "=1+1" would render in
+    // Excel/LibreOffice exactly like "=1+1" once the invisible run is skipped, so
+    // testing only charAt(0) would let a disguised formula through unguarded.
     const FORMULA = /^[=+\-@\t\r']/;
-    function guardFormula(v) { const s = str(v); return FORMULA.test(s) ? "'" + s : s; }
+    const INVISIBLE_LEAD = /^[\u200b\u200c\u200d\u2060\ufeff]+/;
+    function triggersFormula(s) { return FORMULA.test(s.replace(INVISIBLE_LEAD, '')); }
+    function guardFormula(v) { const s = str(v); return triggersFormula(s) ? "'" + s : s; }
     function unguardFormula(v) {
         const s = str(v);
-        return (s.charAt(0) === "'" && FORMULA.test(s.slice(1))) ? s.slice(1) : s;
+        return (s.charAt(0) === "'" && triggersFormula(s.slice(1))) ? s.slice(1) : s;
     }
 
     function csvEscape(v) {
@@ -251,7 +278,7 @@
     function parseCsv(text) {
         const problems = [];
         let s = str(text);
-        if (s.charAt(0) === '﻿') s = s.slice(1);
+        if (s.charAt(0) === '\uFEFF') s = s.slice(1);
         const rows = [];
         let row = [];
         let field = '';
@@ -326,8 +353,20 @@
             return { peers: [], problems };
         }
         const header = rows[0].map((h) => unguardFormula(h).trim().toLowerCase());
+        // A duplicated header (two "id" columns, say from a hand-merged
+        // spreadsheet) must not silently discard a whole column of data: the
+        // first occurrence still wins, but which columns were dropped is now
+        // named in `problems` instead of vanishing without a trace.
         const index = {};
-        for (const c of COLUMNS) index[c] = header.indexOf(c);
+        for (const c of COLUMNS) {
+            const positions = [];
+            for (let h = 0; h < header.length; h++) if (header[h] === c) positions.push(h);
+            index[c] = positions.length ? positions[0] : -1;
+            if (positions.length > 1)
+                problems.push('duplicate column header: ' + c + ' (columns ' +
+                    positions.map((p) => p + 1).join(', ') + ') — only column ' +
+                    (positions[0] + 1) + ' is used, the rest are ignored');
+        }
         if (index.id === -1) { problems.push('CSV has no "id" column'); return { peers: [], problems }; }
 
         const candidates = [];
@@ -347,6 +386,9 @@
         }
         const d = dedupePeers(candidates);
         for (const id of d.merged) problems.push('duplicate id merged: ' + id);
+        for (const c of d.conflicts)
+            problems.push('duplicate id ' + c.id + ': ' + c.field + ' "' + c.discarded +
+                '" was discarded in favor of "' + c.kept + '"');
         return { peers: d.peers, problems };
     }
 

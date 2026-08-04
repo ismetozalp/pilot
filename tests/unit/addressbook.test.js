@@ -95,7 +95,33 @@ test('dedupePeers merges by id, unions tags and drops peers with no id', () => {
     assert.equal(out.peers[0].alias, 'first');
     assert.equal(out.peers[0].hostname, 'h1');
     assert.deepEqual(out.peers[0].tags, ['a', 'b']);
-    assert.deepEqual(AB.dedupePeers(null), { peers: [], merged: [] });
+    assert.deepEqual(AB.dedupePeers(null), { peers: [], merged: [], conflicts: [] });
+});
+
+test('dedupePeers names exactly which conflicting field values were discarded', () => {
+    // dedupePeers has no book scoping -- two records that happen to share an id
+    // fuse into one regardless of whether they came from the same address book or
+    // two unrelated ones. `merged` alone only says an id was touched; `conflicts`
+    // is what lets a caller notice a fusion it should not have allowed and see
+    // exactly what would be lost.
+    const out = AB.dedupePeers([
+        { id: '1', alias: 'front desk', hostname: 'ws-01', tags: ['siteA'] },
+        { id: '1', alias: 'back office', hostname: 'ws-02', tags: ['siteB'] }
+    ]);
+    assert.deepEqual(out.merged, ['1']);
+    assert.deepEqual(out.conflicts, [
+        { id: '1', field: 'alias', kept: 'front desk', discarded: 'back office' },
+        { id: '1', field: 'hostname', kept: 'ws-01', discarded: 'ws-02' }
+    ]);
+    assert.equal(out.peers.length, 1);
+    assert.equal(out.peers[0].alias, 'front desk');
+    assert.deepEqual(out.peers[0].tags, ['siteA', 'siteB'], 'tags still union, not a conflict');
+
+    // filling an EMPTY field from a duplicate is not a conflict -- only two
+    // non-empty, differing values are.
+    const filled = AB.dedupePeers([{ id: '2' }, { id: '2', alias: 'only one has a name' }]);
+    assert.deepEqual(filled.conflicts, []);
+    assert.equal(filled.peers[0].alias, 'only one has a name');
 });
 
 test('withTags and bulkTag honour add/remove/set and reject any other mode', () => {
@@ -181,11 +207,23 @@ test('the formula guard is reversible for every string, including empty', () => 
     assert.equal(AB.guardFormula('plain'), 'plain');
 });
 
+test('the formula guard looks past a leading zero-width/invisible character', () => {
+    const hidden = '\u200B=1+1';
+    assert.equal(AB.guardFormula(hidden), "'" + hidden, 'a trigger hidden behind U+200B must still be guarded');
+    assert.equal(AB.unguardFormula(AB.guardFormula(hidden)), hidden);
+
+    const benign = '\u200Bhello';
+    assert.equal(AB.guardFormula(benign), benign, 'invisible char + plain text is not a formula');
+
+    for (const v of [hidden, benign, '\uFEFF+1', '\u2060@x', '\u200C\u200D-9'])
+        assert.equal(AB.unguardFormula(AB.guardFormula(v)), v, 'not reversible: ' + JSON.stringify(v));
+});
+
 test('parseCsv survives quotes, embedded separators, CRLF and a truncated quote', () => {
     assert.deepEqual(AB.parseCsv('').rows, []);
     assert.deepEqual(AB.parseCsv('\r\n\n').rows, []);
     assert.deepEqual(AB.parseCsv('""').rows, [['']], 'a quoted empty field is a real row');
-    assert.deepEqual(AB.parseCsv('﻿a,b').rows, [['a', 'b']], 'BOM not stripped');
+    assert.deepEqual(AB.parseCsv('\uFEFFa,b').rows, [['a', 'b']], 'BOM not stripped');
     assert.deepEqual(AB.parseCsv('a,"b,c",d').rows, [['a', 'b,c', 'd']]);
     assert.deepEqual(AB.parseCsv('"say ""hi"""').rows, [['say "hi"']]);
     assert.deepEqual(AB.parseCsv('a\r\nb\nc').rows, [['a'], ['b'], ['c']]);
@@ -231,6 +269,22 @@ test('fromCsv maps columns by header name, in any order, ignoring extras', () =>
     assert.equal(out.peers[0].note, 'hello');
     assert.deepEqual(out.peers[0].tags, ['a', 'b']);
     assert.equal(out.peers[0].alias, '');
+});
+
+test('fromCsv names a duplicate column header instead of silently dropping the data', () => {
+    const dupId = AB.fromCsv('id,id,note\r\nKEEP,DISCARDED,hello\r\n');
+    assert.equal(dupId.peers.length, 1);
+    assert.equal(dupId.peers[0].id, 'KEEP', 'first occurrence still wins');
+    assert.equal(dupId.peers[0].note, 'hello');
+    assert.match(dupId.problems[0], /duplicate column header: id/);
+
+    const dupAlias = AB.fromCsv('id,alias,alias\r\nok-1,KEEP,DISCARDED\r\n');
+    assert.equal(dupAlias.peers[0].alias, 'KEEP');
+    assert.match(dupAlias.problems[0], /duplicate column header: alias/);
+
+    const triple = AB.fromCsv('id,id,id\r\nKEEP,SECOND,THIRD\r\n');
+    assert.equal(triple.peers[0].id, 'KEEP');
+    assert.match(triple.problems[0], /duplicate column header: id \(columns 1, 2, 3\)/);
 });
 
 test('fromCsv reports bad rows by number and keeps the good ones', () => {
