@@ -31,7 +31,6 @@
         { id: 'file', label: 'File transfers' },
         { id: 'login', label: 'Logins' }
     ];
-    const CONTROL_ONE = /[\x00-\x1f\x7f]/;
     const DIGITS_RE = /^[0-9]+$/;
     const DAY_RE = /^([0-9]{4})-([0-9]{2})-([0-9]{2})$/;
     const MIN_MS = Date.UTC(2000, 0, 1);
@@ -67,7 +66,7 @@
             if (!isFinite(value)) return null;
             ms = scale(value);
         } else if (typeof value === 'string') {
-            if (value === '' || CONTROL_ONE.test(value)) return null;
+            if (value === '' || view().hasControl(value)) return null;
             const s = value.trim();
             if (s === '') return null;
             if (DIGITS_RE.test(s)) {
@@ -98,7 +97,7 @@
     }
 
     function parseDay(value, endOfDay) {
-        if (typeof value !== 'string' || CONTROL_ONE.test(value)) return null;
+        if (typeof value !== 'string' || view().hasControl(value)) return null;
         const m = DAY_RE.exec(value.trim());
         if (!m) return null;
         const y = Number(m[1]), mo = Number(m[2]), d = Number(m[3]);

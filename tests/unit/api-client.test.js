@@ -483,6 +483,41 @@ test('audit.conn, file and login are three distinct admin endpoints', async () =
     calls.forEach((c) => assert.equal(c.auth, C.AUTH.admin));
 });
 
+// The test above only ever fed an empty list through audit.conn/file/login —
+// exactly the shape that would look identical whether paginate() unwrapped
+// the real payload or silently discarded it (the axis Task 18's address-book
+// façade actually broke on: 76 green tests that never called those methods).
+// A realistic envelope — several rows, a total clearly larger than list.length,
+// a non-default page/page_size — is the only fixture that can tell "unwrapped
+// correctly" from "returned a plausible-looking empty stub" apart. Mutation-
+// verified: breaking paginate() (js/core/api-client.js) turns these three red
+// (task-25-report.md carries the transcript).
+test('audit.conn unwraps a realistic paginated envelope, not just an empty list', async () => {
+    const calls = recorder({ status: 200, body: { code: 0, message: '', data:
+        { list: [{ id: 'c1' }, { id: 'c2' }, { id: 'c3' }], page: 4, total: 137, page_size: 25 } } });
+    const out = await Api.audit.conn({ page: 4, pageSize: 25 });
+    assert.equal(calls[0].method, 'GET');
+    assert.equal(calls[0].path, C.EP['audit.conn'].path + '?page=4&page_size=25');
+    assert.equal(calls[0].auth, C.AUTH.admin);
+    assert.deepEqual(out, { list: [{ id: 'c1' }, { id: 'c2' }, { id: 'c3' }], page: 4, total: 137, pageSize: 25 });
+});
+
+test('audit.file unwraps a realistic paginated envelope, not just an empty list', async () => {
+    const calls = recorder({ status: 200, body: { code: 0, message: '', data:
+        { list: [{ id: 'f1' }, { id: 'f2' }], page: 2, total: 53, page_size: 10 } } });
+    const out = await Api.audit.file({ page: 2, pageSize: 10 });
+    assert.equal(calls[0].path, C.EP['audit.file'].path + '?page=2&page_size=10');
+    assert.deepEqual(out, { list: [{ id: 'f1' }, { id: 'f2' }], page: 2, total: 53, pageSize: 10 });
+});
+
+test('audit.login unwraps a realistic paginated envelope, not just an empty list', async () => {
+    const calls = recorder({ status: 200, body: { code: 0, message: '', data:
+        { list: [{ id: 'l1' }, { id: 'l2' }, { id: 'l3' }, { id: 'l4' }], page: 1, total: 204, page_size: 4 } } });
+    const out = await Api.audit.login({ page: 1, pageSize: 4 });
+    assert.equal(calls[0].path, C.EP['audit.login'].path + '?page=1&page_size=4');
+    assert.deepEqual(out, { list: [{ id: 'l1' }, { id: 'l2' }, { id: 'l3' }, { id: 'l4' }], page: 1, total: 204, pageSize: 4 });
+});
+
 // --------------------------------------------------------- hostile façade input ---
 
 test('devices.rename: a pre-encoded traversal id is also neutralised, never a real path change', async () => {
