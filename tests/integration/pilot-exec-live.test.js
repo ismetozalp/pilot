@@ -618,17 +618,19 @@ test('SshTransport.write_file surfaces a real remote chown failure as a failed s
         assert.match(r.raw, /chown/);
         assert.equal(sh('podman', ['exec', name, 'test', '-e', '/var/cache/pilot/owned.txt']).status,
             1, 'the target file must not exist after a failed remote chown');
-        // Verified against the real implementation before writing this
-        // assertion (see the task report): unlike LocalTransport, which
-        // explicitly unlinks its temp file on a chown failure, the remote
-        // write_file script aborts via `set -e` immediately after chown
-        // fails, before it ever reaches `mv -f` — so its temp file is left
-        // behind. This is a genuine, confirmed asymmetry between the two
-        // transports, asserted here as documented fact rather than assumed.
+        // Transport parity, asserted rather than assumed: LocalTransport.write_file
+        // explicitly unlinks its temp file when chown fails (see the sibling
+        // assertion in the local chown-failure test above). SshTransport.write_file's
+        // remote script now carries an EXIT trap for exactly this reason — without
+        // it, `set -e` would abort the script the instant `chown` failed, before
+        // ever reaching `mv -f`, leaving `.pilot-tmp` (potentially secret content,
+        // per a `secret: true` write step) behind on the remote host at a
+        // predictable path. This was a real, confirmed gap; it is fixed in
+        // libexec/pilot-exec and asserted here so a regression is caught live.
         assert.equal(
             sh('podman', ['exec', name, 'test', '-e', '/var/cache/pilot/owned.txt.pilot-tmp']).status,
-            0, 'expected the remote temp file to be left behind after a failed chown ' +
-                '(known LocalTransport/SshTransport asymmetry — see task report)');
+            1, 'the remote temp file must be cleaned up after a failed chown, ' +
+                'the same as LocalTransport');
     });
 
 test('SshTransport.write_file chowns to root:root and succeeds over a real ssh connection',

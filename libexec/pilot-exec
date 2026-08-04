@@ -961,9 +961,20 @@ class SshTransport(Transport):
 
     def write_file(self, path, content, mode, owner):
         quote = shlex.quote
+        # set -e means the FIRST failing command (base64, chmod, chown or the
+        # mv itself) ends the script immediately; without the trap that
+        # leaves ".pilot-tmp" behind on the remote host — a real gap in
+        # transport parity with LocalTransport.write_file, which unlinks its
+        # own temp file on failure, and worse for a secret step, whose
+        # content the temp file holds under 0600 either way (umask 077).
+        # A single-quoted EXIT trap runs on every exit path, success or
+        # failure; by the time it fires after a successful "mv -f", "$t" no
+        # longer exists, so "rm -f" is a harmless no-op and the success path
+        # is unchanged.
         script = ("set -e; umask 077; "
                   "d=$(dirname " + quote(path) + "); mkdir -p \"$d\"; "
                   "t=" + quote(path + ".pilot-tmp") + "; "
+                  "trap 'rm -f \"$t\"' EXIT; "
                   "base64 -d > \"$t\"; "
                   "chmod " + quote(mode) + " \"$t\"; "
                   "chown " + quote(owner) + " \"$t\"; "
