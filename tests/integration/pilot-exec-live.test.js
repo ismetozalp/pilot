@@ -304,14 +304,22 @@ test('a changed host key is a hard stop even for an already-trusted host', { ski
     const knownHosts = path.join(dir, 'known_hosts');
     // Record a key that is real in form but is not this host's.
     const other = makeKeypair();
-    fs.writeFileSync(knownHosts,
-        '[127.0.0.1]:' + port + ' ' + other.pub.trim().split(/\s+/).slice(0, 2).join(' ') + '\n');
+    const untrustedRecord = '[127.0.0.1]:' + port + ' ' +
+        other.pub.trim().split(/\s+/).slice(0, 2).join(' ') + '\n';
+    fs.writeFileSync(knownHosts, untrustedRecord);
     const hostEnv = { PILOT_RUNS_DIR: path.join(dir, 'runs'), PILOT_KNOWN_HOSTS: knownHosts };
+    // Captured before either hard-stop call, so a bug that persists the
+    // ATTACKER's key on the SSH_HOSTKEY_CHANGED path — silently trusting it
+    // while still refusing this one connection — shows up as a diff below
+    // instead of passing unnoticed.
+    const knownHostsBefore = fs.readFileSync(knownHosts, 'utf8');
 
     const probe = runOnHost({ host: '127.0.0.1', port: port }, hostEnv, '--check-hostkey');
     assert.equal(probe.code, 5);
     assert.equal(probe.lines[0].kind, 'SSH_HOSTKEY_CHANGED');
     assert.equal(probe.lines[0].known, true);
+    assert.equal(fs.readFileSync(knownHosts, 'utf8'), knownHostsBefore,
+        'a rejected --check-hostkey probe rewrote the stored host key');
 
     const sentinelStep = step({ id: 'must-not-run', mutating: true,
         argv: ['touch', '/tmp/pilot-must-not-exist'] });
@@ -326,6 +334,13 @@ test('a changed host key is a hard stop even for an already-trusted host', { ski
         { t: 'run-end', status: 'failed', kind: 'SSH_HOSTKEY_CHANGED' });
     assert.equal(sh('podman', ['exec', name, 'test', '-e', '/tmp/pilot-must-not-exist']).status !== 0,
         true, 'a step ran despite the host-key hard stop');
+    // The critical property: a hard-stopped run must not have persisted the
+    // offered (attacker) key over the previously-trusted one. If it did, the
+    // NEXT run against the real host would sail through as "known" with the
+    // wrong key on file — the exact MITM-persistence bug this test exists to
+    // catch.
+    assert.equal(fs.readFileSync(knownHosts, 'utf8'), untrustedRecord,
+        'the stored host key was rewritten by a run that hard-stopped on SSH_HOSTKEY_CHANGED');
 });
 
 // --- greenfield, then adopt ----------------------------------------------
@@ -554,6 +569,95 @@ test('a write step chowned to root:root actually succeeds under real root', { sk
     assert.equal(stat.status, 0);
     assert.equal(stat.stdout.trim(), 'root:root 640');
 });
+
+// The two tests above drive `runInContainer`, i.e. `--transport local`, so they
+// only ever exercise `LocalTransport.write_file`. `SshTransport.write_file` is a
+// structurally different implementation — a remote `/bin/sh -c` script doing
+// `chmod; chown; mv -f` under `set -e`, not a direct chown subprocess — and was
+// entirely untested by the pair above. These two are their ssh-transport
+// siblings, standing up the same real root-over-ssh container this suite
+// already uses for transport parity.
+
+function setupSshHost(name) {
+    const port = startContainer(name, true);
+    const keys = makeKeypair();
+    authoriseKey(name, keys.pub);
+    assert.equal(waitForSshd(port), true);
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pilot-ssh-'));
+    const hostEnv = { PILOT_RUNS_DIR: path.join(dir, 'runs'),
+        PILOT_KNOWN_HOSTS: path.join(dir, 'known_hosts') };
+    const probe = runOnHost({ host: '127.0.0.1', port: port }, hostEnv, '--check-hostkey');
+    assert.equal(probe.code, 0, probe.err);
+    const fp = probe.lines[0].fingerprint;
+    const sshOf = (over) => Object.assign({ host: '127.0.0.1', port: port, user: 'root',
+        auth: 'pem', accept_fingerprint: fp }, over || {});
+    return { hostEnv, sshOf, pem: keys.pem };
+}
+
+test('SshTransport.write_file surfaces a real remote chown failure as a failed step, not a crash',
+    { skip: SKIP }, (t) => {
+        t.after(destroyAll);
+        const name = 'pilot-chown-fail-ssh';
+        const { hostEnv, sshOf, pem } = setupSshHost(name);
+
+        const bad = step({
+            id: 'bad-owner', title: 'Write with a nonexistent owner', mutating: true,
+            why: 'exercise the chown-failure branch of SshTransport.write_file', argv: [],
+            write: { path: '/var/cache/pilot/owned.txt', mode: '0644',
+                content: 'x\n', owner: 'nosuchuser9:nosuchgroup9' }
+        });
+        const r = runOnHost(envelope([bad], {
+            transport: 'ssh', run_id: '20260804T000000Z',
+            ssh: sshOf(), credentials: { password: null, pem: pem }
+        }), hostEnv);
+        assert.equal(r.code, 1,
+            'a real chown failure over ssh must be a normal step failure, not a crash');
+        assert.deepEqual(outcomes(r.lines), ['bad-owner:failed']);
+        assert.deepEqual(r.lines[r.lines.length - 1],
+            { t: 'run-end', status: 'failed', kind: 'GENERIC' });
+        assert.match(r.raw, /chown/);
+        assert.equal(sh('podman', ['exec', name, 'test', '-e', '/var/cache/pilot/owned.txt']).status,
+            1, 'the target file must not exist after a failed remote chown');
+        // Verified against the real implementation before writing this
+        // assertion (see the task report): unlike LocalTransport, which
+        // explicitly unlinks its temp file on a chown failure, the remote
+        // write_file script aborts via `set -e` immediately after chown
+        // fails, before it ever reaches `mv -f` — so its temp file is left
+        // behind. This is a genuine, confirmed asymmetry between the two
+        // transports, asserted here as documented fact rather than assumed.
+        assert.equal(
+            sh('podman', ['exec', name, 'test', '-e', '/var/cache/pilot/owned.txt.pilot-tmp']).status,
+            0, 'expected the remote temp file to be left behind after a failed chown ' +
+                '(known LocalTransport/SshTransport asymmetry — see task report)');
+    });
+
+test('SshTransport.write_file chowns to root:root and succeeds over a real ssh connection',
+    { skip: SKIP }, (t) => {
+        t.after(destroyAll);
+        const name = 'pilot-chown-ok-ssh';
+        const { hostEnv, sshOf, pem } = setupSshHost(name);
+
+        const good = step({
+            id: 'good-owner', title: 'Write owned by root:root', mutating: true,
+            why: 'exercise a chown that really succeeds over ssh', argv: [],
+            write: { path: '/var/cache/pilot/rootowned.txt', mode: '0640',
+                content: 'y\n', owner: 'root:root' }
+        });
+        const r = runOnHost(envelope([good], {
+            transport: 'ssh', run_id: '20260804T000100Z',
+            ssh: sshOf(), credentials: { password: null, pem: pem }
+        }), hostEnv);
+        assert.equal(r.code, 0, r.err);
+        assert.deepEqual(outcomes(r.lines), ['good-owner:ok']);
+
+        const stat = sh('podman', ['exec', name, 'stat', '-c', '%U:%G %a',
+            '/var/cache/pilot/rootowned.txt']);
+        assert.equal(stat.status, 0);
+        assert.equal(stat.stdout.trim(), 'root:root 640');
+        assert.equal(
+            sh('podman', ['exec', name, 'test', '-e', '/var/cache/pilot/rootowned.txt.pilot-tmp']).status,
+            1, 'the remote temp file must be gone after a successful write');
+    });
 
 function spawnWatched(env, extraEnv) {
     return new Promise((resolve, reject) => {
