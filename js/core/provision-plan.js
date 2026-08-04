@@ -499,11 +499,13 @@
     }
 
     // For secret steps, render variable assignments before the command.
-    // Returns { preLines, commandLine }: preLines are setup lines (env checks, variable assignments),
-    // commandLine is the full rendered command (or null to use normal argv rendering).
+    // Returns { preLines, commandLine, mustRunManually }:
+    //   - preLines: setup lines (env checks, variable assignments)
+    //   - commandLine: full rendered command (or null to use normal argv rendering)
+    //   - mustRunManually: true if this secret step carries credentials and cannot be safely shared
     function renderSecretStep(step) {
         const preLines = [];
-        if (!step.secret) return { preLines: [], commandLine: null };
+        if (!step.secret) return { preLines: [], commandLine: null, mustRunManually: false };
 
         // DuckDNS: extract domain and token from URL, render as variables
         if (step.id === 'tls-duckdns' && Array.isArray(step.argv)) {
@@ -549,12 +551,13 @@
                     let cmdLine = argvLine(beforeUrl) + ' "https://www.duckdns.org/update?domains=${PILOT_DUCKDNS_DOMAINS}&token=${DUCKDNS_TOKEN}&ip="';
                     if (afterUrl.length > 0) cmdLine += ' ' + argvLine(afterUrl);
 
-                    return { preLines: preLines, commandLine: cmdLine };
+                    return { preLines: preLines, commandLine: cmdLine, mustRunManually: false };
                 }
             }
         }
 
-        return { preLines: [], commandLine: null };
+        // For any other secret step, refuse to render it in cleartext
+        return { preLines: [], commandLine: null, mustRunManually: true };
     }
 
     // Find a collision-free heredoc delimiter by checking content for collisions.
@@ -611,7 +614,10 @@
             } else {
                 const secretInfo = renderSecretStep(s);
                 for (let j = 0; j < secretInfo.preLines.length; j++) out.push(secretInfo.preLines[j]);
-                if (secretInfo.commandLine) {
+                if (secretInfo.mustRunManually) {
+                    out.push('# MANUAL STEP: This step carries credentials and must be run manually on the target.');
+                    out.push('# Do not include this step in a shareable script.');
+                } else if (secretInfo.commandLine) {
                     out.push(secretInfo.commandLine);
                 } else {
                     out.push(argvLine(s.argv));

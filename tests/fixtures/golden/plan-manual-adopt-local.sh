@@ -109,5 +109,6 @@ curl -fsS --retry 10 --retry-delay 2 --retry-connrefused --max-time 60 http://12
 # [16/16] Capture the generated admin password
 # The API server prints its generated admin password once, into the journal.
 # SECRET: this step carries a credential - do not paste it into a shared log.
-journalctl -u rustdesk-api.service --no-pager -n 200
+# MANUAL STEP: This step carries credentials and must be run manually on the target.
+# Do not include this step in a shareable script.
 

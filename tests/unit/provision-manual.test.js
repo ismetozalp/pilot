@@ -205,3 +205,17 @@ test('an idempotency-checked step is truly skipped on re-run (resumable script)'
     assert.ok(out.indexOf("echo \"skip: user (already satisfied)\"") !== -1);
     assert.ok(out.indexOf('fi') !== -1);
 });
+
+test('a secret step with a non-duckdns id does not leak credentials in rendered script', () => {
+    const out = P.manualScript(rawPlan([
+        rawStep({ id: 'register-api', secret: true,
+            argv: ['curl', '-fsS', '-H', 'Authorization: Bearer SUPERSECRETXYZ999', 'https://example.com/register'] })
+    ]));
+    // The literal token must NOT appear anywhere
+    assert.equal(out.indexOf('SUPERSECRETXYZ999'), -1, 'secret credential does not leak');
+    // Script must indicate this step must run manually
+    assert.ok(out.indexOf('MANUAL STEP') !== -1, 'marked as manual step');
+    assert.ok(out.indexOf('shareable script') !== -1, 'warned about sharing');
+    // The actual command is NOT included in the rendered script
+    assert.equal(out.indexOf('curl -fsS -H'), -1, 'command with secret not included');
+});
