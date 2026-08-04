@@ -1,0 +1,82 @@
+<!-- Self-update: the version badge AND its modal, in ONE Alpine scope.
+     They live in the same partial deliberately. boot.js injects partials into its
+     host element and only then loads Alpine, so a badge placed elsewhere in
+     index.html would be a different x-data scope and could not see updatePhase or
+     update.available. Keeping both here means this feature needs no knowledge of
+     index.html's layout at all — only its <script> tag.
+
+     Static backdrop and keyboard=false while running: `make install` runs as root,
+     and walking away from it half-finished is exactly what must not happen. -->
+<div x-data="pilotUpdateUi()" x-init="initUpdate(window.PilotSettings)">
+
+    <div style="position: fixed; top: 0.5rem; right: 0.75rem; z-index: 1035;">
+        <button type="button" class="btn btn-sm btn-outline-secondary"
+                :class="badgeClass()" :title="badgeTitle()"
+                @click="onBadgeClick()"
+                x-text="updateBadgeLabel()"></button>
+    </div>
+
+    <div class="modal fade" id="pilot-update" tabindex="-1"
+         data-bs-backdrop="static" data-bs-keyboard="false"
+         aria-labelledby="pilot-update-title" aria-hidden="true">
+        <div class="modal-dialog modal-dialog-centered modal-lg modal-dialog-scrollable">
+            <div class="modal-content">
+
+                <div class="modal-header">
+                    <h5 class="modal-title" id="pilot-update-title">
+                        <span x-show="updatePhase === 'confirm'">Update Pilot</span>
+                        <span x-show="updatePhase === 'running'">Updating&hellip;</span>
+                        <span x-show="updatePhase === 'done'">Update installed</span>
+                        <span x-show="updatePhase === 'error'">Update failed</span>
+                    </h5>
+                    <button type="button" class="btn-close" aria-label="Close"
+                            x-show="!_inFlight" @click="closeUpdateModal()"></button>
+                </div>
+
+                <div class="modal-body">
+                    <template x-if="updatePhase === 'confirm'">
+                        <div>
+                            <p class="mb-2">
+                                Version <strong x-text="update.version"></strong> is available.
+                                You have <span x-text="installedVersion || 'an unknown version'"></span>.
+                            </p>
+                            <div x-show="update.prerelease" class="alert alert-warning py-2 px-3 small">
+                                This is a pre-release.
+                            </div>
+                            <p class="small text-secondary mb-2">
+                                Downloading from
+                                <span x-text="update.assetUrl"></span>,
+                                then running <code>make install</code> as root.
+                                The installed version stays in place until that step succeeds.
+                            </p>
+                            <details x-show="update.notes" class="mb-0">
+                                <summary class="small">Release notes</summary>
+                                <pre class="small mb-0" style="white-space: pre-wrap;"
+                                     x-text="update.notes"></pre>
+                            </details>
+                        </div>
+                    </template>
+
+                    <template x-if="updatePhase !== 'confirm'">
+                        <pre class="small mb-0 p-2 rounded"
+                             style="max-height: 20rem; overflow: auto;
+                                    background: var(--pl-log-bg); color: var(--pl-log-fg);"
+                             x-text="updateLog.join('\n')"></pre>
+                    </template>
+                </div>
+
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary"
+                            x-show="!_inFlight" @click="closeUpdateModal()">Close</button>
+                    <button type="button" class="btn btn-primary"
+                            x-show="updatePhase === 'confirm'"
+                            @click="startSelfUpdate()">Download and install</button>
+                    <button type="button" class="btn btn-warning"
+                            x-show="updatePhase === 'done'"
+                            @click="window.location.reload()">Reload the page</button>
+                </div>
+
+            </div>
+        </div>
+    </div>
+</div>

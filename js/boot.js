@@ -8,6 +8,7 @@
 (function (root) {
 
     var PARTIALS = [
+        'html/modals/update.html',
         // Modal partials are appended here as feature tasks create them.
     ];
 
