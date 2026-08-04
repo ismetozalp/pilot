@@ -1044,6 +1044,22 @@ function withFakeCockpit(fake, fn) {
     });
 }
 
+// A cockpit whose spawn REJECTS, the way the real bridge does when the helper
+// binary is absent or the session is not elevated. `rej` is thrown as the
+// promise rejection; .input()/.stream() still exist because checkHostKey()
+// calls both before awaiting.
+function withFakeSpawn(reject, fn) {
+    return withFakeCockpit({
+        spawn() {
+            const p = reject();
+            p.input = () => p;
+            p.stream = () => p;
+            return p;
+        },
+        file() { return { read: () => Promise.resolve(null), replace: () => Promise.resolve(), close() {} }; }
+    }, fn);
+}
+
 function withFakeDocument(fn) {
     const events = [];
     const had = Object.prototype.hasOwnProperty.call(globalThis, 'document');
@@ -1698,4 +1714,73 @@ test('an error with no detail reports no cause rather than an empty "Reason:" li
     }));
     const html = fs.readFileSync(path.join(ROOT, 'index.html'), 'utf8');
     assert.match(html, /data-testid="registration-cause"[\s\S]{0,120}x-show="registrationError && registrationError\.cause"/);
+});
+
+// -------------------------------------- cockpit problem tokens never render
+
+test('checkHostKey: a missing helper reads as prose, not the raw "not-found" token', async () => {
+    // THE DEFECT, seen on a real first run: /usr/libexec/pilot/pilot-exec did
+    // not exist because `sudo make install` had never been run (symlinking the
+    // plugin directory installs the web assets but NOT the privileged helper).
+    // cockpit.spawn rejected with problem 'not-found' and .message set to that
+    // same token, and the pane rendered it verbatim: the entire explanation the
+    // user got was the word "not-found".
+    const rej = Object.assign(new Error('not-found'), { problem: 'not-found' });
+    const c = await withFakeSpawn(() => Promise.reject(rej), async () => {
+        const ui = UI.pilotSetupUi();
+        ui.choices.target = 'ssh';
+        ui.choices.host = 'example.com';
+        assert.equal(await ui.checkHostKey(), false);
+        return ui;
+    });
+    assert.equal(c.hostkey, null);
+    assert.notEqual(c.error.message, 'not-found', 'the token must never BE the message');
+    assert.match(c.error.message, /helper is not installed/i);
+    assert.match(c.error.message, /make install/);
+    assert.equal(c.error.cause, 'not-found', 'the token is still kept, as the machine-readable cause');
+});
+
+test('checkHostKey: a Limited-access session says how to get administrative access', async () => {
+    const rej = Object.assign(new Error('access-denied'), { problem: 'access-denied' });
+    const c = await withFakeSpawn(() => Promise.reject(rej), async () => {
+        const ui = UI.pilotSetupUi();
+        ui.choices.target = 'ssh';
+        ui.choices.host = 'example.com';
+        await ui.checkHostKey();
+        return ui;
+    });
+    assert.match(c.error.message, /administrative access/i);
+    assert.equal(c.error.cause, 'access-denied');
+});
+
+test('describe(): a real stderr message is preferred over the generic problem prose', async () => {
+    // err:'message' means a helper that DID write to stderr gets its own words
+    // through. Only a bare token is replaced.
+    const rej = Object.assign(new Error('ssh: connect to host example.com port 22: No route to host'),
+        { problem: 'not-found' });
+    const c = await withFakeSpawn(() => Promise.reject(rej), async () => {
+        const ui = UI.pilotSetupUi();
+        ui.choices.target = 'ssh';
+        ui.choices.host = 'example.com';
+        await ui.checkHostKey();
+        return ui;
+    });
+    assert.match(c.error.message, /No route to host/,
+        'the helper\'s own stderr is more specific than the channel problem and must win');
+});
+
+test('index.html never renders the fingerprint box or Accept without a fingerprint (§7.3)', () => {
+    const html = fs.readFileSync(path.join(ROOT, 'index.html'), 'utf8');
+    const pane = html.slice(html.indexOf('data-testid="pane-hostkey"'), html.indexOf('data-testid="pane-detect"'));
+    assert.ok(pane.length > 0);
+    for (const id of ['fingerprint', 'accept-hostkey']) {
+        const at = pane.indexOf('data-testid="' + id + '"');
+        assert.ok(at > 0, id + ' must be in the host-key pane');
+        // The element's own tag, from its '<' to the end of the open tag.
+        const start = pane.lastIndexOf('<', at);
+        const el = pane.slice(start, pane.indexOf('>', at) + 1);
+        assert.match(el, /x-show="hostkey && hostkey\.fingerprint"/,
+            id + ' must be hidden when there is no fingerprint -- an empty bordered box above ' +
+            'an enabled "This fingerprint is correct" invites confirming nothing');
+    }
 });

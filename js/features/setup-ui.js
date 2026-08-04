@@ -1064,6 +1064,25 @@
     // Cockpit default) vs 'not-found' are two completely different next actions.
     // Dropping detail here left the registration pane saying only "could not
     // write /etc/pilot/servers/local.json", with the reason discarded.
+    // A caught cockpit rejection carries .problem (a machine token) and, for
+    // spawn, a .message that is USUALLY that same token -- so rendering
+    // .message put "not-found" on the screen when the helper was not installed.
+    // PilotErrors.problemMessage() is the prose for the ones that really
+    // happen; the raw token stays available as `cause`.
+    // Substituted ONLY when the message adds nothing over the token -- either
+    // it is missing or it IS the token. A helper that wrote real stderr
+    // ("ssh: connect to host x port 22: No route to host") is strictly more
+    // specific than any sentence this table can hold, and must win.
+    function problemProse(err) {
+        if (!err || typeof err !== 'object') return '';
+        const p = str(err.problem);
+        if (p === '') return '';
+        if (!Errors || typeof Errors.problemMessage !== 'function') return '';
+        const msg = str(err.message).trim();
+        if (msg !== '' && msg !== p) return '';
+        return Errors.problemMessage(p);
+    }
+
     function causeOf(err) {
         const d = (err && typeof err === 'object') ? err.detail : null;
         if (!d || typeof d !== 'object') return null;
@@ -1072,6 +1091,21 @@
     }
 
     function describe(err) {
+        // Checked BEFORE the kind branch: a cockpit rejection has no .kind, but
+        // one that has been wrapped by a caller still carries the original
+        // .problem, and the prose beats the token either way.
+        const prose = problemProse(err);
+        if (prose) {
+            const kind = (err && typeof err === 'object' && typeof err.kind === 'string')
+                ? err.kind : 'GENERIC';
+            return {
+                kind: kind,
+                message: prose,
+                cause: str(err.problem),
+                remediation: (Errors && typeof Errors.remediation === 'function')
+                    ? Errors.remediation(kind) : null
+            };
+        }
         if (err && typeof err === 'object' && typeof err.kind === 'string') {
             return {
                 kind: err.kind,

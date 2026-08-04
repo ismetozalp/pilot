@@ -132,6 +132,39 @@
         return String(message);
     }
 
+    // Cockpit's channel `problem` codes are machine tokens -- 'not-found',
+    // 'access-denied', 'terminated'. cockpit.spawn() sets .message to that same
+    // token whenever the process produced no stderr of its own, so anything
+    // that renders a caught spawn rejection's .message puts a bare token on the
+    // screen: a first run with the helper not installed read, in full, as
+    // "not-found". Every one of these has a specific and completely different
+    // next action, so each gets a real sentence.
+    //
+    // 'not-found' and 'access-denied' are the two that actually happen: the
+    // first is `sudo make install` never having been run (the plugin's web
+    // assets can be dropped in or symlinked, but the privileged helper has to
+    // be installed to a root-owned path), and the second is Cockpit's default
+    // Limited-access session, which every account starts in.
+    const PROBLEM_MESSAGE = {
+        'not-found': "Pilot's system helper is not installed on this machine. " +
+            'Run `sudo make install` from the Pilot source directory, then try again.',
+        'access-denied': 'Pilot needs administrative access to do this. Use ' +
+            '"Turn on administrative access" in Cockpit\'s top-right menu, then try again.',
+        'authentication-failed': 'Cockpit could not authenticate this session. Sign in again.',
+        'not-supported': 'This Cockpit session cannot run system commands.',
+        'no-cockpit': 'Cockpit is not running on this machine.',
+        terminated: "The helper was stopped before it finished. Nothing was left half-applied -- try again.",
+        disconnected: "The connection to this machine's Cockpit bridge was lost. Reload the page and try again.",
+        'internal-error': 'Cockpit reported an internal error. Reload the page and try again.',
+        timeout: 'The helper did not respond in time.'
+    };
+
+    // '' means "no better wording than whatever the caller already has".
+    function problemMessage(problem) {
+        if (typeof problem !== 'string') return '';
+        return has(PROBLEM_MESSAGE, problem) ? PROBLEM_MESSAGE[problem] : '';
+    }
+
     function create(kind, message, detail) {
         const k = normalize(kind);
         const e = new Error(messageText(message, k));
@@ -147,8 +180,8 @@
     }
 
     const PilotErrors = {
-        KIND, REMEDIATION, VALUES,
-        create, remediation, isHardStop, normalize, isPilotError
+        KIND, REMEDIATION, VALUES, PROBLEM_MESSAGE,
+        create, remediation, isHardStop, normalize, isPilotError, problemMessage
     };
     root.PilotErrors = PilotErrors;
     if (typeof module !== 'undefined' && module.exports) module.exports = PilotErrors;

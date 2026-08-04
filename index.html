@@ -113,8 +113,14 @@
           <div x-show="isStep('hostkey')" data-testid="pane-hostkey">
             <p>Confirm this host key fingerprint before Pilot connects.</p>
             <p data-testid="hostkey-checking" x-show="busy">Checking the host key…</p>
-            <pre class="border p-2" data-testid="fingerprint" x-text="hostkey ? hostkey.fingerprint : ''"></pre>
-            <button class="btn btn-primary" data-testid="accept-hostkey" @click="acceptHostKey()">
+            <!-- §7.3: never render an empty control. With no fingerprint there
+                 is nothing to confirm, so the box and the Accept button are not
+                 shown at all -- an empty bordered box above an enabled
+                 "This fingerprint is correct" invites confirming nothing. -->
+            <pre class="border p-2" data-testid="fingerprint" x-show="hostkey && hostkey.fingerprint"
+                 x-text="hostkey ? hostkey.fingerprint : ''"></pre>
+            <button class="btn btn-primary" data-testid="accept-hostkey"
+                    x-show="hostkey && hostkey.fingerprint" @click="acceptHostKey()">
               This fingerprint is correct</button>
             <button class="btn btn-link" data-testid="retry-hostkey" @click="checkHostKey()">Retry</button>
             <p class="text-danger mb-0" data-testid="hostkey-error" x-text="errors.hostkey || ''"></p>

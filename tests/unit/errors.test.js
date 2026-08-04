@@ -204,3 +204,32 @@ test('a created error survives being thrown and caught by kind', () => {
         () => { throw E.create('CHECKSUM_MISMATCH', 'digest differs', { expected: 'a', got: 'b' }); },
         (e) => e.kind === 'CHECKSUM_MISMATCH' && e.remediation === 'hard-stop' && E.isHardStop(e.kind));
 });
+
+// --- problemMessage: cockpit's machine tokens never reach a screen ---------
+
+test('problemMessage: every cockpit problem that really happens gets a real sentence', () => {
+    // cockpit.spawn() sets .message to the problem token itself when the
+    // process wrote no stderr, so anything rendering .message shows the token.
+    for (const p of Object.keys(E.PROBLEM_MESSAGE)) {
+        const m = E.problemMessage(p);
+        assert.equal(typeof m, 'string');
+        assert.ok(m.length > 20, p + ' must get a sentence, not a token: ' + JSON.stringify(m));
+        assert.ok(!/^[a-z-]+$/.test(m), p + ' still looks like a token: ' + m);
+        assert.ok(/[.!]$/.test(m.trim()), p + ' must read as a sentence: ' + m);
+    }
+});
+
+test('problemMessage: the two that actually happen say what to DO', () => {
+    // A first run with no `sudo make install` read, in full, as "not-found".
+    assert.match(E.problemMessage('not-found'), /helper is not installed/i);
+    assert.match(E.problemMessage('not-found'), /make install/);
+    // Cockpit starts every account in Limited access, including sudoers.
+    assert.match(E.problemMessage('access-denied'), /administrative access/i);
+    assert.notEqual(E.problemMessage('not-found'), E.problemMessage('access-denied'));
+});
+
+test('problemMessage: an unknown or hostile problem yields nothing, never a guess', () => {
+    for (const bad of ['', 'wat', null, undefined, 7, {}, [], true,
+        '__proto__', 'constructor', 'toString', 'hasOwnProperty'])
+        assert.equal(E.problemMessage(bad), '', JSON.stringify(bad));
+});
