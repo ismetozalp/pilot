@@ -120,7 +120,10 @@ export default async function run(ctx) {
             await waitRowCount(page, 2);
             await page.fill('#pilot-devices [data-test="filter"]', 'reception');
             await waitRowCount(page, 1);
-            const calls = await transportCalls(page);
+            // Device LIST requests specifically: a Refresh also re-fetches the
+            // address books, which is a different call and not what this asserts.
+            const calls = (await transportCalls(page))
+                .filter((c) => c.path.indexOf('/admin/peer') === 0);
             assertEqual(calls.length, 1, 'filtering is client-side on the page we already have');
         } finally {
             await page.ctx.close();
@@ -231,15 +234,16 @@ export default async function run(ctx) {
         }
     });
 
-    await check('devices: add-to-address-book is disabled with a visible reason, not a dead-end control', async () => {
-        const page = await openDevices(ctx, { 'GET /admin/peer': listOk(DEVICES) });
+    await check('devices: add-to-address-book stays disabled while there is genuinely no book, ' +
+        'with the reason on screen rather than only in a tooltip', async () => {
+        const page = await openDevices(ctx, { 'GET /admin/peer': listOk(DEVICES),
+            'GET /api/ab/shared/profiles': { reject: true, message: 'no address book service' } });
         try {
             await page.click('#pilot-devices [data-test="refresh"]');
             await waitRowCount(page, 2);
             const btn = page.locator('#pilot-devices [data-device="111111111"] [data-test="add-book"]');
-            assertOk(await btn.isDisabled(), 'the control must not look identical to working Rename/Delete');
-            assertOk(await page.locator(
-                '#pilot-devices [data-device="111111111"] [data-test="add-book-hint"]').isVisible(),
+            assertOk(await btn.isDisabled(), 'nothing to add to means the control must not look working');
+            assertOk(await page.locator('#pilot-devices [data-test="book-empty-message"]').isVisible(),
                 'the reason is visible, not hidden behind a tooltip only');
         } finally {
             await page.ctx.close();
@@ -409,6 +413,81 @@ export default async function run(ctx) {
             assertEqual(out.imgs, 0, 'no element was created from the payload');
             assertEqual(out.lastSeen, 'never', 'an unparseable time is honest');
             assertOk(out.name.includes('<img'), 'the raw text is shown to the operator');
+        } finally {
+            await page.ctx.close();
+        }
+    });
+
+    // ============================================== FINAL REVIEW, FINDING 3 ==
+    //
+    // THE DEFECT: `book` was initialised to '' and never assigned anywhere, and
+    // the template had no book selector at all, so "Add to address book" was
+    // permanently :disabled with the title "No address book yet" -- factually
+    // wrong since task 23 shipped the whole Address Book surface -- and the
+    // 25-line addToBook() with its complete error handling was unreachable.
+    const BOOKS_OK = { status: 200, body: { code: 0, message: '', data: { profiles: [
+        { guid: '', name: 'Personal', personal: true },
+        { guid: 'shared-1', name: 'Support team' }
+    ] } } };
+
+    await check('FINDING 3: the address book selector is real, and "Add to address book" ' +
+        'actually calls the API with the CHOSEN book', async () => {
+        const page = await openDevices(ctx, {
+            'GET /admin/peer': listOk(DEVICES),
+            'GET /api/ab/shared/profiles': BOOKS_OK,
+            'POST /api/ab/peer/add/': { status: 200, body: { code: 0, message: '', data: {} } }
+        });
+        try {
+            await page.click('#pilot-devices [data-test="refresh"]');
+            await waitRowCount(page, 2);
+            await page.waitForSelector('#pilot-devices [data-test="book"]',
+                { state: 'visible', timeout: WAIT });
+            const names = await page.$$eval('#pilot-devices [data-test="book"] option',
+                (els) => els.map((e) => e.textContent.trim()));
+            assertOk(names.includes('Support team'),
+                'the selector must list the books the server really has: ' + names.join(','));
+
+            const button = page.locator('#pilot-devices [data-test="add-book"]').first();
+            assertOk(!(await button.isDisabled()),
+                'with a book available the action must be enabled -- it was permanently disabled before');
+
+            await page.selectOption('#pilot-devices [data-test="book"]', 'shared-1');
+            await button.click();
+            await page.waitForSelector('#pilot-devices [data-test="notice"]',
+                { state: 'visible', timeout: WAIT });
+            const calls = (await ctx.transportCalls(page))
+                .filter((c) => c.method === 'POST' && c.path.indexOf('/api/ab/peer/add/') === 0);
+            assertEqual(calls.length, 1, 'exactly one add request reached the transport');
+            assertOk(calls[0].path.endsWith('/shared-1'),
+                'and it names the book the operator actually chose: ' + calls[0].path);
+            await shot(page, 'devices-add-to-book');
+        } finally {
+            await page.ctx.close();
+        }
+    });
+
+    await check('FINDING 3: with no address book at all, §7.3 says render the empty state ' +
+        'and its CTA -- never an empty <select>', async () => {
+        const page = await openDevices(ctx, {
+            'GET /admin/peer': listOk(DEVICES),
+            'GET /api/ab/shared/profiles': { reject: true, message: 'no address book service' }
+        });
+        try {
+            await page.click('#pilot-devices [data-test="refresh"]');
+            await waitRowCount(page, 2);
+            await page.waitForSelector('#pilot-devices [data-test="book-empty"]',
+                { state: 'visible', timeout: WAIT });
+            assertOk(!(await page.isVisible('#pilot-devices [data-test="book-picker"]')),
+                'an empty <select> is a dead end and must not be rendered');
+            const action = page.locator('#pilot-devices [data-test="book-empty-action"]');
+            assertEqual(await action.evaluate((el) => el.tagName), 'BUTTON',
+                'the empty state offers a real control, not just a sentence');
+            await action.click();
+            await page.waitForFunction(
+                () => document.querySelector('#pilot-addressbook') &&
+                    document.querySelector('#pilot-addressbook').offsetParent !== null,
+                null, { timeout: WAIT });
+            await shot(page, 'devices-no-address-book');
         } finally {
             await page.ctx.close();
         }

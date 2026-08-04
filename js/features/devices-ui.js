@@ -17,6 +17,16 @@
     }
 
     const Errors = need('PilotErrors', '../core/errors.js');
+    // Task 23 shipped the whole Address Book surface, and this one kept its
+    // task-20 "disable until task 21" placeholder: `book` was initialised to ''
+    // and never assigned again, so hasBook() was permanently false and the
+    // 25-line addToBook() below was unreachable. AB.booksFrom() is the same
+    // normaliser js/features/addressbook-ui.js uses — one shape for a book
+    // payload, not two.
+    const AB = need('PilotAddressBook', '../core/addressbook.js');
+    // Spec §7.3: a data-driven control with nothing to choose from is never
+    // rendered; the empty state and its next action come from here.
+    const EmptyState = need('PilotEmptyState', '../core/emptystate.js');
 
     const MOUNT_ID = 'pilot-devices';
     const SERVER_CHANGED_EVENT = 'pilot:server-changed';
@@ -318,21 +328,71 @@
             editingId: null,
             editName: '',
             confirmingId: null,
-            book: '',
+            // The address books this server actually has, and which one is
+            // selected. `book` is null — NOT '' — until something is chosen,
+            // because '' is a real, valid book id: js/core/addressbook.js's
+            // PERSONAL.guid is the empty string by design, and api-client.js's
+            // fill() deliberately allows it for the `ab` path parameter alone.
+            // Treating '' as "nothing selected" would make the personal book —
+            // the one book every server has — permanently unusable.
+            books: [],
+            book: null,
+            booksLoaded: false,
 
             hasApi() {
                 return !!(this.api && this.api.devices && typeof this.api.devices.list === 'function');
             },
+            hasBooksApi() {
+                return !!(this.api && this.api.addressbook &&
+                    typeof this.api.addressbook.books === 'function');
+            },
             errorText(e) { return errorMessage(e); },
             errorRemediation(e) { return remediationOf(e); },
             errorRemediationLabel(e) { return remediationLabel(e); },
-            // The Address Book surface (Task 21) is what will actually let an
-            // operator choose a book; until then `book` can never be set from
-            // this surface's own template, so the action stays disabled with a
-            // visible reason rather than rendering a control that always fails
-            // (spec §7.3's "never a dead-end control", the same principle it
-            // applies to an empty dropdown).
-            hasBook() { return !!clean(this.book); },
+            // True once a real book from THIS server's list is selected. The
+            // membership check matters: a stale selection left over from another
+            // server must not keep the button enabled against a book that is not
+            // there any more.
+            hasBook() {
+                return typeof this.book === 'string' &&
+                    this.books.some((b) => b.guid === this.book);
+            },
+            // Spec §7.3: with no books to choose from, render the empty state and
+            // its route to where one is created — never an empty <select>, which
+            // says something is wrong but not what, and offers no way forward.
+            bookEmpty() { return this.booksLoaded && this.books.length === 0; },
+            bookEmptyState() {
+                const e = (EmptyState && typeof EmptyState.forKind === 'function')
+                    ? EmptyState.forKind('addressbook') : null;
+                return e || { message: 'No address book yet.', ctaLabel: 'Create one', tab: 'addressbook' };
+            },
+            // Loads this server's address books. A failure is not an error
+            // banner of its own: it lands in the same empty state, because from
+            // this surface "there is no book to add to" is the same situation
+            // either way and the next action is identical.
+            async loadBooks() {
+                if (!this.hasBooksApi() || !AB || typeof AB.booksFrom !== 'function') {
+                    this.books = [];
+                    this.book = null;
+                    this.booksLoaded = true;
+                    return this.books;
+                }
+                try {
+                    this.books = AB.booksFrom(await this.api.addressbook.books());
+                } catch (e) {
+                    this.books = [];
+                }
+                this.booksLoaded = true;
+                // Default to the first book (the personal one, which
+                // booksFrom() guarantees is present whenever the call
+                // succeeded) so the action is usable without a second click.
+                this.book = this.books.length ? this.books[0].guid : null;
+                return this.books;
+            },
+            selectBook(guid) {
+                this.book = typeof guid === 'string' ? guid : null;
+                return this.book;
+            },
             isBusy(id) { return this.busyIds.indexOf(id) !== -1; },
             setBusy(id, on) {
                 const i = this.busyIds.indexOf(id);
@@ -366,6 +426,10 @@
             },
 
             async refresh(force) {
+                // An explicit Refresh refreshes this surface, which includes the
+                // book list -- otherwise a book created on the Address Book tab
+                // never appears here without a full reload.
+                if (force) this.loadBooks();
                 if (!force && Array.isArray(this.state.rows)) {
                     this.rows = this.state.rows.slice();
                     this.total = this.state.total;
@@ -417,6 +481,12 @@
                 this.confirmingId = null;
                 this.actionError = null;
                 this.notice = '';
+                // Address books are per server: the selection made against the
+                // previous one means nothing here.
+                this.books = [];
+                this.book = null;
+                this.booksLoaded = false;
+                this.loadBooks();
                 return this.refresh(false);
             },
 
@@ -433,6 +503,9 @@
                 const self = this;
                 if (target && typeof target.addEventListener === 'function')
                     target.addEventListener(SERVER_CHANGED_EVENT, function (ev) { self.onServerChanged(ev); });
+                // Deliberately not awaited: the device table must not wait on
+                // the book list, and loadBooks() records its own outcome.
+                this.loadBooks();
                 return this.refresh(false);
             },
 
@@ -508,8 +581,11 @@
             async addToBook(row, book) {
                 const id = (row && row.id) ? row.id : '';
                 if (!id) return false;
-                const ab = clean(book === undefined ? this.book : book);
-                if (!ab) {
+                // '' is a legitimate book id (the personal book), so the guard
+                // is "is anything selected", never "is the string non-empty".
+                const raw = book === undefined ? this.book : book;
+                const ab = typeof raw === 'string' ? clean(raw) : null;
+                if (ab === null) {
                     // Caught here, before the API is ever called, so the operator
                     // never sees api-client.js's internal guard string ("a path
                     // parameter must not be empty") as if it were a real answer
@@ -553,6 +629,25 @@
         '  <input type="search" class="form-control form-control-sm mb-2" data-test="filter"',
         '         aria-label="Filter devices" placeholder="Filter by name, ID, address or platform"',
         '         :value="state.query" @input="setQuery($event.target.value)">',
+        // The address book the row actions add to. Rendered only when this
+        // server really has one (spec §7.3): with none, the empty state and its
+        // route to the Address Book surface take its place -- never an empty
+        // <select>, and never a permanently disabled button with no way out.
+        '  <div class="mb-2" data-test="book-picker" x-show="books.length > 0">',
+        '    <label class="form-label form-label-sm mb-0" for="pilot-devices-book">Address book</label>',
+        '    <select class="form-select form-select-sm" id="pilot-devices-book" data-test="book"',
+        '            @change="selectBook($event.target.value)">',
+        '      <template x-for="b in books" :key="b.guid">',
+        '        <option :value="b.guid" :selected="b.guid === book" x-text="b.name"></option>',
+        '      </template>',
+        '    </select>',
+        '  </div>',
+        '  <div class="mb-2" data-test="book-empty" x-show="bookEmpty()">',
+        '    <span class="text-secondary small me-2" data-test="book-empty-message"',
+        '          x-text="bookEmptyState().message"></span>',
+        '    <button type="button" class="btn btn-sm btn-outline-primary" data-test="book-empty-action"',
+        '            @click="tab = bookEmptyState().tab" x-text="bookEmptyState().ctaLabel"></button>',
+        '  </div>',
         '  <div class="alert alert-warning" data-test="error" x-show="error">',
         '    <span x-text="errorText(error)"></span>',
         '    <span class="fw-semibold ms-1" data-test="error-remediation"',
@@ -620,9 +715,7 @@
         '                    @click="startRename(d)" :disabled="isBusy(d.id)">Rename</button>',
         '            <button type="button" class="btn btn-sm btn-outline-secondary" data-test="add-book"',
         '                    @click="addToBook(d)" :disabled="isBusy(d.id) || !hasBook()"',
-        '                    :title="hasBook() ? \'\' : \'No address book yet\'">Add to address book</button>',
-        '            <span class="text-secondary small ms-1" data-test="add-book-hint"',
-        '                  x-show="!hasBook()">No address book yet</span>',
+        '                    :title="hasBook() ? \'\' : bookEmptyState().message">Add to address book</button>',
         '            <span x-show="confirmingId !== d.id">',
         '              <button type="button" class="btn btn-sm btn-outline-danger" data-test="delete"',
         '                      @click="askDelete(d)" :disabled="isBusy(d.id)">Delete</button>',

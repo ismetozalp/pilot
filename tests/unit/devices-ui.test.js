@@ -358,8 +358,22 @@ function fakeApi(over) {
         }
     };
     Object.assign(api.devices, (over && over.devices) || {});
+    // The address-book half of the façade. `books` answers rustdesk's own
+    // {data:{profiles:[...]}} shape, which js/core/addressbook.js's booksFrom()
+    // is what normalises -- this surface must not re-derive it.
+    api.addressbook = Object.assign({
+        books: async () => { calls.push(['books']); return { data: { profiles: [
+            { guid: '', name: 'Personal', personal: true },
+            { guid: 'shared-1', name: 'Support team' }
+        ] } }; }
+    }, (over && over.addressbook) || {});
     return api;
 }
+
+// Calls that are not the address-book list: refresh(true) now also re-fetches
+// the books (they are per server and a new one must show up without a reload),
+// which is deliberate and not what these device-table assertions are about.
+function deviceCalls(api) { return api.calls.filter((x) => x[0] !== 'books'); }
 
 function component(over) {
     const o = over || {};
@@ -386,7 +400,7 @@ test('refresh renders the inventory and records the total', async () => {
     assert.equal(c.rows.length, 2);
     assert.equal(c.total, 2);
     assert.equal(c.visible()[0].name, 'Kitchen Pi');
-    assert.deepEqual(api.calls[0], ['list', { page: 1, page_size: 50, q: '' }]);
+    assert.deepEqual(deviceCalls(api)[0], ['list', { page: 1, page_size: 50, q: '' }]);
 });
 
 test('a devices failure is reported with its kind and does not blank the surface', async () => {
@@ -412,7 +426,7 @@ test('refresh without force serves the remembered rows instead of refetching', a
     const c = component({ api });
     await c.refresh(true);
     await c.refresh(false);
-    assert.equal(api.calls.length, 1, 'the second call came from the per-server cache');
+    assert.equal(deviceCalls(api).length, 1, 'the second call came from the per-server cache');
     assert.equal(c.rows.length, 2);
 });
 
@@ -423,16 +437,19 @@ test('switching servers preserves the query and the rows of the one we left', as
     c.setQuery('kitchen');
     assert.equal(c.visible().length, 1);
 
+    // Counts device LIST calls specifically: switching server also re-fetches
+    // the address books (they are per server too), which is a different call.
+    const lists = () => api.calls.filter((x) => x[0] === 'list').length;
     await c.useServer('beta');
     assert.equal(c.serverId, 'beta');
     assert.equal(c.state.query, '', 'a new server starts with a clean filter');
-    assert.equal(api.calls.length, 2, 'an unseen server is fetched');
+    assert.equal(lists(), 2, 'an unseen server is fetched');
 
     await c.useServer('alpha');
     assert.equal(c.state.query, 'kitchen', 'the filter came back');
     assert.equal(c.rows.length, 2);
     assert.equal(c.visible().length, 1);
-    assert.equal(api.calls.length, 2, 'a server we already loaded is not refetched');
+    assert.equal(lists(), 2, 'a server we already loaded is not refetched');
 });
 
 test('switching to the server we are already on does nothing', async () => {
@@ -440,7 +457,7 @@ test('switching to the server we are already on does nothing', async () => {
     const c = component({ api });
     await c.refresh(true);
     await c.useServer('alpha');
-    assert.equal(api.calls.length, 1);
+    assert.equal(deviceCalls(api).length, 1);
 });
 
 test('a server-changed event switches the surface; a malformed one is ignored', async () => {
@@ -467,11 +484,11 @@ test('rename validates before it calls the API, and patches the row in place', a
     c.editName = 'a\nb';
     assert.equal(await c.commitRename(), false);
     assert.ok(c.actionError);
-    assert.equal(api.calls.length, 1, 'an invalid name never reaches the server');
+    assert.equal(deviceCalls(api).length, 1, 'an invalid name never reaches the server');
 
     c.editName = '  Kitchen  ';
     assert.equal(await c.commitRename(), true);
-    assert.deepEqual(api.calls[1], ['rename', '123456789', 'Kitchen']);
+    assert.deepEqual(deviceCalls(api)[1], ['rename', '123456789', 'Kitchen']);
     assert.equal(c.rows[0].name, 'Kitchen');
     assert.equal(c.editingId, null);
     assert.equal(c.isBusy('123456789'), false);
@@ -497,7 +514,7 @@ test('a traversal-shaped rename is sent verbatim as a name, never as a path', as
     c.startRename(c.rows[0]);
     c.editName = '../../etc/shadow';
     assert.equal(await c.commitRename(), true);
-    assert.deepEqual(api.calls[1], ['rename', '123456789', '../../etc/shadow']);
+    assert.deepEqual(deviceCalls(api)[1], ['rename', '123456789', '../../etc/shadow']);
 });
 
 test('delete takes two clicks and removes exactly one row', async () => {
@@ -509,11 +526,11 @@ test('delete takes two clicks and removes exactly one row', async () => {
     assert.equal(c.confirmingId, '987654321');
     c.cancelDelete();
     assert.equal(c.confirmingId, null);
-    assert.equal(api.calls.length, 1);
+    assert.equal(deviceCalls(api).length, 1);
 
     c.askDelete(c.rows[1]);
     assert.equal(await c.confirmDelete(), true);
-    assert.deepEqual(api.calls[1], ['remove', '987654321']);
+    assert.deepEqual(deviceCalls(api)[1], ['remove', '987654321']);
     assert.deepEqual(c.rows.map((r) => r.id), ['123456789']);
     assert.equal(c.total, 1);
 });
@@ -535,7 +552,7 @@ test('add to address book passes the id and the chosen book', async () => {
     await c.refresh(true);
     c.book = 'shared';
     assert.equal(await c.addToBook(c.rows[0]), true);
-    assert.deepEqual(api.calls[1], ['addToAddressBook', '123456789', 'shared']);
+    assert.deepEqual(deviceCalls(api)[1], ['addToAddressBook', '123456789', 'shared']);
     assert.match(c.notice, /address book/);
     assert.equal(await c.addToBook({ id: '' }), false);
 });
@@ -553,14 +570,14 @@ test('an address-book failure is an action error, not a surface error', async ()
 });
 
 test('add to address book without a book chosen is a client-side action error, never a raw path-parameter string', async () => {
-    // Nothing in the shipped template can set `book` yet (Task 21 owns the
-    // Address Book surface that will), so this is the path every click of
-    // "Add to address book" takes today -- caught before api-client.js's
+    // The button is disabled in this state; this is the defence for anything
+    // that can still call the method directly -- caught before api-client.js's
     // internal guard string ("a path parameter must not be empty") could ever
     // reach the operator as if it were a real answer from the server.
-    const api = fakeApi();
+    const api = fakeApi({ addressbook: { books: async () => { throw new Error('down'); } } });
     const c = component({ api });
     await c.refresh(true);
+    await c.loadBooks();
     assert.equal(c.hasBook(), false);
     assert.equal(await c.addToBook(c.rows[0]), false);
     assert.equal(c.errorText(c.actionError), 'No address book is available yet to add this device to.');
@@ -580,13 +597,23 @@ test('setSort toggles direction on the same column and resets on a new one', () 
 
 // --- hasBook / errorRemediationLabel / emptyKind / pagination -----------
 
-test('hasBook: false until a book is actually chosen', () => {
+test('hasBook: false until a book from THIS server\'s list is chosen', () => {
     const c = component();
-    assert.equal(c.hasBook(), false);
-    for (const bad of ['   ', '\x00', null, undefined])
+    assert.equal(c.hasBook(), false, 'nothing is selected before the books have loaded');
+    c.books = [{ guid: '', name: 'Personal', personal: true }, { guid: 'shared', name: 'Shared' }];
+    for (const bad of ['   ', '\x00', null, undefined, 'gone'])
         { c.book = bad; assert.equal(c.hasBook(), false, String(bad)); }
     c.book = 'shared';
     assert.equal(c.hasBook(), true);
+    // '' is the personal book's real guid (js/core/addressbook.js's
+    // PERSONAL.guid), not "nothing selected" -- treating it as empty made the
+    // one book every server has permanently unusable.
+    c.book = '';
+    assert.equal(c.hasBook(), true, "the personal book's own id is the empty string");
+    // A selection that does not exist on the server we just switched to must
+    // not keep the button enabled.
+    c.books = [{ guid: 'other', name: 'Other' }];
+    assert.equal(c.hasBook(), false);
 });
 
 test('errorRemediationLabel: a specific sentence per remediation kind, empty for "none"', () => {
@@ -644,14 +671,22 @@ test('the template renders text only and offers real buttons', () => {
         assert.ok(D.TEMPLATE.includes('data-test="' + hook + '"'), hook);
 });
 
-test('the add-to-address-book control is disabled with a visible, honest reason (spec 7.3)', () => {
-    // Task 21 owns the Address Book surface that will let an operator actually
-    // choose a book; until then this control must never look identical to the
-    // working Rename/Delete buttons while always erroring underneath it.
-    assert.ok(D.TEMPLATE.includes('data-test="add-book-hint"'));
+test('the address book control is a real selector, and an empty one is the §7.3 empty state', () => {
+    // This was task 20's "disable until task 21" placeholder, never lifted:
+    // `book` was never assigned anywhere, so the button was permanently
+    // disabled with the (by then false) title "No address book yet" and
+    // addToBook() was unreachable.
+    assert.ok(D.TEMPLATE.includes('data-test="book"'), 'a real book selector is rendered');
+    assert.match(D.TEMPLATE, /data-test="book-picker"[\s\S]{0,120}books\.length > 0/,
+        'the selector is rendered ONLY when there is something to choose from');
     assert.match(D.TEMPLATE, /data-test="add-book"[\s\S]{0,120}!hasBook\(\)/,
-        'the button itself must be disabled while there is no book to add to');
-    assert.ok(D.TEMPLATE.includes('No address book yet'));
+        'the button is still disabled while nothing is selected');
+    for (const hook of ['book-empty', 'book-empty-message', 'book-empty-action'])
+        assert.ok(D.TEMPLATE.includes('data-test="' + hook + '"'), hook);
+    assert.ok(D.TEMPLATE.includes('bookEmptyState().ctaLabel'),
+        'the empty state\'s copy and CTA come from PilotEmptyState, not from a second hardcoded string');
+    assert.equal(D.TEMPLATE.indexOf('No address book yet'), -1,
+        'the copy lives in js/core/emptystate.js now, not inline here');
 });
 
 test('an empty inventory and a filter with no matches each offer a real next action (spec 7.3)', () => {
@@ -728,4 +763,72 @@ test('emitServerChanged dispatches the documented detail, and is safe without a 
         assert.equal(D.emitServerChanged('beta', {}), false);
         assert.equal(D.emitServerChanged('beta', null), false);
     } finally { if (!had) delete globalThis.CustomEvent; }
+});
+
+
+// =================================================== FINAL REVIEW, FINDING 3
+//
+// `book` was initialised to '' and never assigned anywhere: hasBook() was
+// permanently false, the button permanently disabled with the (since task 23,
+// factually wrong) title "No address book yet", and the 25-line addToBook()
+// unreachable. These drive the load/select/add path that now exists.
+
+test('loadBooks fetches this server\'s books through the façade and selects one', async () => {
+    const api = fakeApi();
+    const c = component({ api });
+    await c.loadBooks();
+    assert.deepEqual(api.calls.filter((x) => x[0] === 'books').length, 1);
+    assert.deepEqual(c.books.map((b) => b.guid), ['', 'shared-1']);
+    assert.equal(c.book, '', 'the personal book is selected by default, so the action is usable at once');
+    assert.equal(c.hasBook(), true);
+    assert.equal(c.bookEmpty(), false);
+});
+
+test('addToBook really calls the API with the SELECTED book, including the personal one', async () => {
+    const api = fakeApi();
+    const c = component({ api });
+    await c.loadBooks();
+    assert.equal(await c.addToBook({ id: 'dev-1' }), true);
+    assert.deepEqual(api.calls.filter((x) => x[0] === 'addToAddressBook').pop(),
+        ['addToAddressBook', 'dev-1', ''], 'the personal book id is the empty string, and it is legal');
+    c.selectBook('shared-1');
+    assert.equal(await c.addToBook({ id: 'dev-2' }), true);
+    assert.deepEqual(api.calls.filter((x) => x[0] === 'addToAddressBook').pop(),
+        ['addToAddressBook', 'dev-2', 'shared-1']);
+    assert.match(c.notice, /added to the address book/);
+});
+
+test('no books at all is the §7.3 empty state, never an empty <select>', async () => {
+    const c = component({ api: fakeApi({ addressbook: { books: async () => { throw new Error('down'); } } }) });
+    await c.loadBooks();
+    assert.deepEqual(c.books, []);
+    assert.equal(c.book, null);
+    assert.equal(c.hasBook(), false);
+    assert.equal(c.bookEmpty(), true);
+    const e = c.bookEmptyState();
+    assert.equal(e.message, require('../../js/core/emptystate.js').forKind('addressbook').message);
+    assert.equal(e.tab, 'addressbook', 'the CTA goes where an address book is actually created');
+    // And the action still refuses honestly rather than calling the API with nothing.
+    assert.equal(await c.addToBook({ id: 'dev-1' }), false);
+    assert.match(c.actionError.message, /No address book/);
+});
+
+test('an API façade with no addressbook half degrades to the empty state, never throws', async () => {
+    const api = fakeApi();
+    delete api.addressbook;
+    const c = component({ api });
+    await c.loadBooks();
+    assert.equal(c.bookEmpty(), true);
+});
+
+test('switching server re-loads the books and drops the previous selection', async () => {
+    const api = fakeApi();
+    const c = component({ api });
+    await c.loadBooks();
+    c.selectBook('shared-1');
+    await c.useServer('beta');
+    assert.equal(c.serverId, 'beta');
+    await new Promise((r) => setTimeout(r, 0));
+    assert.equal(api.calls.filter((x) => x[0] === 'books').length, 2,
+        'address books are per server, so they must be re-fetched');
 });
