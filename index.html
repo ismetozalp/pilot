@@ -10,7 +10,14 @@
 </head>
 <body>
 
-<div class="pilot-shell" x-data="pilotApp()" x-cloak>
+<!-- js/features/overview.js's server switcher only persists the choice and
+     dispatches 'pilot:server-changed' (it has no reference to pilotApp()'s own
+     switchServer() and must stay unit-testable with no DOM/Alpine at all) --
+     this listener is what actually closes the loop and re-wires PilotApi's
+     transport to the newly active server. switchServer() itself guards against
+     the resulting re-entrant dispatch (see js/app.js). -->
+<div class="pilot-shell" x-data="pilotApp()" x-cloak
+     @pilot:server-changed.document="switchServer($event.detail.id)">
 
     <div class="pilot-header d-flex align-items-center gap-3">
         <strong class="me-2">Pilot</strong>

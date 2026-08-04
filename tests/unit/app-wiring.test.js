@@ -150,6 +150,48 @@ test('switchServer: re-wires the transport for the newly active server', async (
     assert.notEqual(seen[0], seen[1], 'switchServer reused the old server\'s transport function');
 });
 
+// Regression test for the CRITICAL review finding on Task 21: index.html now
+// listens for 'pilot:server-changed' (the very event notifyServerChanged()
+// dispatches below) and calls switchServer() again with that same id, so that
+// js/features/overview.js's switcher — which only dispatches the event, never
+// calls switchServer() directly — actually re-wires the transport. Without
+// this guard that is switchServer() -> wireApi() -> notifyServerChanged() ->
+// the shell listener -> switchServer() -> ... forever.
+test('switchServer: a request for the server that is ALREADY active is a no-op (re-entrancy guard)', async (t) => {
+    fakeCockpit();
+    t.after(dropCockpit);
+    const seen = spyOnSetTransport(t);
+    let setActiveCalls = 0;
+    const realSetActive = globalThis.PilotServers.setActive;
+    globalThis.PilotServers.setActive = function (id) { setActiveCalls += 1; return realSetActive(id); };
+    t.after(() => { globalThis.PilotServers.setActive = realSetActive; });
+
+    const c = App.pilotApp();
+    await c.wireApi();                // wires 'prod', activeServerId === 'prod'
+    await c.switchServer('prod');      // the exact re-entrant call the shell listener would make
+
+    assert.equal(c.activeServerId, 'prod', 'still prod');
+    assert.equal(seen.length, 1, 'setTransport was not called a second time');
+    assert.equal(setActiveCalls, 0, 'the registry was not written to again for a no-op switch');
+});
+
+test('switchServer: "local" is recognised as already-active when nothing is configured', async (t) => {
+    fakeCockpit({ '/etc/pilot/config.json': '{}' });
+    t.after(dropCockpit);
+    const seen = spyOnSetTransport(t);
+
+    const c = App.pilotApp();
+    await c.wireApi();                 // no active server -> activeServerId stays null, event carries 'local'
+    await c.switchServer('local');     // the shell listener re-dispatching that same 'local' id
+
+    assert.equal(c.activeServerId, null);
+    // wireApi() itself never calls setTransport when there is no active server
+    // at all (it returns early) -- the guard's job here is simply to confirm
+    // switchServer('local') does not try to proceed past that early return a
+    // second, pointless time either.
+    assert.equal(seen.length, 0, 'no setTransport call for the "nothing configured" case, either time');
+});
+
 test('wireApi: no token file at all is ordinary — tokenError stays null', async (t) => {
     // An explicit null (rather than omitting the key) exercises the same path
     // fakeCockpit's read() takes for a genuinely absent file: `p in files` is

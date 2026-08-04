@@ -159,6 +159,19 @@
             // Called when the user picks a different server in the shell: persist
             // the choice, then re-wire exactly like startup does.
             async switchServer(id) {
+                // Re-entrancy guard: index.html's shell listens for the very
+                // 'pilot:server-changed' event wireApi() dispatches below and
+                // calls switchServer() again with that same id (this is what
+                // lets js/features/overview.js's own switcher — which only
+                // dispatches 'pilot:server-changed', never calls switchServer()
+                // directly — actually re-wire PilotApi's transport). Without
+                // this guard that would be an infinite loop: switchServer() ->
+                // wireApi() -> notifyServerChanged() -> the shell listener ->
+                // switchServer() -> ... A request for the server that is
+                // ALREADY active is a no-op.
+                const requested = (typeof id === 'string' && id.trim()) ? id.trim() : 'local';
+                const current = this.activeServerId || 'local';
+                if (requested === current) return this;
                 const Servers = root.PilotServers;
                 if (Servers && typeof Servers.setActive === 'function') {
                     await Servers.setActive(id);

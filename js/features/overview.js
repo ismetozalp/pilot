@@ -296,41 +296,62 @@
 
             async loadSummary(force) {
                 const id = this.activeId || 'local';
+                // "Last request STARTED wins", not "last request to resolve
+                // wins": selectServer()'s own eager fetch and
+                // onServerChanged()'s later, corrective fetch (fired once the
+                // real transport switch actually completes — see
+                // index.html's shell listener) can genuinely overlap, and a
+                // slow EARLIER response arriving after a faster LATER one
+                // must never be allowed to overwrite it with stale data. This
+                // token is the whole fix: any request that is not still the
+                // most recent one silently discards its own result instead of
+                // writing it into this.summary/this.cache. Claimed BEFORE the
+                // cache check, unconditionally — a synchronous cache hit
+                // still must invalidate any earlier call's token, or that
+                // earlier call's eventual (stale) resolution would wrongly
+                // still look "current" and clobber the cache hit's result
+                // right after it lands.
+                const token = (this.summaryToken = (this.summaryToken || 0) + 1);
                 if (!force && has(this.cache, id)) {
                     this.summary = this.cache[id].summary;
                     this.summaryError = this.cache[id].error;
                     return this.summary;
                 }
+                let summary;
+                let summaryError;
                 if (!Devices || typeof Devices.deviceRows !== 'function') {
-                    this.summary = emptySummary();
-                    this.summaryError = fail('GENERIC',
+                    summary = emptySummary();
+                    summaryError = fail('GENERIC',
                         'The devices module is not loaded, so no device summary is available.');
                 } else if (!this.hasApi()) {
-                    this.summary = emptySummary();
-                    this.summaryError = fail('GENERIC',
+                    summary = emptySummary();
+                    summaryError = fail('GENERIC',
                         'The API client is not loaded, so no device summary is available.');
                 } else {
-                    this.summaryLoading = true;
+                    this.summaryLoading = (token === this.summaryToken) ? true : this.summaryLoading;
                     try {
                         const payload = await this.api.devices.list(
                             { page: 1, page_size: SUMMARY_PAGE_SIZE });
                         const rows = Devices.deviceRows(payload, this.now());
                         const online = rows.filter((r) => r.online).length;
-                        this.summary = {
+                        summary = {
                             total: Devices.normalizeList(payload).total,
                             listed: rows.length,
                             online: online,
                             offline: rows.length - online
                         };
-                        this.summaryError = null;
+                        summaryError = null;
                     } catch (e) {
-                        this.summary = emptySummary();
-                        this.summaryError = e;
+                        summary = emptySummary();
+                        summaryError = e;
                     } finally {
-                        this.summaryLoading = false;
+                        if (token === this.summaryToken) this.summaryLoading = false;
                     }
                 }
-                this.cache[id] = { summary: this.summary, error: this.summaryError };
+                if (token !== this.summaryToken) return this.summary;   // superseded — discard
+                this.summary = summary;
+                this.summaryError = summaryError;
+                this.cache[id] = { summary: summary, error: summaryError };
                 return this.summary;
             },
 
@@ -363,11 +384,44 @@
                 return true;
             },
 
+            // Reacts to the SAME event selectServer() dispatches above, once
+            // js/app.js's switchServer()/wireApi() has actually re-wired
+            // PilotApi's transport to `next` (index.html's shell listens for
+            // this event and is what drives that real re-wiring — this
+            // component has no reference to switchServer() itself and must
+            // stay unit-testable with no DOM at all). Overview's own eager
+            // fetch above may have already run against the OLD transport (the
+            // real re-wire is asynchronous and can finish after it); `force`
+            // guarantees this corrects to the right data rather than trusting
+            // whatever that first, possibly-stale, fetch cached.
+            onServerChanged(ev) {
+                let id = null;
+                try { id = (ev && ev.detail) ? ev.detail.id : null; } catch (x) { id = null; }
+                const next = clean(id);
+                if (!next) return false;
+                this.activeId = next;
+                const known = this.servers.filter((r) => r.id === next)[0];
+                if (known) {
+                    this.server = known;
+                    this.webClient = webClientLink(known);
+                }
+                this.loadSummary(true);
+                return true;
+            },
+
             openWizardTls() {
                 return openWizardTls(this.activeId, this.doc || root.document || null);
             },
 
-            init() { return this.refresh(false); }
+            init() {
+                const target = this.doc || root.document || null;
+                const eventName = (Devices && Devices.SERVER_CHANGED_EVENT) || 'pilot:server-changed';
+                if (target && typeof target.addEventListener === 'function') {
+                    const self = this;
+                    target.addEventListener(eventName, function (ev) { self.onServerChanged(ev); });
+                }
+                return this.refresh(false);
+            }
         };
     }
 

@@ -389,6 +389,99 @@ test('switching servers records the choice, tells the other surfaces, and caches
     } finally { if (!had) delete globalThis.CustomEvent; }
 });
 
+// A real (if minimal) EventTarget-shaped document: init()'s addEventListener()
+// call and selectServer()'s/onServerChanged()'s dispatchEvent() calls need to
+// actually reach each other for a round-trip test, unlike most other tests'
+// no-op `{ dispatchEvent, addEventListener() {} }` stub.
+function fakeDocument() {
+    const listeners = Object.create(null);
+    return {
+        addEventListener(type, fn) {
+            (listeners[type] || (listeners[type] = [])).push(fn);
+        },
+        dispatchEvent(ev) {
+            for (const fn of (listeners[ev.type] || [])) fn(ev);
+            return true;
+        }
+    };
+}
+
+test('onServerChanged: forces a fresh fetch that overwrites a stale cached summary', async () => {
+    // This is the CRITICAL fix's own regression test. In production,
+    // js/app.js's real switchServer()/wireApi() re-wires PilotApi's transport
+    // ASYNCHRONOUSLY (real cockpit.spawn/file round trips) and dispatches
+    // 'pilot:server-changed' again only once that is genuinely done -- a
+    // SEPARATE, LATER event from a different code path than selectServer()'s
+    // own dispatch, which merely REQUESTS the switch (see index.html's
+    // `@pilot:server-changed.document="switchServer(...)"`, the shell listener
+    // that performs the real re-wiring, and js/app.js's switchServer()
+    // re-entrancy guard). Deliberately using a no-op `doc` here (rather than a
+    // real EventTarget) so selectServer()'s own dispatch cannot self-trigger
+    // onServerChanged() out of order -- this test isolates onServerChanged()'s
+    // OWN contract: called later, for the id the real switch actually landed
+    // on, it must force a fresh fetch that overwrites whatever the eager
+    // fetch had already cached (that cached entry may have gone through a
+    // transport that, at the time, still pointed at the OLD server).
+    const doc = { dispatchEvent: () => true, addEventListener() {} };
+    const c = component({ api: fakeApi({ alpha: DEVICES, beta: BETA_DEVICES }), doc });
+    await c.refresh(true);
+    assert.deepEqual(c.summary, { total: 3, listed: 3, online: 2, offline: 1 }, 'alpha, correctly');
+
+    // Simulate a stale cache entry for 'beta' -- e.g. left behind by an eager
+    // fetch made through a transport that, at that moment, still pointed at
+    // alpha (the exact race the review reported).
+    c.cache.beta = { summary: { total: 99, listed: 99, online: 99, offline: 0 }, error: null };
+
+    // The real switch "completes" -- js/app.js's wireApi() would have already
+    // repointed PilotApi's transport to beta by the time it dispatches this.
+    c.__api.use('beta');
+    assert.equal(c.onServerChanged({ detail: { id: 'beta' } }), true);
+    await new Promise((r) => setTimeout(r, 0));   // its own fetch is async
+
+    assert.equal(c.activeId, 'beta');
+    assert.deepEqual(c.summary, { total: 1, listed: 1, online: 0, offline: 1 },
+        'the stale cached entry was overwritten by a genuinely fresh fetch, not trusted as-is');
+});
+
+test('onServerChanged: empty or malformed detail is ignored, never throws', () => {
+    const c = component();
+    assert.equal(c.onServerChanged(null), false);
+    assert.equal(c.onServerChanged({}), false);
+    assert.equal(c.onServerChanged({ detail: {} }), false);
+    assert.equal(c.onServerChanged({ detail: { id: '' } }), false);
+    assert.equal(c.onServerChanged({ detail: { id: null } }), false);
+});
+
+test('onServerChanged: a prototype-shaped id is accepted like any other string, never pollutes anything', async () => {
+    // Unlike selectServer() (which only accepts a KNOWN server id), this
+    // reacts to whatever server the real transport just switched to, which
+    // may not be in this component's own `servers` list yet -- so a
+    // prototype-shaped VALUE is not rejected outright, only handled safely.
+    // `cache` is Object.create(null), so a property literally named
+    // "__proto__" is an ordinary own key on it, never special-cased.
+    const c = component({ api: { devices: { list: async () => payload([]) } } });
+    for (const k of PROTO_KEYS) {
+        assert.equal(c.onServerChanged({ detail: { id: k } }), true, k);
+        assert.equal(c.activeId, k);
+    }
+    assert.equal(Object.getPrototypeOf({}).polluted, undefined,
+        'Object.prototype itself was never touched');
+});
+
+test('init() registers the pilot:server-changed listener exactly once and returns the initial refresh', async () => {
+    const doc = fakeDocument();
+    const c = O.pilotOverview({ api: fakeApi({ alpha: DEVICES }), doc, now: () => NOW });
+    await c.init();
+    assert.deepEqual(c.servers.map((s) => s.id), ['local'], 'no registry -> the fallback server');
+    // A second, unrelated dispatch (a bare boolean id) must not throw or corrupt state.
+    const had = typeof globalThis.CustomEvent === 'function';
+    if (!had) globalThis.CustomEvent = function (n, o) { this.type = n; this.detail = o && o.detail; };
+    try {
+        doc.dispatchEvent(new CustomEvent(D.SERVER_CHANGED_EVENT, { detail: { id: true } }));
+        assert.equal(c.activeId, 'local', 'a non-string id changes nothing');
+    } finally { if (!had) delete globalThis.CustomEvent; }
+});
+
 test('selecting the active server, or one that is not listed, changes nothing', async () => {
     const api = fakeApi({ alpha: DEVICES, beta: BETA_DEVICES });
     const c = component({ api });

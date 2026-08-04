@@ -63,32 +63,43 @@ async function installFixtures(page, servers, inventory) {
     await page.evaluate(({ list, inv }) => {
         window.__calls = [];
         window.__wizard = [];
-        window.__server = 'alpha';
         window.__inventory = inv;
         document.addEventListener('pilot:open-wizard', (ev) => { window.__wizard.push(ev.detail); });
-        document.addEventListener('pilot:server-changed', (ev) => { window.__server = ev.detail.id; });
-        window.PilotApi.setTransport(async (req) => {
-            // api-client.js's buildRequest() folds `query` into the path's own
-            // query string (path + encodeQuery(query)) before the transport ever
-            // sees it -- there is no separate req.query field to read.
-            const path = (req && req.path) || '';
-            // The Devices surface (js/features/devices-ui.js) ALSO listens for
-            // pilot:server-changed and independently refetches its own inventory
-            // on every switch -- that is correct, expected cross-surface
-            // behaviour (Task 20), not a defect. Overview's own summary request
-            // is distinguished by its fixed page_size (SUMMARY_PAGE_SIZE=200,
-            // never overridden) and by never sending a `q` filter, so a check
-            // that cares only about Overview's own fetch count can filter this
-            // shared call log down to just its own requests.
-            const isOverview = /(^|[?&])page_size=200(&|$)/.test(path) && !/(^|[?&])q=/.test(path);
-            window.__calls.push({
-                server: window.__server, path: path,
-                surface: isOverview ? 'overview' : 'other'
-            });
-            const rows = window.__inventory[window.__server] || [];
-            return { status: 200, body: { code: 0, message: '', data:
-                { list: rows, page: 1, total: rows.length, page_size: 50 } } };
+
+        // Builds a transport BOUND to one server id, exactly like a real
+        // PilotApiIo.transport(conn) closure captures one server's address at
+        // the moment js/app.js's wireApi() builds it. This matters once
+        // js/features/overview.js's own onServerChanged() can fire a second,
+        // concurrent fetch alongside selectServer()'s eager one (see
+        // js/features/overview.js's loadSummary() token guard): an
+        // in-flight request from an OLD transport must keep answering for
+        // the OLD server even after the page has switched again, never read
+        // whatever server happens to be current when it finally executes --
+        // a single shared mutable "current server" variable would get that
+        // wrong in exactly the way a real per-connection closure cannot.
+        function transportFor(id) {
+            return async (req) => {
+                // api-client.js's buildRequest() folds `query` into the
+                // path's own query string before the transport ever sees it.
+                const path = (req && req.path) || '';
+                // The Devices surface (js/features/devices-ui.js) ALSO
+                // listens for pilot:server-changed and independently
+                // refetches its own inventory on every switch -- correct,
+                // expected cross-surface behaviour (Task 20), not a defect.
+                // Overview's own summary request is distinguished by its
+                // fixed page_size (SUMMARY_PAGE_SIZE=200, never overridden)
+                // and by never sending a `q` filter.
+                const isOverview = /(^|[?&])page_size=200(&|$)/.test(path) && !/(^|[?&])q=/.test(path);
+                window.__calls.push({ server: id, path: path, surface: isOverview ? 'overview' : 'other' });
+                const rows = window.__inventory[id] || [];
+                return { status: 200, body: { code: 0, message: '', data:
+                    { list: rows, page: 1, total: rows.length, page_size: 50 } } };
+            };
+        }
+        document.addEventListener('pilot:server-changed', (ev) => {
+            window.PilotApi.setTransport(transportFor(ev.detail.id));
         });
+        window.PilotApi.setTransport(transportFor('alpha'));
         window.PilotOverview.setRegistry({
             list: async () => list,
             active: async () => 'alpha',
@@ -257,9 +268,23 @@ export default async function run(ctx) {
                     setActive: window.__setActive
                 };
             });
-            assertEqual(out.calls, 2,
-                'one Overview summary request per server -- the third view came from cached state');
-            assertEqual(out.servers, 'alpha,beta', 'each server was fetched exactly once');
+            // selectServer()'s own eager fetch is still cache-aware (it alone
+            // would make this exactly 2 -- one per server). But the CRITICAL
+            // review fix added onServerChanged(), which forces one CONFIRMING
+            // re-fetch every time the real "the switch has genuinely landed"
+            // signal arrives (js/app.js's notifyServerChanged(), or here,
+            // installFixtures()' stand-in for it) -- correctness over raw
+            // efficiency, deliberately: it is what stops a stale eager fetch
+            // from a still-old transport silently winning. So each switch now
+            // costs one eager fetch plus one confirming fetch.
+            assertEqual(out.calls, 4, 'one eager + one confirming Overview request per switch');
+            // Exact interleaving between the eager and confirming fetch of
+            // the SAME switch is not guaranteed (both are async and can
+            // settle in either order) -- what must hold is that each server
+            // was asked about exactly twice, never more, never the wrong one.
+            const counts = out.servers.split(',').reduce((m, s) => (m[s] = (m[s] || 0) + 1, m), {});
+            assertEqual(counts.alpha, 2, 'alpha was asked about exactly twice');
+            assertEqual(counts.beta, 2, 'beta was asked about exactly twice');
             assertEqual(out.online, '2', 'alpha\'s online count came back');
             assertEqual(out.offline, '1', 'and its offline count');
             assertEqual(out.setActive, 'alpha', 'the registry was told about the switch back');
@@ -346,6 +371,153 @@ export default async function run(ctx) {
                     && document.querySelector('#pilot-overview [data-test="web-client-link"]').offsetParent !== null
             }));
             assertEqual(state.linkVisible, false, 'a bare IPv6 address is not a domain either');
+        } finally {
+            await page.ctx.close();
+        }
+    });
+
+    // --- CRITICAL: the switch must actually re-wire PilotApi's transport ---
+    //
+    // Every check above drives Overview through a hand-rolled fake transport
+    // installed by installFixtures(), which hides the exact defect a live
+    // review run reproduced: selectServer() only persists the choice and
+    // dispatches 'pilot:server-changed' -- it never itself calls
+    // PilotApi.setTransport. Before index.html gained
+    // `@pilot:server-changed.document="switchServer($event.detail.id)"` (and
+    // js/app.js's switchServer() gained its re-entrancy guard), NOTHING closed
+    // that loop: the UI switcher would show "beta" while every HTTP request
+    // kept dialling alpha's address forever. This check drives ONLY the
+    // Overview <select> -- never window.alpineData().switchServer() directly,
+    // which would prove the wiring exists but not that the switcher UI
+    // actually reaches it -- against the REAL, file-backed PilotServers
+    // registry and the REAL cockpit stub, exactly like
+    // tests/e2e/devices.e2e.mjs's own multi-server check. It asserts on
+    // window.__pilotStub.calls' recorded `address`, never on the UI label,
+    // because the label was right while the review found the data wrong.
+    const PROBE_OK = { code: 0, message: '', data: {} };
+
+    function serverRec(id, host) {
+        return { id, host, sshPort: 22, apiPort: 21114, tls: false,
+            domain: null, hbbsKey: null, hbbsPorts: [], installDir: '/opt/rustdesk-api', createdAt: null };
+    }
+
+    function realMultiServerStub(alphaDevices) {
+        return {
+            spawn: {
+                // Exactly the argv js/core/servers.js's list() joins and runs;
+                // Overview's own default registry (root.PilotServers) is what
+                // calls this, unlike js/app.js's wireApi()/switchServer(),
+                // which only ever reads a single record by id and never lists.
+                'find /etc/pilot/servers -maxdepth 1 -type f -name *.json':
+                    '/etc/pilot/servers/alpha.json\n/etc/pilot/servers/beta.json\n'
+            },
+            files: {
+                '/etc/pilot/config.json': JSON.stringify({ activeServer: 'alpha' }),
+                '/etc/pilot/servers/alpha.json': JSON.stringify(serverRec('alpha', 'alpha.example.com')),
+                '/etc/pilot/servers/alpha.token': 'TOK-ALPHA',
+                '/etc/pilot/servers/beta.json': JSON.stringify(serverRec('beta', 'beta.example.com')),
+                '/etc/pilot/servers/beta.token': 'TOK-BETA'
+            },
+            http: {
+                // Stubbed only so wireApi()'s advisory compatibility probe
+                // does not leave an unrelated console error behind; it runs
+                // AFTER notifyServerChanged() and does not gate this check.
+                'GET /admin/swagger/doc.json': { status: 404, body: '404 page not found' },
+                'GET /api/currentUser2': PROBE_OK,
+                'GET /api/ab/shared/profiles': PROBE_OK,
+                'GET /api/ab/peers': PROBE_OK,
+                'GET /admin/user': PROBE_OK,
+                'GET /admin/group': PROBE_OK,
+                'GET /admin/audit_conn': PROBE_OK,
+                'GET /admin/audit_file': PROBE_OK,
+                'GET /admin/login_log': PROBE_OK,
+                'GET /admin/peer': listOk(alphaDevices)
+            }
+        };
+    }
+
+    async function installAlpineHelper(page) {
+        await page.evaluate(() => {
+            window.alpineData = function () {
+                const el = document.querySelector('.pilot-shell');
+                if (!el || !window.Alpine) return null;
+                return window.Alpine.$data(el);
+            };
+        });
+    }
+
+    async function waitApiReady(page) {
+        await page.waitForFunction(
+            () => { const d = window.alpineData(); return !!d && d.apiReady === true; },
+            null, { timeout: WAIT });
+    }
+
+    function peerCalls(page) {
+        return page.evaluate(() => window.__pilotStub.calls
+            .filter((c) => c.kind === 'http' && c.method === 'GET' && c.path.indexOf('/admin/peer') === 0));
+    }
+
+    await check('CRITICAL: switching ONLY through the Overview control re-wires the real transport', async () => {
+        const page = await ctx.open(ctx.browser, realMultiServerStub(ALPHA_DEVICES));
+        page.setDefaultTimeout(WAIT);
+        try {
+            await installAlpineHelper(page);
+            await waitApiReady(page);
+            // 'attached', not the default 'visible': an <option> inside a
+            // <select> reports no box of its own, so a plain visibility wait
+            // would time out even once it genuinely exists.
+            await page.waitForSelector('#pilot-overview [data-test="switcher"] option',
+                { state: 'attached', timeout: WAIT });
+            await page.waitForFunction(() =>
+                document.querySelectorAll('#pilot-overview [data-test="switcher"] option').length === 2,
+                null, { timeout: WAIT });
+
+            const before = await peerCalls(page);
+            assertOk(before.length >= 1, 'the initial load already fetched alpha\'s devices');
+            assertEqual(before[before.length - 1].address, 'alpha.example.com',
+                'the initial transport dials alpha, as configured');
+
+            // Swapped BEFORE switching, exactly like devices.e2e.mjs's own
+            // multi-server check: the later assertion can only pass if the
+            // switch genuinely triggered a NEW fetch that observed the swap,
+            // never a coincidental re-render of data already in memory.
+            await page.evaluate((list) => {
+                window.__pilotStub.http['GET /admin/peer'] = { status: 200, body:
+                    { code: 0, message: '', data: { list, page: 1, total: list.length, page_size: 50 } } };
+            }, BETA_DEVICES);
+
+            // The ONLY action in this check: the Overview <select>. Never
+            // window.alpineData().switchServer() -- that would prove the
+            // re-wiring code exists, not that the switcher UI reaches it.
+            await page.selectOption('#pilot-overview [data-test="switcher"]', 'beta');
+
+            // Proves the REAL shell-level switch completed (not just
+            // Overview's own local activeId), i.e. that the loop actually
+            // closed: js/app.js's own activeServerId, not anything
+            // Overview keeps for itself.
+            await page.waitForFunction(
+                () => window.alpineData().activeServerId === 'beta', null, { timeout: WAIT });
+
+            await waitTotal(page, String(BETA_DEVICES.length), 'beta, after the real switch');
+
+            const after = await peerCalls(page);
+            const last = after[after.length - 1];
+            assertEqual(last.address, 'beta.example.com',
+                'the request AFTER switching carries the NEW server\'s address, not the old one');
+
+            // Not a one-off: a further, independent action (Overview's own
+            // Refresh button) must ALSO still dial beta -- this is exactly
+            // what the review reported broken ("ALL calls after switch stay
+            // alpha forever").
+            await page.click('#pilot-overview [data-test="refresh"]');
+            await page.waitForFunction(
+                (n) => window.__pilotStub.calls.filter((c) =>
+                    c.kind === 'http' && c.path.indexOf('/admin/peer') === 0).length > n,
+                after.length, { timeout: WAIT });
+            const final = await peerCalls(page);
+            assertEqual(final[final.length - 1].address, 'beta.example.com',
+                'every subsequent request keeps dialling the newly active server, not just the first one');
+            await shot(page, 'overview-real-switch');
         } finally {
             await page.ctx.close();
         }
