@@ -60,14 +60,15 @@
 
     function probeTargets() { return ENDPOINTS.filter(function (ep) { return ep.probe; }); }
 
-    function seg(value) {
+    function seg(value, opts) {
         let v = value;
         if (typeof v === 'number' && Number.isFinite(v)) v = String(v);
         if (typeof v !== 'string') {
             throw fail('GENERIC', 'a path parameter must be a string or a finite number',
                 { type: typeof value });
         }
-        if (v === '') throw fail('GENERIC', 'a path parameter must not be empty', {});
+        const allowEmpty = !!(opts && opts.allowEmpty);
+        if (v === '' && !allowEmpty) throw fail('GENERIC', 'a path parameter must not be empty', {});
         if (v.length > MAX_SEG_LEN) {
             throw fail('GENERIC', 'a path parameter is too long',
                 { length: v.length, max: MAX_SEG_LEN });
@@ -282,7 +283,12 @@
             if (!params || !(name in params)) {
                 throw fail('GENERIC', 'missing path parameter "' + name + '"', { endpoint: ep.id });
             }
-            return seg(params[name]);
+            // The address book id is the one path parameter that may legitimately
+            // be '' -- js/core/addressbook.js's AB.PERSONAL.guid is '' by design,
+            // meaning "the caller's own personal book" rather than "no book was
+            // given". Every OTHER path parameter (a device, user or peer id) keeps
+            // the strict "must not be empty" rule; only 'ab' is relaxed here.
+            return seg(params[name], { allowEmpty: name === 'ab' });
         });
     }
 
@@ -343,6 +349,20 @@
         return value;
     }
 
+    // Like text(), but for the address book id specifically: '' is a real value
+    // (the personal book, AB.PERSONAL.guid === '' from js/core/addressbook.js),
+    // not a missing one, so the non-empty check text() enforces for every OTHER
+    // string parameter does not apply here.
+    function abText(value) {
+        if (typeof value !== 'string') {
+            throw fail('GENERIC', 'an address book id must be a string', { type: typeof value });
+        }
+        if (CTRL.test(value)) {
+            throw fail('GENERIC', 'an address book id contains a control character', {});
+        }
+        return value;
+    }
+
     function guarded(fn) {
         try {
             return fn();
@@ -375,10 +395,25 @@
             }
         },
         addressbook: {
-            books: function () { return call('ab.books').then(asList); },
+            // books()/peers()/tags() resolve to the RAW unwrapped `data` (e.g.
+            // {profiles:[...]}, {peers:[...]}, {tags:[...]}) rather than being run
+            // through asList()/listCall()+paginate(). Those two helpers assume the
+            // {list, page, total, page_size} pagination envelope that devices.list/
+            // users.list/users.groups/audit.* genuinely use -- but rustdesk's own
+            // address book API answers with the differently-named keys above, no
+            // pagination fields at all. Forcing that shape through paginate() silently
+            // discarded every real payload (paginate() only ever looks at `.list`),
+            // which nothing caught before Task 23 because this façade had no tests of
+            // its own for the addressbook methods and every existing addressbook-ui
+            // test drives a fully fake facade. js/core/addressbook.js's booksFrom/
+            // peersFrom/tagsFrom are already built to dig through whichever of these
+            // keys (or a bare array, or one more level of {data:...}) is actually
+            // there, which is exactly why the interface here is documented as
+            // "-> Promise<any>" rather than a pinned shape.
+            books: function () { return call('ab.books'); },
             peers: function (ab) {
                 return guarded(function () {
-                    return listCall('ab.peers', { ab: text(ab, 'an address book id') });
+                    return call('ab.peers', { query: { ab: abText(ab) } });
                 });
             },
             addPeer: function (ab, peer) {
@@ -399,7 +434,7 @@
                     });
                 });
             },
-            tags: function (ab) { return call('ab.tags', { params: { ab: ab } }).then(asList); },
+            tags: function (ab) { return call('ab.tags', { params: { ab: ab } }); },
             addTag: function (ab, tag) {
                 return guarded(function () {
                     return call('ab.addTag', { params: { ab: ab }, body: [text(tag, 'a tag')] });
