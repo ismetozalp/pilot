@@ -50,18 +50,21 @@
     // answers 200 with the body "KO" for a bad token, so `curl -fsS` alone would
     // exit 0 on a rejected update and the failure would surface much later as an
     // opaque ACME error: the body is checked explicitly instead.
-    const DUCKDNS_SCRIPT = [
-        'set -e',
-        'umask 077',
-        'conf=$(mktemp)',
-        'trap \'rm -f "$conf" ' + DUCKDNS_TOKEN_PATH + '\' EXIT',
-        '[ -s ' + DUCKDNS_TOKEN_PATH + ' ] || { echo "no staged DuckDNS token" >&2; exit 1; }',
+    // ONE line, semicolon-separated, exactly like the hbbs-key step's own
+    // wait-for-file script: libexec/pilot-exec REJECTS any argv element
+    // containing a control character (a newline included), and rightly so —
+    // that check is what stops a hostile detection value smuggling a second
+    // command into a rendered plan. Caught by running the real helper against a
+    // real DuckDNS envelope, not by inspection; tests/integration now does that
+    // on every run.
+    const DUCKDNS_SCRIPT =
+        'set -e; umask 077; conf=$(mktemp); ' +
+        'trap \'rm -f "$conf" ' + DUCKDNS_TOKEN_PATH + '\' EXIT; ' +
+        '[ -s ' + DUCKDNS_TOKEN_PATH + ' ] || { echo "no staged DuckDNS token" >&2; exit 1; }; ' +
         'printf \'url = "https://www.duckdns.org/update?domains=%s&token=%s&ip="\\n\' ' +
-            '"$1" "$(cat ' + DUCKDNS_TOKEN_PATH + ')" > "$conf"',
-        'out=$(curl -fsS -K "$conf")',
-        'printf \'%s\\n\' "$out"',
-        '[ "$out" = OK ] || { echo "DuckDNS refused the update" >&2; exit 1; }'
-    ].join('\n');
+        '"$1" "$(cat ' + DUCKDNS_TOKEN_PATH + ')" > "$conf"; ' +
+        'out=$(curl -fsS -K "$conf"); printf \'%s\\n\' "$out"; ' +
+        '[ "$out" = OK ] || { echo "DuckDNS refused the update" >&2; exit 1; }';
 
     const CTRL_RE = /[\x00-\x1f\x7f]/;
     const RUN_ID_RE = /^[0-9]{8}T[0-9]{6}Z$/;

@@ -470,3 +470,64 @@ test('the step cap and the empty-steps rule hold', () => {
     for (let i = 0; i < 201; i += 1) many.push(step({ id: 'step-' + i }));
     assert.equal(run(['--print-plan'], JSON.stringify(envelope({ steps: many }))).code, 3);
 });
+
+// =================================================== FINAL REVIEW, FINDING 1
+//
+// The plans PilotProvisionPlan actually builds must be plans the REAL helper
+// accepts. Nothing checked that before: the unit tier asserts on plan objects
+// and the e2e tier's stub validates nothing at all, so the first version of the
+// DuckDNS step — whose argv carried a multi-line shell script — passed 1400
+// unit tests and 21 browser checks while pilot-exec rejected it outright
+// ("envelope.steps[N].argv[2] contains a control character", which is the very
+// guard that stops a smuggled second command). Every tier a real plan is built
+// in now ends at the real validator.
+const Plan = require('../../js/core/provision-plan.js');
+
+const DETECTION = {
+    os_release: { id: 'debian', id_like: '', version_id: '12', pretty_name: 'Debian 12' },
+    arch: 'x86_64', init: 'systemd', firewall: 'firewalld', egress: true,
+    disk_free_mb: 4096, hbbs: null, api: null, public_ip: '203.0.113.10'
+};
+
+function planChoices(over) {
+    return Object.assign({
+        target: 'local', installHbbs: true, openFirewall: true,
+        tlsTier: 'none', domain: null, duckdns: null, apiPort: 21114, sshPort: 22
+    }, over || {});
+}
+
+for (const [label, over] of [
+    ['no TLS', {}],
+    ['own domain', { tlsTier: 'own', domain: 'rd.example.com' }],
+    ['sslip.io', { tlsTier: 'sslip' }],
+    ['DuckDNS', { tlsTier: 'duckdns', duckdns: { subdomain: 'pilotdemo', token: 'TOKEN-abc123XYZ' } }]
+]) {
+    test(`a real ${label} plan is accepted by the real helper's own validator`, () => {
+        const envelope = Plan.toEnvelope(Plan.build(DETECTION, planChoices(over)),
+            { run_id: '20260804T120000Z' });
+        const r = run(['--print-plan'], JSON.stringify(envelope));
+        assert.equal(r.code, 0, `pilot-exec rejected a plan Pilot itself builds: ${r.out}${r.err}`);
+        const printed = lines(r.out);
+        assert.equal(printed[0].t, 'plan');
+        assert.equal(printed[0].steps, envelope.steps.length);
+    });
+}
+
+test('the DuckDNS token appears nowhere in what the helper prints for a DuckDNS plan', () => {
+    const TOKEN = 'TOKEN-abc123XYZ';
+    const envelope = Plan.toEnvelope(Plan.build(DETECTION, planChoices({
+        tlsTier: 'duckdns', duckdns: { subdomain: 'pilotdemo', token: TOKEN }
+    })), { run_id: '20260804T120000Z' });
+    const r = run(['--print-plan'], JSON.stringify(envelope));
+    assert.equal(r.code, 0);
+    assert.equal(r.out.indexOf(TOKEN), -1, 'the printed plan leaked the token');
+    assert.equal(r.err.indexOf(TOKEN), -1, 'stderr leaked the token');
+    const printed = lines(r.out);
+    const staged = printed.filter((p) => p.id === 'tls-duckdns-token')[0];
+    assert.ok(staged, 'the token-staging step must be in the plan');
+    assert.equal(staged.secret, true);
+    assert.equal(staged.cmd, '•'.repeat(6), 'a secret step prints as the mask, never its content');
+    const update = printed.filter((p) => p.id === 'tls-duckdns')[0];
+    assert.ok(update.cmd.indexOf(TOKEN) === -1 && update.cmd.indexOf('-K') !== -1,
+        'the update step reads the URL from a config file, so its own command is safe to print');
+});
