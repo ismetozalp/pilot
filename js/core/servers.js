@@ -238,9 +238,26 @@
         };
     }
 
+    // Real cockpit.js does NOT hand back a native Promise from cockpit.file()
+    // or cockpit.spawn() -- it is a home-grown deferred whose .then() invokes
+    // resolve/reject callbacks SYNCHRONOUSLY, straight out of the channel's
+    // "close" event dispatch, with no try/catch of its own. A Cockpit session
+    // starts in "Limited access" by default (spec-adjacent: every account,
+    // including sudoers, until the user explicitly turns on administrative
+    // access), so every superuser:'require' handle opened at load — exactly
+    // what wireApi() does on first paint — fails this way immediately. If our
+    // own reject handler THROWS (as this used to), that throw is not a promise
+    // rejection: it is a genuine, uncaught, top-level exception, because it
+    // happens deep inside real browser event dispatch, long after any of
+    // Pilot's own try/catch blocks are still on the stack. `Promise.resolve()`
+    // fixes this by assimilating the raw thenable through the native Promise
+    // machinery (a microtask-scheduled job), so cockpit.js only ever calls a
+    // native resolver — never our own code — synchronously. Every `.then()`
+    // chained after this point is therefore native and safe, all the way up
+    // through guard() and every caller's own await/try-catch. See GAP A.
     function readFile(ck, p) {
         const handle = ck.file(p, { superuser: 'require' });
-        return handle.read().then(function (content) {
+        return Promise.resolve(handle.read()).then(function (content) {
             handle.close();
             return content;
         }, function (e) {
@@ -251,7 +268,7 @@
 
     function writeFile(ck, p, value) {
         const handle = ck.file(p, { superuser: 'require' });
-        return handle.replace(value).then(function () {
+        return Promise.resolve(handle.replace(value)).then(function () {
             handle.close();
             return p;
         }, function (e) {
@@ -261,7 +278,7 @@
     }
 
     function run(ck, argv) {
-        return ck.spawn(argv, { superuser: 'require', err: 'message' });
+        return Promise.resolve(ck.spawn(argv, { superuser: 'require', err: 'message' }));
     }
 
     function ensureDir(ck, dir, mode) {

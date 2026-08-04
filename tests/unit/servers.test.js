@@ -62,6 +62,54 @@ function fakeCockpit(opts) {
     return calls;
 }
 
+// Real cockpit.js does NOT hand back a native Promise from cockpit.file()/
+// cockpit.spawn() -- it is a home-grown "deferred" (cockpit.defer()) whose
+// .then() invokes the resolve/reject callbacks SYNCHRONOUSLY, directly from
+// whatever dispatched the underlying channel's close event, with no
+// surrounding try/catch of its own. A callback that THROWS therefore escapes
+// as a genuine, unhandled top-level exception -- never a promise rejection --
+// because the throw happens deep inside a real browser event dispatch, long
+// after any of Pilot's own try/catch blocks have returned. This is invisible
+// to a fakeCockpit built on native Promise.resolve/reject (GAP A task 33):
+// those settle asynchronously via the microtask queue, which already has the
+// safety net real cockpit.js lacks. hostileFileCockpit reproduces the real
+// shape closely enough to catch a `throw e` regression before it reaches a
+// live Cockpit session.
+function hostileFileCockpit(opts) {
+    opts = opts || {};
+    const calls = { spawn: [], file: [], replace: [], closes: 0 };
+    const handlers = []; // one entry per handle.read()/replace() call
+    globalThis.cockpit = {
+        spawn(argv, o) {
+            calls.spawn.push({ argv, opts: o });
+            return Promise.resolve('');
+        },
+        file(p, o) {
+            calls.file.push({ path: p, opts: o });
+            function hostileThenable(kind) {
+                return {
+                    then(onFulfilled, onRejected) {
+                        handlers.push({ path: p, kind, onFulfilled, onRejected });
+                        // Real cockpit.js returns the SAME deferred's .promise
+                        // from further .then() calls under the hood; nothing
+                        // here needs to chain further for this test.
+                        return { then() {} };
+                    }
+                };
+            }
+            return {
+                read() { return hostileThenable('read'); },
+                replace(v) {
+                    calls.replace.push({ path: p, value: v });
+                    return hostileThenable('replace');
+                },
+                close() { calls.closes++; }
+            };
+        }
+    };
+    return { calls, handlers };
+}
+
 const REC = {
     id: 'prod', host: 'rd.example.com', sshPort: 22, apiPort: 21114, tls: true,
     domain: 'rd.example.com', hbbsKey: 'AbC+/123=', hbbsPorts: [21115, 21116, 21117],
@@ -278,6 +326,67 @@ test('list: one corrupt record does not hide the others', async (t) => {
     t.after(dropCockpit);
     const out = await S.list();
     assert.deepEqual(out.map((r) => r.id), ['prod']);
+});
+
+// --- GAP A (task 33): the "not permitted" callback must never be able to ---
+// --- throw synchronously out of cockpit.js's own event dispatch.         ---
+
+test('GAP A: read() never lets an access-denied close synchronously escape ' +
+    'as an uncaught exception, even though cockpit.js dispatches it synchronously', async (t) => {
+    const { handlers } = hostileFileCockpit();
+    t.after(dropCockpit);
+
+    const pending = S.read('prod');
+    // readFile() must have registered against the record file's real (hostile)
+    // read thenable by now; whether that happens synchronously or after a
+    // microtask depends on whether the raw thenable was wrapped -- flush a
+    // macrotask turn so either implementation has had its chance to attach.
+    await new Promise((resolve) => setImmediate(resolve));
+    const readCall = handlers.find((h) => h.path === '/etc/pilot/servers/prod.json' && h.kind === 'read');
+    assert.ok(readCall, 'servers.js never registered a read handler against the record file');
+
+    const denied = Object.assign(new Error(), { problem: 'access-denied', message: 'Not permitted to perform this action.' });
+    let escaped = null;
+    try {
+        // This is exactly what real cockpit.js does: call the rejection
+        // callback directly, synchronously, from inside the channel's close
+        // event -- no promise machinery, no try/catch of its own.
+        readCall.onRejected(denied);
+    } catch (e) {
+        escaped = e;
+    }
+    assert.equal(escaped, null,
+        'servers.js\'s own reject handler threw synchronously back into cockpit.js\'s dispatch -- ' +
+        'in a real browser this is an uncaught top-level exception, not a promise rejection ' +
+        '(see GAP A: js/core/servers.js readFile/writeFile/run must wrap the raw cockpit ' +
+        'thenable in Promise.resolve() before chaining .then())');
+
+    // The outer read() promise must still end up properly (asynchronously)
+    // rejected with a typed PilotError -- the fix must not just swallow the
+    // failure, it must convert the escape hazard into an ordinary rejection.
+    await assert.rejects(pending, (e) => e && e.name === 'PilotError');
+});
+
+test('GAP A: write() never lets an access-denied close synchronously escape ' +
+    'as an uncaught exception on the record write', async (t) => {
+    const { handlers } = hostileFileCockpit();
+    t.after(dropCockpit);
+
+    const pending = S.write(REC);
+    await new Promise((resolve) => setImmediate(resolve));
+    const writeCall = handlers.find((h) => h.path === '/etc/pilot/servers/prod.json' && h.kind === 'replace');
+    assert.ok(writeCall, 'servers.js never registered a replace handler against the record file');
+
+    const denied = Object.assign(new Error(), { problem: 'access-denied', message: 'Not permitted to perform this action.' });
+    let escaped = null;
+    try {
+        writeCall.onRejected(denied);
+    } catch (e) {
+        escaped = e;
+    }
+    assert.equal(escaped, null,
+        'writeFile\'s reject handler threw synchronously back into cockpit.js\'s dispatch');
+    await assert.rejects(pending, (e) => e && e.name === 'PilotError');
 });
 
 test('read: rejects typed when the record file is absent', async (t) => {
