@@ -21,7 +21,7 @@ const C7 = [
     'js/core/errors.js', 'js/core/semver.js', 'js/core/themes.js', 'js/core/settings.js',
     'js/core/ostarget.js', 'js/core/ports.js', 'js/core/firewall.js', 'js/core/tls.js',
     'js/core/provision-plan.js', 'js/core/redact.js',
-    'js/core/servers.js', 'js/core/api-io.js', 'js/core/api-client.js', 'js/core/addressbook.js',
+    'js/core/servers.js', 'js/core/api-io.js', 'js/core/api-client.js', 'js/core/console-view.js', 'js/core/addressbook.js',
     'js/features/update.js', 'js/features/setup-ui.js',
     'js/features/devices-ui.js', 'js/features/addressbook-ui.js',
     'js/features/users-ui.js', 'js/features/audit-ui.js',

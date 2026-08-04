@@ -402,6 +402,77 @@ test('users.resetPassword refuses an empty or non-string password', async () => 
     }
 });
 
+// The gap Task 24 was warned about (Task 18's PilotApi.addressbook shipped with
+// 76 passing tests that never once called it, and a façade that silently
+// discarded every payload passed review): nothing above exercised
+// users.list/groups/create/update/setGroup's actual method, path, payload or
+// unwrapped shape. Verified by execution before js/features/users-ui.js was
+// built on top of them (task-24-report.md); these lock the verified behaviour
+// in as a permanent regression test rather than leaving the gap open.
+test('users.list sends GET /admin/user with admin auth, and paginates the {list,page,total,page_size} shape', async () => {
+    const calls = recorder({ status: 200, body:
+        { code: 0, message: '', data: { list: [{ id: 'u1', name: 'ada' }], page: 3, total: 91, page_size: 20 } } });
+    const out = await Api.users.list({ page: 3, pageSize: 20, keyword: 'ada' });
+    assert.equal(calls[0].method, 'GET');
+    assert.equal(calls[0].path, '/admin/user?keyword=ada&page=3&page_size=20');
+    assert.equal(calls[0].auth, C.AUTH.admin);
+    assert.deepEqual(out, { list: [{ id: 'u1', name: 'ada' }], page: 3, total: 91, pageSize: 20 });
+});
+
+test('users.groups sends GET /admin/group and resolves to a bare array (not {list,...})', async () => {
+    const calls = recorder({ status: 200, body:
+        { code: 0, message: '', data: { list: [{ id: 'g1', name: 'Support' }], page: 1, total: 1, page_size: 50 } } });
+    const out = await Api.users.groups();
+    assert.equal(calls[0].method, 'GET');
+    assert.equal(calls[0].path, '/admin/group');
+    assert.equal(calls[0].auth, C.AUTH.admin);
+    assert.deepEqual(out, [{ id: 'g1', name: 'Support' }], 'groups() must unwrap to a plain array via asList()');
+});
+
+test('users.groups tolerates a bare-array data payload with no pagination envelope at all', async () => {
+    recorder({ status: 200, body: { code: 0, message: '', data: [{ id: 'g1', name: 'Support' }] } });
+    const out = await Api.users.groups();
+    assert.deepEqual(out, [{ id: 'g1', name: 'Support' }]);
+});
+
+test('users.create POSTs the account object as-is to /admin/user', async () => {
+    const calls = recorder({ status: 200, body: { code: 0, data: null } });
+    await Api.users.create({ name: 'ada', email: 'ada@example.com', password: 'correct horse' });
+    assert.equal(calls[0].method, 'POST');
+    assert.equal(calls[0].path, '/admin/user');
+    assert.equal(calls[0].auth, C.AUTH.admin);
+    assert.deepEqual(JSON.parse(calls[0].body), { name: 'ada', email: 'ada@example.com', password: 'correct horse' });
+    await assert.rejects(Api.users.create(null), (e) => e.kind === Errors.KIND.GENERIC);
+    await assert.rejects(Api.users.create('nope'), (e) => e.kind === Errors.KIND.GENERIC);
+});
+
+test('users.update PUTs to /admin/user/{id} using the object\'s own id', async () => {
+    const calls = recorder({ status: 200, body: { code: 0, data: null } });
+    await Api.users.update({ id: 'u1', name: 'ada2' });
+    assert.equal(calls[0].method, 'PUT');
+    assert.equal(calls[0].path, '/admin/user/u1');
+    assert.deepEqual(JSON.parse(calls[0].body), { id: 'u1', name: 'ada2' });
+});
+
+test('users.setGroup PUTs {id,group_id} to /admin/user/{id}', async () => {
+    const calls = recorder({ status: 200, body: { code: 0, data: null } });
+    await Api.users.setGroup('u1', 'g2');
+    assert.equal(calls[0].method, 'PUT');
+    assert.equal(calls[0].path, '/admin/user/u1');
+    assert.deepEqual(JSON.parse(calls[0].body), { id: 'u1', group_id: 'g2' });
+    await assert.rejects(Api.users.setGroup('', 'g2'), (e) => e.kind === Errors.KIND.GENERIC);
+});
+
+test('users.setEnabled and setGroup refuse an empty id even without an explicit guarded() wrapper', async () => {
+    // Unlike create/update/resetPassword, setEnabled/setGroup build their path
+    // directly rather than going through guarded() -- confirms call()'s own
+    // synchronous try/catch around fill() still turns the seg() throw into a
+    // typed rejection instead of an uncaught synchronous exception.
+    recorder({ status: 200, body: { code: 0, data: null } });
+    await assert.rejects(Api.users.setEnabled('', true), (e) => e.name === 'PilotError' && e.kind === Errors.KIND.GENERIC);
+    await assert.rejects(Api.users.setGroup('', 'g1'), (e) => e.name === 'PilotError' && e.kind === Errors.KIND.GENERIC);
+});
+
 test('audit.conn, file and login are three distinct admin endpoints', async () => {
     const calls = recorder({ status: 200, body: { code: 0, data: { list: [] } } });
     await Api.audit.conn({});
