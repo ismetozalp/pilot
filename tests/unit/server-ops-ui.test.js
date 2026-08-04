@@ -148,6 +148,41 @@ test('opArgv: rotate-key removes the keypair and restarts hbbs in one compound c
     assert.match(argv[2], /systemctl restart rustdesk-hbbs\.service/);
 });
 
+// A false "success" here is the worst failure mode this surface has: an
+// operator who believes a compromised key was rotated, and it was not,
+// stops treating it as compromised. `rm -f` on a missing path exits 0, so
+// the script must check the key file exists FIRST and fail loudly (naming
+// the path) rather than silently no-op through to a green run.
+test('opArgv: rotate-key verifies the key file exists before removing it, and fails loudly (naming the path) if not', () => {
+    const argv = S.opArgv('rotate-key', LOCAL);
+    const script = argv[2];
+    assert.match(script, /if \[ ! -e '\/var\/lib\/rustdesk-server\/id_ed25519' \]/,
+        'must guard on the private key file actually existing');
+    assert.match(script, /exit 1/, 'a missing key file must abort the step, not proceed to rm/restart');
+    assert.match(script, />&2/, 'the failure message must go to stderr');
+    assert.match(script, /\/var\/lib\/rustdesk-server\/id_ed25519/,
+        'the failure message must name the actual path that was missing');
+    // The guard must come BEFORE the rm/restart, not after.
+    const guardIdx = script.indexOf('exit 1');
+    const rmIdx = script.indexOf('rm -f');
+    assert.ok(guardIdx < rmIdx, 'the existence check must run before rm -f, not after');
+});
+
+test('opArgv: rotate-key reads server.hbbsDataDir when the registry supplies one, falling back to the default otherwise', () => {
+    const customServer = Object.assign({}, LOCAL, { hbbsDataDir: '/srv/custom-rustdesk' });
+    const argv = S.opArgv('rotate-key', customServer);
+    assert.match(argv[2], /\/srv\/custom-rustdesk\/id_ed25519/);
+    assert.ok(argv[2].indexOf('/var/lib/rustdesk-server') === -1,
+        'a supplied hbbsDataDir must replace the default, not merely add to it');
+
+    // Hostile/empty values fall back to the documented default rather than
+    // producing a broken or empty path.
+    for (const bad of [null, undefined, '', '   ', 42, {}]) {
+        const withBad = Object.assign({}, LOCAL, { hbbsDataDir: bad });
+        assert.equal(S.hbbsDataDirFor(withBad), '/var/lib/rustdesk-server', JSON.stringify(bad));
+    }
+});
+
 test('opArgv returns null for an unknown op', () => {
     assert.equal(S.opArgv('nope', LOCAL), null);
     assert.equal(S.opArgv('', LOCAL), null);
@@ -678,6 +713,87 @@ test('confirmRun does nothing while disabled (rotate-key without the typed id)',
         assert.equal(result, false);
         assert.ok(c.confirm, 'the confirmation must still be open');
         assert.equal(fake.calls.length, 0);
+    });
+});
+
+// ------------------------------------------------------------ rotate-key: existence guard end-to-end
+//
+// The confirmation gate (typed server id) and the on-target existence guard
+// (opArgv's `if [ ! -e ... ]`) are two independent defences against two
+// different mistakes: the confirm gate stops a MISCLICK; the existence
+// guard stops a false "success" when the key simply is not where Pilot
+// expects it. These three tests exercise the real component method
+// (confirmRun -> execute), not opArgv in isolation, so a regression that
+// wired the guard into the wrong place (or dropped it before it reaches
+// pilot-exec) would be caught here too.
+
+const RUN_ROTATE_OK = [
+    '{"t":"run-start","run_id":"20260803T204700Z","transport":"local","steps":1}',
+    '{"t":"step-start","id":"rotate-key","title":"Rotate server keypair","cmd":"sh -c ..."}',
+    '{"t":"step-end","id":"rotate-key","status":"ok","exit":0,"ms":40}',
+    '{"t":"run-end","status":"ok","kind":null}'
+].join('\n') + '\n';
+
+// Models the real on-target guard tripping: the shell script's own `exit 1`
+// after printing to stderr, surfaced by pilot-exec as a normal failed step
+// (never a manufactured green run).
+const RUN_ROTATE_MISSING_KEY = [
+    '{"t":"run-start","run_id":"20260803T204800Z","transport":"local","steps":1}',
+    '{"t":"step-start","id":"rotate-key","title":"Rotate server keypair","cmd":"sh -c ..."}',
+    '{"t":"output","id":"rotate-key","stream":"stderr",' +
+        '"line":"rotate-key: no keypair found at /var/lib/rustdesk-server/id_ed25519 -- nothing was rotated"}',
+    '{"t":"step-end","id":"rotate-key","status":"failed","exit":1,"ms":5}',
+    '{"t":"run-end","status":"failed","kind":null}'
+].join('\n') + '\n';
+
+test('rotate-key happy path: confirming with the exact server id actually rotates the key and restarts hbbs', async () => {
+    const fake = fakeCockpit({ spawn: { '--run': RUN_ROTATE_OK } });
+    await withCockpit(fake, async () => {
+        const c = S.serverOpsUi();
+        c.server = LOCAL;
+        c.request('rotate-key');
+        c.confirm.typed = LOCAL.id;
+        const ok = await c.confirmRun();
+        assert.equal(ok, true);
+        assert.equal(c.confirm, null);
+        assert.equal(c.opAlerts['rotate-key'], null, 'a genuine success must not leave a stale alert');
+        const call = fake.calls.find((x) => x.argv.indexOf('--run') >= 0);
+        const envelope = JSON.parse(call.stdin);
+        assert.match(envelope.steps[0].argv[2], /if \[ ! -e /,
+            'the real run must actually carry the existence guard, not a stale/simplified argv');
+    });
+});
+
+test('rotate-key wrong/missing path: a missing keypair is a clear, visible failure — never a false success', async () => {
+    const fake = fakeCockpit({ spawn: { '--run': RUN_ROTATE_MISSING_KEY } });
+    await withCockpit(fake, async () => {
+        const c = S.serverOpsUi();
+        c.server = LOCAL;
+        c.request('rotate-key');
+        c.confirm.typed = LOCAL.id;
+        const ok = await c.confirmRun();
+        assert.equal(ok, false, 'a missing keypair must never be reported as success');
+        assert.ok(c.opAlerts['rotate-key'], 'the failure must be visible under this op\'s own alert');
+        assert.match(c.opAlerts['rotate-key'].message, /no keypair found at .*id_ed25519.*nothing was rotated/i,
+            'the operator-visible alert must name the actual missing path, not a generic message');
+    });
+});
+
+test('rotate-key\'s confirmation gate still applies after the existence-guard change', async () => {
+    const fake = fakeCockpit({ spawn: { '--run': RUN_ROTATE_OK } });
+    await withCockpit(fake, async () => {
+        const c = S.serverOpsUi();
+        c.server = LOCAL;
+        c.request('rotate-key');
+        assert.ok(c.confirm, 'rotate-key must still open a confirmation, not run immediately');
+        assert.equal(c.confirmDisabled(), true, 'must still be locked with nothing typed');
+        c.confirm.typed = 'not-the-right-id';
+        assert.equal(c.confirmDisabled(), true, 'must still be locked with the wrong id typed');
+        assert.equal(fake.calls.length, 0, 'nothing may run until the gate is passed');
+        c.confirm.typed = LOCAL.id;
+        assert.equal(c.confirmDisabled(), false, 'the exact id must still unlock it');
+        await c.confirmRun();
+        assert.ok(fake.calls.some((x) => x.argv.indexOf('--run') >= 0));
     });
 });
 

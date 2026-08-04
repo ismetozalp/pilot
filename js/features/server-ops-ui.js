@@ -121,6 +121,20 @@
         return true;
     }
 
+    // provision-plan.js supports a customised hbbs data directory
+    // (det.hbbs.dataDir, C8), but no task persists that path into the server
+    // registry (js/core/servers.js's normalizeRecord carries no such field) —
+    // a real gap upstream of this one. Rather than silently assume the
+    // default is always right, this reads an optional server.hbbsDataDir when
+    // a caller supplies one (so it is ready the moment some later task DOES
+    // start persisting it) and only falls back to the documented default
+    // when it is absent.
+    function hbbsDataDirFor(server) {
+        const s = (server && typeof server === 'object') ? server : {};
+        const dir = s.hbbsDataDir;
+        return (typeof dir === 'string' && dir.trim() !== '') ? dir.trim() : HBBS_DATA;
+    }
+
     // The argv actually executed ON THE TARGET, inside one pilot-exec envelope
     // step — never the credential, which travels only in the envelope's
     // `credentials` block (stdin), never here.
@@ -142,10 +156,23 @@
                 return ['rustdesk-utils', 'doctor'];
             case 'recheck-ports':
                 return ['ss', '-H', '-ltnu'];
-            case 'rotate-key':
+            case 'rotate-key': {
+                // `rm -f` on a missing path exits 0 — this op would otherwise
+                // report SUCCESS while rotating nothing, which is worse than an
+                // error: an operator who believes a compromised key has been
+                // rotated, and has not, stops treating it as compromised. So
+                // the key file's existence is checked FIRST, and the whole
+                // step fails loudly (non-zero exit, naming the path) rather
+                // than silently no-op'ing through to a green "done".
+                const dir = hbbsDataDirFor(server);
+                const priv = dir + '/id_ed25519';
+                const pub = dir + '/id_ed25519.pub';
                 return ['sh', '-c',
-                    'rm -f ' + sq(HBBS_DATA + '/id_ed25519') + ' ' + sq(HBBS_DATA + '/id_ed25519.pub') +
+                    'if [ ! -e ' + sq(priv) + ' ]; then echo ' +
+                    sq('rotate-key: no keypair found at ' + priv + ' -- nothing was rotated') +
+                    ' >&2; exit 1; fi; rm -f ' + sq(priv) + ' ' + sq(pub) +
                     ' && systemctl restart ' + UNIT.hbbs];
+            }
             default:
                 return null;
         }
@@ -455,6 +482,26 @@
         return lines.join('\n');
     }
 
+    // A failed step with no C6 kind (e.g. rotate-key's own on-target existence
+    // guard, which just exits 1 after an ordinary stderr line — it is not a
+    // PilotErrors kind, just a plain shell failure) would otherwise surface as
+    // the generic "did not finish successfully", burying the one line that
+    // actually says WHY (naming a path, in rotate-key's case) inside the
+    // output pane instead of the headline alert. This promotes the last
+    // stderr line to the alert message when there is no better kind-specific
+    // one already.
+    function lastStderrLine(exec) {
+        const steps = (exec && Array.isArray(exec.steps)) ? exec.steps : [];
+        for (let i = steps.length - 1; i >= 0; i--) {
+            const lines = Array.isArray(steps[i].lines) ? steps[i].lines : [];
+            for (let j = lines.length - 1; j >= 0; j--) {
+                if (lines[j].stream === 'stderr' && str(lines[j].text).trim() !== '')
+                    return str(lines[j].text).trim();
+            }
+        }
+        return '';
+    }
+
     function serverOpsUi() {
         return Object.assign(blankState(), {
             OPS: OPS,
@@ -644,8 +691,9 @@
 
             applyResult: function (opId, exec) {
                 if (exec && exec.status === 'failed') {
+                    const detail = lastStderrLine(exec);
                     this.opAlerts[opId] = errorView(
-                        fail(exec.kind || 'GENERIC', 'The operation did not finish successfully.', null),
+                        fail(exec.kind || 'GENERIC', detail || 'The operation did not finish successfully.', null),
                         findOp(opId) ? findOp(opId).label : opId);
                 }
                 const text = outputTextFrom(exec);
@@ -767,7 +815,7 @@
 
     const PilotServerOpsUi = {
         OPS: OPS, DANGER_OPS: DANGER_OPS,
-        isOpAllowed: isOpAllowed, opArgv: opArgv,
+        isOpAllowed: isOpAllowed, opArgv: opArgv, hbbsDataDirFor: hbbsDataDirFor,
         parseUnitState: parseUnitState, unitStatesFrom: unitStatesFrom, STATUS_UNITS: STATUS_UNITS,
         parseRelayLog: parseRelayLog, summarise: summarise,
         blankState: blankState, serverOpsUi: serverOpsUi,
