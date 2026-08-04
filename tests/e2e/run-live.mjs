@@ -225,6 +225,56 @@ export function requireLive() {
     return process.env.PILOT_LIVE_REQUIRE === '1';
 }
 
+// --- the developer's own settings file ------------------------------------
+//
+// This tier drives the REAL plugin, and js/core/settings.js persists the theme
+// to ~/.config/cockpit/pilot/settings.json for real. Until the final review the
+// live tier had no cleanup of any kind: the theme check clicked "Nord", the run
+// wrote theme:"nord" to disk, and the NEXT run started already on Nord — so the
+// check ("a theme switch must change a real computed style") passed exactly once
+// on a fresh machine and failed forever after. That is a self-poisoning test AND
+// a test that quietly edits the developer's settings.
+//
+// Both halves are fixed: the scenario now picks a theme different from whatever
+// is currently applied (see live-smoke.live.mjs), and the file is snapshotted
+// here and put back in a finally.
+export function settingsPath(home) {
+    return path.join((home === undefined || home === null) ? os.homedir() : home,
+        '.config', 'cockpit', 'pilot', 'settings.json');
+}
+
+// { path, existed, content }. Never throws: a snapshot that could not be taken
+// simply records existed:false with a null content, and restore() then only
+// removes a file THIS run created.
+export function snapshotSettings(home) {
+    const file = settingsPath(home);
+    try {
+        return { path: file, existed: true, content: fs.readFileSync(file, 'utf8') };
+    } catch (e) {
+        return { path: file, existed: false, content: null };
+    }
+}
+
+// Puts back exactly what was there, or removes the file if there was none.
+// Returns what it did, so the runner can print it.
+export function restoreSettings(snap) {
+    if (!snap || typeof snap !== 'object' || typeof snap.path !== 'string') return 'skipped';
+    try {
+        if (snap.existed) {
+            const current = (() => { try { return fs.readFileSync(snap.path, 'utf8'); } catch (e) { return null; } })();
+            if (current === snap.content) return 'unchanged';
+            fs.mkdirSync(path.dirname(snap.path), { recursive: true });
+            fs.writeFileSync(snap.path, snap.content);
+            return 'restored';
+        }
+        if (!fs.existsSync(snap.path)) return 'unchanged';
+        fs.unlinkSync(snap.path);
+        return 'removed';
+    } catch (e) {
+        return 'failed: ' + (e && e.message);
+    }
+}
+
 // --- the browser side: only reached once shouldSkip() returns null --------
 
 function isMain(metaUrl) {
@@ -444,6 +494,10 @@ async function main() {
         console.log(`test:live: Pilot found installed at ${installedAt}`);
 
         const creds = credentials();
+        // Taken BEFORE the browser is even launched, and put back no matter how
+        // this run ends: driving the real plugin really writes this file, and a
+        // test tier has no business editing the developer's settings.
+        const settings = snapshotSettings();
         const { chromium } = await import('playwright');
         liveBrowser = await chromium.launch({ headless: !process.env.HEADED, timeout: 30000 });
         console.log(`test:live: chromium launched, driving ${BASE_URL}`);
@@ -452,6 +506,7 @@ async function main() {
         } finally {
             await liveBrowser.close();
             liveBrowser = null;
+            console.log(`test:live: ${settings.path}: ${restoreSettings(settings)}`);
         }
     }
 
@@ -469,7 +524,8 @@ async function main() {
 
 export const PilotLive = {
     credentials, shouldSkip, loginUrl, isCspViolation, requireLive,
-    pluginInstalled, pluginDirCandidates, findPluginDir, makeCheck
+    pluginInstalled, pluginDirCandidates, findPluginDir, makeCheck,
+    settingsPath, snapshotSettings, restoreSettings
 };
 
 if (isMain(import.meta.url)) {

@@ -51,21 +51,48 @@ export default async function run(ctx) {
                 `no pageerror while exercising every tab, got: ${page.pageErrors.join('; ')}`);
         });
 
+        // This check used to hardcode "Nord" AND the tier had no cleanup, so the
+        // run wrote theme:"nord" to the real ~/.config/cockpit/pilot/settings.json
+        // and the NEXT run started already on Nord: before === after, and the
+        // check failed forever after passing exactly once on a fresh machine. It
+        // was self-poisoning, not flaky. The fix is in two places: run-live.mjs
+        // now snapshots and restores that file in a finally, and this check picks
+        // a theme that is genuinely DIFFERENT from whatever is currently applied,
+        // chosen from the palette the page itself offers. The assertion is
+        // unchanged and deliberately so — a theme switch changing a real computed
+        // style is the whole point of the check.
         await check('live-smoke: the theme picker restyles the real page', async () => {
             assertOk(!!frame, 'Pilot frame must be open before the theme picker can be exercised');
             await frame.click('[data-tab="overview"]', { timeout: 15000 });
             await frame.waitForSelector('[title="Change the colour theme"]', { state: 'visible', timeout: 15000 });
+
+            // Which theme to switch TO is decided from the page's own state:
+            // the currently applied theme's base (light/dark) picks the opposite
+            // one, so the two palettes are guaranteed to differ whatever the
+            // developer's settings happen to say today.
+            const target = await frame.evaluate(() => {
+                const applied = document.documentElement.getAttribute('data-bs-theme') || '';
+                const themes = (window.PilotThemes && window.PilotThemes.THEMES) || [];
+                const current = themes.filter((t) => t.id === applied)[0] || null;
+                const base = current ? current.base : null;
+                const wantDark = base !== 'dark';
+                const pick = themes.filter((t) => t.id !== applied && t.base === (wantDark ? 'dark' : 'light'))[0];
+                return pick ? { id: pick.id, label: pick.label, from: applied } : null;
+            });
+            assertOk(!!target, 'the theme registry must offer a theme different from the applied one');
+
             const before = await frame.evaluate(() => getComputedStyle(document.body).backgroundColor);
             await frame.click('[title="Change the colour theme"]', { timeout: 15000 });
             await frame.waitForSelector('#pilot-theme', { state: 'visible', timeout: 15000 });
-            await frame.click('#pilot-theme button:has-text("Nord")', { timeout: 15000 });
+            await frame.click(`#pilot-theme button:has-text("${target.label}")`, { timeout: 15000 });
             await frame.waitForFunction(
-                () => document.documentElement.getAttribute('data-bs-theme') === 'nord',
-                null, { timeout: 15000 });
+                (id) => document.documentElement.getAttribute('data-bs-theme') === id,
+                target.id, { timeout: 15000 });
             const after = await frame.evaluate(() => getComputedStyle(document.body).backgroundColor);
             assertOk(after !== before,
-                `a theme switch must change a real computed style, not just the attribute (before=${before} after=${after})`);
-            await shot(page, 'theme-nord');
+                'a theme switch must change a real computed style, not just the attribute ' +
+                `(${target.from || 'none'} -> ${target.id}: before=${before} after=${after})`);
+            await shot(page, `theme-${target.id}`);
         });
     } finally {
         await page.ctx.close();

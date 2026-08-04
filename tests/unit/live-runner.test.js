@@ -343,3 +343,77 @@ test('makeCheck: with no password, the message passes through unredacted (nothin
     }
     assert.match(lines.join('\n'), /plain failure, no secret involved/);
 });
+
+// =================================================== FINAL REVIEW, FINDING 4
+//
+// The live tier drives the REAL plugin, which really persists the theme to
+// ~/.config/cockpit/pilot/settings.json. It had no cleanup of any kind, so the
+// theme check wrote theme:"nord" to disk and the NEXT run started already on
+// Nord -- the check passed exactly once on a fresh machine and failed forever
+// after. Self-poisoning, and it edited the developer's own settings.
+//
+// Every test below works against a throwaway home under os.tmpdir(); none of
+// them can touch the real file.
+
+test('settingsPath points at the file js/core/settings.js actually writes', () => {
+    const Settings = require('../../js/core/settings.js');
+    assert.equal(Live.PilotLive.settingsPath('/home/x'), '/home/x/' + Settings.REL_PATH,
+        'the snapshot must cover the same path the plugin persists to, not a guess');
+});
+
+test('snapshot/restore puts an existing settings file back byte for byte', () => {
+    const home = tmpdir();
+    const file = Live.PilotLive.settingsPath(home);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const original = '{\n  "ui": {\n    "theme": "sepia"\n  }\n}\n';
+    fs.writeFileSync(file, original);
+
+    const snap = Live.PilotLive.snapshotSettings(home);
+    assert.equal(snap.existed, true);
+    // What a real run does: the plugin persists a different theme.
+    fs.writeFileSync(file, '{"ui":{"theme":"nord"}}');
+    assert.equal(Live.PilotLive.restoreSettings(snap), 'restored');
+    assert.equal(fs.readFileSync(file, 'utf8'), original,
+        'the developer\'s own settings must survive the run unchanged');
+});
+
+test('a settings file the run CREATED is removed again, not left behind', () => {
+    const home = tmpdir();
+    const file = Live.PilotLive.settingsPath(home);
+    const snap = Live.PilotLive.snapshotSettings(home);
+    assert.equal(snap.existed, false);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, '{"ui":{"theme":"nord"}}');
+    assert.equal(Live.PilotLive.restoreSettings(snap), 'removed');
+    assert.equal(fs.existsSync(file), false);
+});
+
+test('restore is a no-op when nothing changed, and never throws on a hostile snapshot', () => {
+    const home = tmpdir();
+    assert.equal(Live.PilotLive.restoreSettings(Live.PilotLive.snapshotSettings(home)), 'unchanged');
+    for (const bad of [null, undefined, 42, 'x', {}, { path: 7 }, []])
+        assert.equal(Live.PilotLive.restoreSettings(bad), 'skipped', JSON.stringify(bad));
+});
+
+test('the live theme check never hardcodes a theme id or label', () => {
+    // The other half of the fix: a check that always clicks "Nord" passes only
+    // while the machine is not already on Nord -- which the run itself then
+    // makes false.
+    const src = fs.readFileSync(path.join(ROOT, 'tests', 'e2e', 'live-smoke.live.mjs'), 'utf8');
+    const code = src.replace(/^\s*\/\/.*$/gm, '');
+    // 'light' and 'dark' are BASE names as well as theme ids, and the check
+    // legitimately reasons about the base of the currently applied theme to
+    // pick its opposite -- that is the mechanism, not a hardcoded choice.
+    const BASES = new Set(['light', 'dark', 'system']);
+    for (const t of require('../../js/core/themes.js').THEMES) {
+        assert.equal(code.includes('"' + t.label + '"'), false,
+            `live-smoke.live.mjs hardcodes the theme label ${t.label}`);
+        if (BASES.has(t.id)) continue;
+        assert.equal(code.includes("'" + t.id + "'"), false,
+            `live-smoke.live.mjs hardcodes the theme id ${t.id}`);
+    }
+    assert.equal(/nord/i.test(code), false,
+        'the theme this check used to hardcode must not appear at all');
+    assert.ok(code.includes('window.PilotThemes'),
+        'the theme to switch to must be derived from the registry the page itself offers');
+});
