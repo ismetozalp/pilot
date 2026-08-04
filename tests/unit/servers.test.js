@@ -467,7 +467,7 @@ test('readSecret: strips exactly one trailing newline', async (t) => {
 // --- day-2 operations" checkbox persisted nothing, and the stored secret   ---
 // --- had no auth-type discriminator (a PEM would later be sent as a       ---
 // --- password). encodeSshCredential/decodeSshCredential and the           ---
-// --- writeSshCredential/readSshCredential wrappers built on the existing, ---
+// --- the writeSshCredential wrapper built on the existing,                 ---
 // --- UNCHANGED writeSecret/readSecret are the fix.
 
 test('encodeSshCredential/decodeSshCredential round-trip password and pem, tagged', () => {
@@ -516,29 +516,10 @@ test('writeSshCredential: writes 0600 root:root, tags the auth type, and the ' +
     assert.deepEqual(calls.spawn[1].argv, ['chmod', '0600', p]);
     assert.deepEqual(calls.spawn[2].argv, ['chown', 'root:root', p]);
     // What actually landed on disk (fakeCockpit's write side does not mutate
-    // its own read-side `files` map — see readSshCredential's own test below
-    // for the read half) decodes back to exactly what was written.
+    // its own read-side `files` map) decodes back to exactly what was written
+    // -- decodeSshCredential's own tests above cover the read half, including
+    // the legacy bare-string shape.
     assert.deepEqual(S.decodeSshCredential(calls.replace[0].value), { authType: 'pem', secret: 'BEGIN PEM DATA' });
-});
-
-test('readSshCredential: reads back a stored, auth-type-tagged credential', async (t) => {
-    fakeCockpit({
-        files: { '/etc/pilot/servers/prod.ssh': S.encodeSshCredential('pem', 'BEGIN PEM DATA') }
-    });
-    t.after(dropCockpit);
-    assert.deepEqual(await S.readSshCredential('prod'), { authType: 'pem', secret: 'BEGIN PEM DATA' });
-});
-
-test('readSshCredential: no stored secret is null, not a failure (hasCredential must read as false)', async (t) => {
-    fakeCockpit({ files: {} });
-    t.after(dropCockpit);
-    assert.equal(await S.readSshCredential('prod'), null);
-});
-
-test('readSshCredential: a legacy bare-string secret (pre-dating this fix) still reads back, as password', async (t) => {
-    fakeCockpit({ files: { '/etc/pilot/servers/prod.ssh': 's3cr3tpassword' } });
-    t.after(dropCockpit);
-    assert.deepEqual(await S.readSshCredential('prod'), { authType: 'password', secret: 's3cr3tpassword' });
 });
 
 test('remove: unlinks the record and both secrets', async (t) => {

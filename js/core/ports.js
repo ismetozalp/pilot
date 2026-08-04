@@ -66,7 +66,6 @@
 
         const tls = choices.tlsTier !== 'none';
         const out = [];
-        const fixedPorts = new Map(); // track port+proto -> component for collision detection
 
         if (choices.target === 'ssh') {
             const sshPort = (choices.sshPort === undefined || choices.sshPort === null)
@@ -82,44 +81,33 @@
             // so telling the user to open it upstream would be noise.
             out.push(req(sshPort, 'tcp', 'ssh', 'host', null,
                 'Pilot provisions and manages this host over SSH.'));
-            fixedPorts.set(key(sshPort, 'tcp'), 'ssh');
         }
 
         out.push(req(21115, 'tcp', 'hbbs', 'both', null,
             'hbbs NAT type test — clients cannot classify their NAT without it.'));
-        fixedPorts.set(key(21115, 'tcp'), 'hbbs');
         out.push(req(21116, 'tcp', 'hbbs', 'both', null,
             'hbbs ID registration and rendezvous over TCP.'));
-        fixedPorts.set(key(21116, 'tcp'), 'hbbs');
         out.push(req(21116, 'udp', 'hbbs', 'both', null,
             'hbbs hole punching over UDP — without it registration still succeeds ' +
             'and every direct session silently falls back to the relay or fails.'));
-        fixedPorts.set(key(21116, 'udp'), 'hbbs');
         out.push(req(21117, 'tcp', 'hbbr', 'both', null,
             'hbbr relay, used whenever a direct connection cannot be established.'));
-        fixedPorts.set(key(21117, 'tcp'), 'hbbr');
 
         if (tls) {
             out.push(req(21118, 'tcp', 'hbbs', 'host', 'proxy',
                 'hbbs websocket, reached only through the TLS proxy on this host.'));
-            fixedPorts.set(key(21118, 'tcp'), 'hbbs');
             out.push(req(21119, 'tcp', 'hbbr', 'host', 'proxy',
                 'hbbr websocket, reached only through the TLS proxy on this host.'));
-            fixedPorts.set(key(21119, 'tcp'), 'hbbr');
             out.push(req(80, 'tcp', 'acme', 'both', null,
                 'ACME HTTP-01 challenge, during issuance and at every renewal.'));
-            fixedPorts.set(key(80, 'tcp'), 'acme');
             out.push(req(443, 'tcp', 'https', 'both', null,
                 'The TLS proxy. The RustDesk client appends no port to a domain, ' +
                 'so 443 is the only port that works.'));
-            fixedPorts.set(key(443, 'tcp'), 'https');
         } else {
             out.push(req(21118, 'tcp', 'hbbs', 'both', null,
                 'hbbs websocket for the web client.'));
-            fixedPorts.set(key(21118, 'tcp'), 'hbbs');
             out.push(req(21119, 'tcp', 'hbbr', 'both', null,
                 'hbbr websocket for the web client.'));
-            fixedPorts.set(key(21119, 'tcp'), 'hbbr');
             const apiPort = (choices.apiPort === undefined || choices.apiPort === null)
                 ? API_DEFAULT : toPort(choices.apiPort, 'choices.apiPort');
             // Check for collision with fixed RustDesk ports.
@@ -132,7 +120,6 @@
             out.push(req(apiPort, 'tcp', 'api', 'both', null,
                 'The API server, which the Cockpit host must reach directly ' +
                 'because no TLS proxy is configured.'));
-            fixedPorts.set(key(apiPort, 'tcp'), 'api');
         }
 
         out.sort((a, b) => (a.port - b.port) || (a.proto < b.proto ? -1 : a.proto > b.proto ? 1 : 0));

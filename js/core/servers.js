@@ -421,11 +421,12 @@
         return writeSecret(id, 'ssh', encodeSshCredential(authType, secret));
     }
 
-    function readSshCredential(id) {
-        return readSecret(id, 'ssh').then(function (raw) {
-            return raw === null || raw === undefined ? null : decodeSshCredential(raw);
-        });
-    }
+    // NOTE: there is deliberately no readSshCredential() wrapper. It existed and
+    // had zero callers: js/features/server-ops-ui.js composes readSecret(id,
+    // 'ssh') with decodeSshCredential() itself, feature-detecting both, so that
+    // an older PilotServers without the decoder degrades to "no credential"
+    // rather than misreading raw JSON as a password. One composition, at the one
+    // site that needs it.
 
     function removeSecret(id, kind) {
         return guard('removeSecret', function (ck) {
@@ -572,7 +573,6 @@
         encodeSshCredential: encodeSshCredential,
         decodeSshCredential: decodeSshCredential,
         writeSshCredential: writeSshCredential,
-        readSshCredential: readSshCredential,
         active: active,
         setActive: setActive,
         probeCompatibility: probeCompatibility
