@@ -150,6 +150,50 @@ test('switchServer: re-wires the transport for the newly active server', async (
     assert.notEqual(seen[0], seen[1], 'switchServer reused the old server\'s transport function');
 });
 
+test('wireApi: no token file at all is ordinary — tokenError stays null', async (t) => {
+    // An explicit null (rather than omitting the key) exercises the same path
+    // fakeCockpit's read() takes for a genuinely absent file: `p in files` is
+    // true but the value is null, matching readSecret()'s own "absent" case.
+    fakeCockpit({ '/etc/pilot/servers/prod.token': null });
+    t.after(dropCockpit);
+    spyOnSetTransport(t);
+
+    const c = App.pilotApp();
+    await c.wireApi();
+
+    assert.equal(c.apiReady, true);
+    assert.equal(c.tokenError, null, 'no token configured must not be reported as an error');
+});
+
+test('wireApi: a permissions error reading the token is recorded, distinct from "no token configured"', async (t) => {
+    // MINOR fix: readSecret() rejecting (as it would on a genuine EACCES
+    // reading the 0600 secret file) must not look identical to the ordinary
+    // "no token was ever set" case — both previously left `token` as `null`
+    // with nothing else to tell them apart.
+    fakeCockpit();
+    t.after(dropCockpit);
+    spyOnSetTransport(t);
+    const realFile = globalThis.cockpit.file;
+    globalThis.cockpit.file = function (p, o) {
+        if (p === '/etc/pilot/servers/prod.token') {
+            return {
+                read() { return Promise.reject(new Error('permission denied')); },
+                replace(v) { return Promise.resolve(); },
+                close() {}
+            };
+        }
+        return realFile(p, o);
+    };
+
+    const c = App.pilotApp();
+    await c.wireApi();
+
+    assert.equal(c.apiReady, true,
+        'an unreadable token must still fail safe to an anonymous request, not block wiring');
+    assert.ok(c.tokenError, 'a genuine read failure on the token file must be recorded');
+    assert.equal(c.tokenError.name, 'PilotError');
+});
+
 test('switchServer: rejects a hostile id before touching the transport', async (t) => {
     fakeCockpit();
     t.after(dropCockpit);

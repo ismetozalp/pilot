@@ -47,6 +47,13 @@
             activeServerId: null,
             apiReady: false,
             compatError: null,
+            // Set only when the SECRET FILE ITSELF could not be read (e.g. a
+            // permissions problem on the 0600 file) — never for the ordinary
+            // case of no token configured, which PilotServers.readSecret()
+            // already reports as a plain `null`, not a rejection. Wiring still
+            // fails safe to an anonymous request either way; this is what lets
+            // that be told apart from "no token was ever set" after the fact.
+            tokenError: null,
 
             failSurface(id, err) {
                 if (!Object.prototype.hasOwnProperty.call(this.errors, id)) return null;
@@ -85,11 +92,20 @@
 
                 try {
                     const rec = await Servers.read(id);
+                    // readSecret() resolving to null means "no token file" — an
+                    // ordinary, expected case (anonymous request). A REJECTION
+                    // means the file exists but could not be read (e.g. a
+                    // permissions problem on the 0600 file); that must not look
+                    // identical to "no token was ever set", so it is recorded in
+                    // tokenError even though wiring still proceeds anonymously
+                    // rather than blocking the whole server on it.
                     let token = null;
                     try {
                         token = await Servers.readSecret(id, 'token');
+                        this.tokenError = null;
                     } catch (e) {
                         token = null;
+                        this.tokenError = e;
                     }
                     const conn = { address: rec.host, port: rec.apiPort, tls: rec.tls, token: token };
                     const send = Io.transport(conn);
