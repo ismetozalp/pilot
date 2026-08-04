@@ -498,14 +498,49 @@
         return (i === -1 || i + 1 >= argv.length) ? '' : argv[i + 1];
     }
 
+    // Recognizes credential material actually present in a step's own argv —
+    // e.g. a token=... query parameter or an "Authorization: Bearer ..."
+    // header value — as opposed to a step whose argv is entirely plain but
+    // whose OUTPUT happens to be sensitive (verify-admin's journalctl call is
+    // the latter: nothing in its argv is secret, only what it prints is).
+    // This is what drives the secret/argv split below, and it is deliberately
+    // NOT an id list: any step, present or future, is classified by what is
+    // actually in its own argv, never by an allowlist of "known safe" ids.
+    const CREDENTIAL_ARGV_PATTERNS = [
+        /[?&](?:token|apikey|api_key|password|secret|pwd)=([^&\s]+)/i,
+        /Authorization:\s*(?:Bearer|Basic)\s+(\S+)/i
+    ];
+    function findEmbeddedCredential(argv) {
+        const list = Array.isArray(argv) ? argv : [];
+        for (let i = 0; i < list.length; i++) {
+            const s = String(list[i]);
+            for (let p = 0; p < CREDENTIAL_ARGV_PATTERNS.length; p++) {
+                const m = s.match(CREDENTIAL_ARGV_PATTERNS[p]);
+                if (m) return m[1];
+            }
+        }
+        return null;
+    }
+
     // For secret steps, render variable assignments before the command.
-    // Returns { preLines, commandLine, mustRunManually }:
+    // Returns { preLines, commandLine, mustRunManually, outputSensitive }:
     //   - preLines: setup lines (env checks, variable assignments)
     //   - commandLine: full rendered command (or null to use normal argv rendering)
-    //   - mustRunManually: true if this secret step carries credentials and cannot be safely shared
+    //   - mustRunManually: true if this secret step's argv itself carries a
+    //     credential we have no safe rewrite for, and cannot be safely shared
+    //   - outputSensitive: true if the argv embeds nothing sensitive and the
+    //     command is safe to run and share as-is — only its OUTPUT is secret
     function renderSecretStep(step) {
         const preLines = [];
-        if (!step.secret) return { preLines: [], commandLine: null, mustRunManually: false };
+        if (!step.secret) return { preLines: [], commandLine: null, mustRunManually: false, outputSensitive: false };
+
+        // Nothing in this step's own argv looks like a credential: the
+        // command itself is safe to run and safe to share. Render it as-is —
+        // e.g. verify-admin's `journalctl ...` carries no secret in its argv,
+        // only in what it prints.
+        if (!findEmbeddedCredential(step.argv)) {
+            return { preLines: [], commandLine: null, mustRunManually: false, outputSensitive: true };
+        }
 
         // DuckDNS: extract domain and token from URL, render as variables
         if (step.id === 'tls-duckdns' && Array.isArray(step.argv)) {
@@ -551,13 +586,14 @@
                     let cmdLine = argvLine(beforeUrl) + ' "https://www.duckdns.org/update?domains=${PILOT_DUCKDNS_DOMAINS}&token=${DUCKDNS_TOKEN}&ip="';
                     if (afterUrl.length > 0) cmdLine += ' ' + argvLine(afterUrl);
 
-                    return { preLines: preLines, commandLine: cmdLine, mustRunManually: false };
+                    return { preLines: preLines, commandLine: cmdLine, mustRunManually: false, outputSensitive: false };
                 }
             }
         }
 
-        // For any other secret step, refuse to render it in cleartext
-        return { preLines: [], commandLine: null, mustRunManually: true };
+        // The argv embeds a credential we have no safe rewrite for: refuse
+        // to render it in cleartext.
+        return { preLines: [], commandLine: null, mustRunManually: true, outputSensitive: false };
     }
 
     // Find a collision-free heredoc delimiter by checking content for collisions.
@@ -593,7 +629,12 @@
             out.push('');
             out.push('# [' + (i + 1) + '/' + n + '] ' + s.title);
             out.push('# ' + s.why);
-            if (s.secret) out.push('# SECRET: this step carries a credential - do not paste it into a shared log.');
+            const secretInfo = renderSecretStep(s);
+            if (s.secret) {
+                out.push(secretInfo.outputSensitive
+                    ? '# SECRET: this command is safe to run and safe to share - its OUTPUT contains a credential; do not paste the OUTPUT into a shared log.'
+                    : '# SECRET: this step carries a credential - do not paste it into a shared log.');
+            }
 
             // Render check probes as real guards: if ! check; then cmd; fi
             if (s.check) {
@@ -612,7 +653,6 @@
                 out.push('chmod ' + q(s.write.mode) + ' ' + q(s.write.path));
                 out.push('chown ' + q(s.write.owner) + ' ' + q(s.write.path));
             } else {
-                const secretInfo = renderSecretStep(s);
                 for (let j = 0; j < secretInfo.preLines.length; j++) out.push(secretInfo.preLines[j]);
                 if (secretInfo.mustRunManually) {
                     out.push('# MANUAL STEP: This step carries credentials and must be run manually on the target.');

@@ -73,9 +73,26 @@ test('every download is followed by a sha256sum check of the -o path', () => {
     assert.equal(out.match(/sha256sum -c -/g).length, n, 'exactly one check per download');
 });
 
-test('a secret step is flagged so it is never pasted into a shared log', () => {
+test('a secret step whose argv is safe (verify-admin) is rendered, warning about its OUTPUT', () => {
     const out = P.manualScript(P.build(DET_ADOPT, CH_LOCAL));
-    assert.ok(out.indexOf('# SECRET: this step carries a credential - do not paste it into a shared log.\n') !== -1);
+    // verify-admin's argv (journalctl ...) carries no credential itself: the
+    // command must actually appear, not be replaced by a manual-only marker.
+    assert.ok(out.indexOf('journalctl -u rustdesk-api.service --no-pager -n 200\n') !== -1, 'command is rendered');
+    // The warning must say the command is safe to run/share and that the
+    // OUTPUT (not the command) is what carries the credential.
+    assert.ok(out.indexOf('# SECRET: this command is safe to run and safe to share') !== -1, 'warning describes output-sensitivity');
+    assert.ok(out.indexOf('OUTPUT contains a credential') !== -1, 'warning names the output as sensitive');
+    assert.equal(out.indexOf('MANUAL STEP'), -1, 'a safe-argv secret step is not marked manual-only');
+});
+
+test('a secret step whose argv embeds a credential is still fully suppressed', () => {
+    const out = P.manualScript(rawPlan([
+        rawStep({ id: 'register-api', secret: true,
+            argv: ['curl', '-fsS', '-H', 'Authorization: Bearer SUPERSECRETXYZ999', 'https://example.com/register'] })
+    ]));
+    assert.equal(out.indexOf('SUPERSECRETXYZ999'), -1, 'credential does not leak');
+    assert.ok(out.indexOf('# SECRET: this step carries a credential - do not paste it into a shared log.\n') !== -1, 'unsafe-argv warning text kept');
+    assert.ok(out.indexOf('MANUAL STEP') !== -1, 'marked manual-only');
 });
 
 test('an idempotency check is rendered as a real guard that skips the step if satisfied', () => {
