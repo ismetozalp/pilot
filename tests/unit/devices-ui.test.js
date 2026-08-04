@@ -545,10 +545,26 @@ test('an address-book failure is an action error, not a surface error', async ()
         addToAddressBook: async () => { throw Errors.create('BRIDGE_NO_ADDRESS_CAP', 'no address capability'); }
     } }) });
     await c.refresh(true);
+    c.book = 'shared';   // a book must be chosen, or the client-side guard below fires first
     assert.equal(await c.addToBook(c.rows[0]), false);
     assert.equal(c.error, null, 'the inventory stays on screen');
     assert.equal(c.rows.length, 2);
     assert.equal(c.errorRemediation(c.actionError), Errors.remediation('BRIDGE_NO_ADDRESS_CAP'));
+});
+
+test('add to address book without a book chosen is a client-side action error, never a raw path-parameter string', async () => {
+    // Nothing in the shipped template can set `book` yet (Task 21 owns the
+    // Address Book surface that will), so this is the path every click of
+    // "Add to address book" takes today -- caught before api-client.js's
+    // internal guard string ("a path parameter must not be empty") could ever
+    // reach the operator as if it were a real answer from the server.
+    const api = fakeApi();
+    const c = component({ api });
+    await c.refresh(true);
+    assert.equal(c.hasBook(), false);
+    assert.equal(await c.addToBook(c.rows[0]), false);
+    assert.equal(c.errorText(c.actionError), 'No address book is available yet to add this device to.');
+    assert.ok(!api.calls.some((call) => call[0] === 'addToAddressBook'), 'the API was never called');
 });
 
 test('setSort toggles direction on the same column and resets on a new one', () => {
@@ -562,6 +578,59 @@ test('setSort toggles direction on the same column and resets on a new one', () 
     assert.equal(c.state.sortKey, 'online', 'an unknown column is ignored');
 });
 
+// --- hasBook / errorRemediationLabel / emptyKind / pagination -----------
+
+test('hasBook: false until a book is actually chosen', () => {
+    const c = component();
+    assert.equal(c.hasBook(), false);
+    for (const bad of ['   ', '\x00', null, undefined])
+        { c.book = bad; assert.equal(c.hasBook(), false, String(bad)); }
+    c.book = 'shared';
+    assert.equal(c.hasBook(), true);
+});
+
+test('errorRemediationLabel: a specific sentence per remediation kind, empty for "none"', () => {
+    const c = component();
+    assert.match(c.errorRemediationLabel(Errors.create('API_AUTH_FAILED', 'x')), /sign in again/);
+    assert.match(c.errorRemediationLabel(Errors.create('API_UNREACHABLE', 'x')), /try again/);
+    assert.equal(c.errorRemediationLabel(Errors.create('GENERIC', 'x')), '', 'GENERIC has no one-click fix');
+    assert.equal(c.errorRemediationLabel(null), '');
+});
+
+test('emptyKind: tells "no devices at all" apart from "the filter matched nothing"', async () => {
+    const api = fakeApi();
+    const c = component({ api });
+    assert.equal(c.emptyKind(), 'no-devices', 'nothing loaded yet renders the same honest empty state, not a blank table');
+
+    await c.refresh(true);
+    assert.equal(c.emptyKind(), 'none', 'two rows, no filter -- nothing to say');
+
+    c.setQuery('nothing-matches-anything');
+    assert.equal(c.emptyKind(), 'no-match', 'a filter that matched nothing is not "no devices ever"');
+    c.setQuery('');
+    assert.equal(c.emptyKind(), 'none');
+
+    const empty = component({ api: fakeApi({ devices: { list: async () => ({ code: 0, message: '', data: { list: [] } }) } }) });
+    await empty.refresh(true);
+    assert.equal(empty.emptyKind(), 'no-devices');
+
+    const failed = component({ api: fakeApi({ devices: {
+        list: async () => { throw Errors.create('API_UNREACHABLE', 'x'); }
+    } }) });
+    await failed.refresh(true);
+    assert.equal(failed.emptyKind(), 'none', 'a load failure is reported as an error, not as "no devices"');
+});
+
+test('refresh: total can exceed the fetched page, so truncation is representable', async () => {
+    const c = component({ api: fakeApi({ devices: {
+        list: async () => payload(RAW, { total: 9 })
+    } }) });
+    await c.refresh(true);
+    assert.equal(c.rows.length, 2);
+    assert.equal(c.total, 9, 'more devices exist on the server than this page shows');
+    assert.ok(c.total > c.rows.length);
+});
+
 // --- the template --------------------------------------------------------
 
 test('the template renders text only and offers real buttons', () => {
@@ -573,6 +642,41 @@ test('the template renders text only and offers real buttons', () => {
     for (const hook of ['refresh', 'filter', 'row', 'rename', 'rename-input', 'rename-save',
         'delete', 'delete-confirm', 'add-book', 'error', 'empty'])
         assert.ok(D.TEMPLATE.includes('data-test="' + hook + '"'), hook);
+});
+
+test('the add-to-address-book control is disabled with a visible, honest reason (spec 7.3)', () => {
+    // Task 21 owns the Address Book surface that will let an operator actually
+    // choose a book; until then this control must never look identical to the
+    // working Rename/Delete buttons while always erroring underneath it.
+    assert.ok(D.TEMPLATE.includes('data-test="add-book-hint"'));
+    assert.match(D.TEMPLATE, /data-test="add-book"[\s\S]{0,120}!hasBook\(\)/,
+        'the button itself must be disabled while there is no book to add to');
+    assert.ok(D.TEMPLATE.includes('No address book yet'));
+});
+
+test('an empty inventory and a filter with no matches each offer a real next action (spec 7.3)', () => {
+    for (const hook of ['empty-action', 'empty-filtered', 'empty-filtered-action'])
+        assert.ok(D.TEMPLATE.includes('data-test="' + hook + '"'), hook);
+    assert.ok(D.TEMPLATE.includes('type="button" class="btn btn-sm btn-primary" data-test="empty-action"'),
+        'the empty-state action is a real button, not decoration');
+});
+
+test('the error banner renders the real remediation, not a hardcoded "try again" for everything', () => {
+    assert.ok(D.TEMPLATE.includes('data-test="error-remediation"'));
+    assert.ok(D.TEMPLATE.includes('errorRemediationLabel(error)'));
+});
+
+test('pagination is shown, and truncation beyond the fetched page is stated', () => {
+    assert.ok(D.TEMPLATE.includes('data-test="pagination"'));
+    assert.ok(D.TEMPLATE.includes('data-test="pagination-truncated"'));
+    assert.ok(D.TEMPLATE.includes('total > rows.length'));
+});
+
+test('Alpine auto-invokes init() on any x-data object -- no redundant x-init here', () => {
+    // The identical double-fire bug was already found and fixed for
+    // js/app.js's pilotApp() (see tests/e2e/servers.e2e.mjs); this asserts it
+    // was never reintroduced here.
+    assert.ok(!/x-init/.test(D.TEMPLATE));
 });
 
 test('no x-show shares an element with a Bootstrap display utility', () => {

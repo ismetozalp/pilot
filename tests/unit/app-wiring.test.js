@@ -206,3 +206,68 @@ test('switchServer: rejects a hostile id before touching the transport', async (
     assert.equal(seen.length, 1, 'a rejected switch must not have re-wired anything');
     assert.equal(c.activeServerId, 'prod', 'a rejected switch must not change the active server');
 });
+
+// --- pilot:server-changed ------------------------------------------------
+//
+// Every feature surface (starting with js/features/devices-ui.js) mounts
+// with a placeholder server id and corrects it by listening for this event,
+// so nothing downstream is reachable unless wireApi()/switchServer() ACTUALLY
+// dispatch it. This is exactly the class of bug the project has hit twice
+// before (a real trigger a surface's own tests never exercised) -- proven
+// here directly against a fake document, and again live in
+// tests/e2e/devices.e2e.mjs against the real DOM.
+
+function installFakeDocument(t) {
+    const events = [];
+    const had = typeof globalThis.document !== 'undefined';
+    const prior = had ? globalThis.document : undefined;
+    globalThis.document = { dispatchEvent(ev) { events.push(ev); return true; } };
+    t.after(() => { if (had) globalThis.document = prior; else delete globalThis.document; });
+    return events;
+}
+
+test('wireApi: dispatches pilot:server-changed with the resolved server id', async (t) => {
+    fakeCockpit();
+    t.after(dropCockpit);
+    spyOnSetTransport(t);
+    const events = installFakeDocument(t);
+
+    const c = App.pilotApp();
+    await c.wireApi();
+
+    assert.equal(events.length, 1, 'wireApi() must notify every listening surface');
+    assert.equal(events[0].type, 'pilot:server-changed');
+    assert.deepEqual(events[0].detail, { id: 'prod' });
+});
+
+test('wireApi: dispatches pilot:server-changed with "local" when nothing is configured', async (t) => {
+    fakeCockpit({ '/etc/pilot/config.json': '{}' });
+    t.after(dropCockpit);
+    spyOnSetTransport(t);
+    const events = installFakeDocument(t);
+
+    const c = App.pilotApp();
+    await c.wireApi();
+
+    assert.equal(events.length, 1, 'a surface still needs to hear SOMETHING, even with no active server');
+    assert.deepEqual(events[0].detail, { id: 'local' });
+});
+
+test('switchServer: dispatches pilot:server-changed again for the newly active server', async (t) => {
+    const REC2 = Object.assign({}, REC, { id: 'staging', host: 'staging.example.com' });
+    fakeCockpit({
+        '/etc/pilot/servers/staging.json': JSON.stringify(REC2),
+        '/etc/pilot/servers/staging.token': 'TOK456\n'
+    });
+    t.after(dropCockpit);
+    spyOnSetTransport(t);
+    const events = installFakeDocument(t);
+
+    const c = App.pilotApp();
+    await c.wireApi();                 // dispatches 'prod'
+    await c.switchServer('staging');   // must dispatch 'staging' too
+
+    assert.equal(events.length, 2, 'switchServer must notify surfaces again, not just re-wire the transport');
+    assert.deepEqual(events[0].detail, { id: 'prod' });
+    assert.deepEqual(events[1].detail, { id: 'staging' });
+});

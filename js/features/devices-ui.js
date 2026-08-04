@@ -251,6 +251,27 @@
         return 'none';
     }
 
+    // A short, honest sentence for each of PilotErrors' closed remediation
+    // vocabulary (C16). The retry button always retries regardless of kind --
+    // it is a generic re-fetch, not a login flow -- but the banner must still
+    // say what actually went wrong is not "just click retry" for something
+    // like an expired token (spec: the kind must drive real remediation, not
+    // a single hardcoded "Try again" for every failure).
+    const REMEDIATION_LABEL = {
+        retry: 'Recommended: try again.',
+        reauthorize: 'Recommended: sign in again on this server.',
+        'manual-mode': 'Recommended: follow the manual steps for this target.',
+        'fix-dns': 'Recommended: check the DNS record for this server.',
+        'open-ports': 'Recommended: open the required ports and try again.',
+        'hard-stop': 'This cannot be resolved automatically.',
+        none: ''
+    };
+
+    function remediationLabel(e) {
+        const r = remediationOf(e);
+        return has(REMEDIATION_LABEL, r) ? REMEDIATION_LABEL[r] : '';
+    }
+
     function fail(kind, message, detail) {
         if (Errors && typeof Errors.create === 'function') return Errors.create(kind, message, detail);
         const e = new Error(message);
@@ -304,6 +325,14 @@
             },
             errorText(e) { return errorMessage(e); },
             errorRemediation(e) { return remediationOf(e); },
+            errorRemediationLabel(e) { return remediationLabel(e); },
+            // The Address Book surface (Task 21) is what will actually let an
+            // operator choose a book; until then `book` can never be set from
+            // this surface's own template, so the action stays disabled with a
+            // visible reason rather than rendering a control that always fails
+            // (spec §7.3's "never a dead-end control", the same principle it
+            // applies to an empty dropdown).
+            hasBook() { return !!clean(this.book); },
             isBusy(id) { return this.busyIds.indexOf(id) !== -1; },
             setBusy(id, on) {
                 const i = this.busyIds.indexOf(id);
@@ -321,6 +350,19 @@
             visible() {
                 return sortRows(filterRows(this.rows, this.state.query),
                     this.state.sortKey, this.state.sortDir);
+            },
+            // Two different empty screens (spec §7.3: never a bare empty shell,
+            // always a message plus a next action) -- "no devices have EVER
+            // registered" needs a different message and action than "the filter
+            // matched nothing", which would be actively misleading if the two
+            // shared one paragraph (an operator staring at "no devices have
+            // connected" while two devices sit one keystroke away, hidden only
+            // by their own filter, is worse than no message at all).
+            emptyKind() {
+                if (this.loading || this.error) return 'none';
+                if (this.rows.length === 0) return 'no-devices';
+                if (this.visible().length === 0) return 'no-match';
+                return 'none';
             },
 
             async refresh(force) {
@@ -467,6 +509,17 @@
                 const id = (row && row.id) ? row.id : '';
                 if (!id) return false;
                 const ab = clean(book === undefined ? this.book : book);
+                if (!ab) {
+                    // Caught here, before the API is ever called, so the operator
+                    // never sees api-client.js's internal guard string ("a path
+                    // parameter must not be empty") as if it were a real answer
+                    // from the server -- the button is also disabled for the same
+                    // reason (:disabled="!hasBook()"), this is the defence for
+                    // anything that can still call the method directly.
+                    this.actionError = fail('GENERIC',
+                        'No address book is available yet to add this device to.');
+                    return false;
+                }
                 if (!this.hasApi() || typeof this.api.devices.addToAddressBook !== 'function') {
                     this.actionError = fail('GENERIC', 'The API client cannot write to an address book.');
                     return false;
@@ -490,7 +543,7 @@
     // ---------------------------------------------------------- template
 
     const TEMPLATE = [
-        '<div class="pilot-surface" x-data="pilotDevices()" x-init="init()">',
+        '<div class="pilot-surface" x-data="pilotDevices()">',
         '  <div class="d-flex justify-content-between align-items-center mb-2">',
         '    <h2 class="h5 mb-0">Devices</h2>',
         '    <button type="button" class="btn btn-sm btn-outline-secondary" data-test="refresh"',
@@ -502,6 +555,8 @@
         '         :value="state.query" @input="setQuery($event.target.value)">',
         '  <div class="alert alert-warning" data-test="error" x-show="error">',
         '    <span x-text="errorText(error)"></span>',
+        '    <span class="fw-semibold ms-1" data-test="error-remediation"',
+        '          x-text="errorRemediationLabel(error)"></span>',
         '    <button type="button" class="btn btn-sm btn-outline-dark ms-2" data-test="error-retry"',
         '            @click="refresh(true)">Try again</button>',
         '  </div>',
@@ -509,8 +564,21 @@
         '       x-text="errorText(actionError)"></div>',
         '  <div class="alert alert-success py-1" data-test="notice" x-show="notice" x-text="notice"></div>',
         '  <p data-test="loading" x-show="loading">Loading devices\u2026</p>',
-        '  <p data-test="empty" x-show="!loading && !error && visible().length === 0">',
-        '    No devices have connected to this server yet.</p>',
+        '  <div data-test="empty" x-show="emptyKind() === \'no-devices\'">',
+        '    <p class="mb-2">No devices have connected to this server yet.</p>',
+        '    <button type="button" class="btn btn-sm btn-primary" data-test="empty-action"',
+        '            @click="tab = \'setup\'">Go to Setup to add a device</button>',
+        '  </div>',
+        '  <div data-test="empty-filtered" x-show="emptyKind() === \'no-match\'">',
+        '    <p class="mb-2">No device matches this filter.</p>',
+        '    <button type="button" class="btn btn-sm btn-outline-secondary" data-test="empty-filtered-action"',
+        '            @click="setQuery(\'\')">Clear the filter</button>',
+        '  </div>',
+        '  <p class="small text-secondary" data-test="pagination" x-show="!loading && !error && rows.length > 0">',
+        '    <span x-text="rows.length"></span> of <span x-text="total"></span> device(s) shown',
+        '    <span data-test="pagination-truncated" x-show="total > rows.length">',
+        '      \u2014 more devices exist than are shown here; narrow the filter to find them.</span>',
+        '  </p>',
         '  <table class="table table-sm align-middle" x-show="visible().length > 0">',
         '    <thead><tr>',
         '      <th scope="col"><button type="button" class="btn btn-link btn-sm p-0"',
@@ -551,7 +619,10 @@
         '            <button type="button" class="btn btn-sm btn-outline-secondary" data-test="rename"',
         '                    @click="startRename(d)" :disabled="isBusy(d.id)">Rename</button>',
         '            <button type="button" class="btn btn-sm btn-outline-secondary" data-test="add-book"',
-        '                    @click="addToBook(d)" :disabled="isBusy(d.id)">Add to address book</button>',
+        '                    @click="addToBook(d)" :disabled="isBusy(d.id) || !hasBook()"',
+        '                    :title="hasBook() ? \'\' : \'No address book yet\'">Add to address book</button>',
+        '            <span class="text-secondary small ms-1" data-test="add-book-hint"',
+        '                  x-show="!hasBook()">No address book yet</span>',
         '            <span x-show="confirmingId !== d.id">',
         '              <button type="button" class="btn btn-sm btn-outline-danger" data-test="delete"',
         '                      @click="askDelete(d)" :disabled="isBusy(d.id)">Delete</button>',

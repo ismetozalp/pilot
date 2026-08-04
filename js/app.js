@@ -29,6 +29,24 @@
         return out;
     }
 
+    // Every feature surface (js/features/devices-ui.js and, later, its siblings)
+    // listens for this on document so it learns which server is actually active
+    // without polling PilotServers itself — both at startup (a surface can mount
+    // before wireApi() resolves) and on every switchServer(). Not exported: this
+    // is shell-internal plumbing, the same way blankErrors() is. Mirrors the
+    // shape of js/features/devices-ui.js's own emitServerChanged/serverChangedDetail
+    // so every listener agrees on the event name and detail shape without the
+    // shell depending on any one feature module to define them.
+    function notifyServerChanged(id, target) {
+        const t = target || root.document || null;
+        if (!t || typeof t.dispatchEvent !== 'function') return false;
+        if (typeof root.CustomEvent !== 'function') return false;
+        const value = (typeof id === 'string' && id.trim()) ? id.trim() : 'local';
+        t.dispatchEvent(new root.CustomEvent('pilot:server-changed',
+            { detail: { id: value }, bubbles: true }));
+        return true;
+    }
+
     function pilotApp() {
         return {
             tabs: TABS,
@@ -87,6 +105,7 @@
                 if (!id) {
                     this.activeServerId = null;
                     this.apiReady = false;
+                    notifyServerChanged(null);
                     return null;
                 }
 
@@ -112,6 +131,12 @@
                     Api.setTransport(send);
                     this.activeServerId = id;
                     this.apiReady = true;
+                    // Notified as soon as the transport is actually wired — every
+                    // surface listening re-keys its state to the real server and
+                    // (if it has not seen this server before) refetches. This must
+                    // not wait on the compatibility probe below, which is advisory
+                    // and can take a full round trip of its own.
+                    notifyServerChanged(id);
 
                     // A version mismatch (or an unreachable server) is surfaced,
                     // never thrown away — but it must not undo a transport that
