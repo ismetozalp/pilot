@@ -1,0 +1,62 @@
+<!-- Theme picker: the launcher button AND the modal, in ONE Alpine scope, for the
+     same reason as html/modals/update.html — boot.js injects partials and only then
+     loads Alpine, so a button placed elsewhere in index.html would be a separate
+     x-data scope. Keeping both here means theming needs no knowledge of
+     index.html's layout.
+
+     x-init runs at load, so the persisted theme is applied even if the modal is
+     never opened. -->
+<div x-data="pilotThemeUi()" x-init="initTheme(window.PilotSettings)">
+
+    <div style="position: fixed; top: 0.5rem; right: 11.5rem; z-index: 1035;">
+        <button type="button" class="btn btn-sm btn-outline-secondary"
+                data-bs-toggle="modal" data-bs-target="#pilot-theme"
+                title="Change the colour theme">
+            <span :class="swatchClass(theme)"></span>
+            <span x-text="themeLabel(theme)"></span>
+        </button>
+    </div>
+
+    <div class="modal fade" id="pilot-theme" tabindex="-1"
+         aria-labelledby="pilot-theme-title" aria-hidden="true">
+        <div class="modal-dialog modal-dialog-centered modal-lg">
+            <div class="modal-content">
+
+                <div class="modal-header">
+                    <h5 class="modal-title" id="pilot-theme-title">Theme</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"
+                            aria-label="Close"></button>
+                </div>
+
+                <div class="modal-body">
+                    <p class="small text-secondary">
+                        Saved per user, in
+                        <code>~/.config/cockpit/pilot/settings.json</code>.
+                        <strong>System</strong> follows this computer&rsquo;s
+                        light/dark preference.
+                    </p>
+                    <div class="row row-cols-2 row-cols-md-3 g-2">
+                        <template x-for="t in themes" :key="t.id">
+                            <div class="col">
+                                <button type="button"
+                                        class="btn btn-outline-secondary w-100 text-start"
+                                        :class="isActiveTheme(t.id) ? 'active' : ''"
+                                        :aria-pressed="isActiveTheme(t.id) ? 'true' : 'false'"
+                                        @click="setTheme(t.id)">
+                                    <span :class="swatchClass(t.id)"></span>
+                                    <span class="ms-2" x-text="t.label"></span>
+                                </button>
+                            </div>
+                        </template>
+                    </div>
+                </div>
+
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary"
+                            data-bs-dismiss="modal">Close</button>
+                </div>
+
+            </div>
+        </div>
+    </div>
+</div>

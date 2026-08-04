@@ -1,0 +1,1402 @@
+#!/usr/bin/python3
+# pilot-exec — privileged provisioning helper for the Pilot Cockpit plugin.
+#
+# One executor, two transports. Everything above the transport — step sequencing,
+# the JSON-line protocol, redaction, idempotency probes, SHA256 enforcement — is
+# shared, so a localhost install and a remote install are the same code path with
+# the same tests. Only where a command runs differs.
+#
+# python3 is a safe dependency: cockpit-bridge is Python, so every host that can
+# run Cockpit already has it.
+#
+# CLI (exactly one mode flag is required; there is NO --transport flag — the
+# transport comes from envelope.transport):
+#
+#   --run              read Envelope v1 on stdin, execute it, stream JSON lines
+#   --detect           read a DetectRequest on stdin, emit a Detection document
+#   --check-hostkey    read {host,port} on stdin, emit {fingerprint,known,kind}
+#   --print-plan       read Envelope v1, print the steps, execute NOTHING
+#   --selftest-redact  self-test the redactor; no network, no SSH
+#
+# EXIT CODE CONTRACT — the single table. Nothing in this file overloads a code
+# with a second meaning.
+#
+#   0  the mode completed; for --run every step ended ok or skipped
+#   1  --run completed but at least one step failed (run-end partial|failed)
+#   2  usage error: no mode flag, two mode flags, a repeated mode flag, or an
+#      unknown argument
+#   3  the stdin document is not valid JSON or violates the schema
+#   4  SSH host key unknown and no accept_fingerprint was supplied
+#      (SSH_HOSTKEY_UNKNOWN)
+#   5  SSH host key CHANGED — hard stop, never auto-accepted
+#      (SSH_HOSTKEY_CHANGED)
+#   6  SHA256 mismatch on a downloaded file — hard stop (CHECKSUM_MISMATCH)
+#   7  the transport could not be established (SSH_UNREACHABLE/SSH_AUTH_FAILED)
+#
+# Credentials arrive in the stdin envelope ONLY. They are never accepted in argv
+# (world-readable via /proc/<pid>/cmdline) and never written to a log line.
+# Redaction happens at the emitter, in this file, never in the UI.
+
+import base64
+import hashlib
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+
+VERSION = 1
+
+EXIT_OK = 0
+EXIT_RUN_FAILED = 1
+EXIT_USAGE = 2
+EXIT_BAD_STDIN = 3
+EXIT_HOSTKEY_UNKNOWN = 4
+EXIT_HOSTKEY_CHANGED = 5
+EXIT_CHECKSUM = 6
+EXIT_TRANSPORT = 7
+
+# One name per override. No aliases: a second accepted name is how transcripts
+# silently land in two different directories.
+RUNS_DIR = os.environ.get("PILOT_RUNS_DIR", "/var/lib/pilot/runs")
+KNOWN_HOSTS = os.environ.get("PILOT_KNOWN_HOSTS", "/etc/pilot/known_hosts")
+
+MODES = ("--run", "--detect", "--check-hostkey", "--print-plan", "--selftest-redact")
+
+# Handlers are registered at the bottom of the file as they are implemented.
+# Nothing ever replaces an entry — each mode is registered exactly once.
+MODE_HANDLERS = {}
+
+SECRET_MASK = "••••••"
+
+MAX_STDIN = 4 * 1024 * 1024
+MAX_STEPS = 200
+PATH_MAX = 4096
+
+# Escapes only — a literal control byte in a character class is invisible in an
+# editor and does not survive copy-paste.
+CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
+STEP_ID_RE = re.compile(r"\A[a-z0-9][a-z0-9-]{0,62}\Z")
+RUN_ID_RE = re.compile(r"\A[0-9]{8}T[0-9]{6}Z\Z")
+HOST_RE = re.compile(r"\A[A-Za-z0-9._:-]{1,255}\Z")
+USER_RE = re.compile(r"\A[A-Za-z0-9._-]{1,32}\Z")
+# OpenSSH prints SHA256 fingerprints as unpadded base64 of a 32-byte digest,
+# which is always exactly 43 characters. Nothing else is accepted — not the MD5
+# colon form, not a padded variant.
+FINGERPRINT_RE = re.compile(r"\ASHA256:[A-Za-z0-9+/]{43}\Z")
+FILE_MODE_RE = re.compile(r"\A0[0-7]{3}\Z")
+OWNER_RE = re.compile(r"\A[A-Za-z0-9._-]{1,32}:[A-Za-z0-9._-]{1,32}\Z")
+SHA256_RE = re.compile(r"\A[0-9a-f]{64}\Z")
+
+ENVELOPE_KEYS = ("version", "transport", "run_id", "ssh", "credentials", "steps")
+SSH_KEYS = ("host", "port", "user", "auth", "accept_fingerprint")
+CRED_KEYS = ("password", "pem")
+STEP_KEYS = ("id", "title", "mutating", "why", "argv", "write", "check", "sha256", "secret")
+WRITE_KEYS = ("path", "mode", "content", "owner")
+CHECK_KEYS = ("argv", "expect")
+
+
+class Fail(Exception):
+    """A fatal condition carrying both the process exit code and a C6 error kind."""
+
+    def __init__(self, code, kind, message):
+        Exception.__init__(self, message)
+        self.code = code
+        self.kind = kind
+        self.message = message
+
+
+class Redactor:
+    """Replaces every known form of a secret with SECRET_MASK.
+
+    Registered forms: the secret itself, its untrimmed original, each
+    sufficiently long line of it (so a PEM body line pasted into a log is caught
+    even when the whole key is not), and its base64 encoding (so an HTTP Basic
+    header is caught). Needles are applied longest-first so a whole PEM is
+    masked as one unit rather than line by line.
+    """
+
+    def __init__(self):
+        self._needles = []
+
+    def add(self, secret):
+        if not isinstance(secret, str):
+            return
+        forms = set()
+        stripped = secret.strip()
+        if len(stripped) >= 4:
+            forms.add(stripped)
+        if secret != stripped and len(secret) >= 4:
+            forms.add(secret)
+        for raw in stripped.splitlines():
+            line = raw.strip()
+            if len(line) >= 12 and not line.startswith("-----"):
+                forms.add(line)
+        if len(stripped) >= 4:
+            try:
+                encoded = base64.b64encode(stripped.encode("utf-8")).decode("ascii")
+                if len(encoded) >= 8:
+                    forms.add(encoded)
+            except (UnicodeError, ValueError):
+                pass
+        for form in forms:
+            if form not in self._needles:
+                self._needles.append(form)
+        self._needles.sort(key=len, reverse=True)
+
+    def scrub(self, text):
+        if not isinstance(text, str) or not self._needles:
+            return text
+        for needle in self._needles:
+            if needle in text:
+                text = text.replace(needle, SECRET_MASK)
+        return text
+
+    def scrub_obj(self, obj):
+        if isinstance(obj, str):
+            return self.scrub(obj)
+        if isinstance(obj, list):
+            return [self.scrub_obj(item) for item in obj]
+        if isinstance(obj, dict):
+            return dict((key, self.scrub_obj(value)) for key, value in obj.items())
+        return obj
+
+
+# ---- validation primitives --------------------------------------------------
+#
+# Defined exactly once each. Later tasks in this section reuse them and never
+# introduce a second function with the same name and a different signature.
+
+def _obj(value, path, allowed):
+    if not isinstance(value, dict):
+        raise Fail(EXIT_BAD_STDIN, "GENERIC", path + " must be an object")
+    extra = sorted(key for key in value.keys() if key not in allowed)
+    if extra:
+        raise Fail(EXIT_BAD_STDIN, "GENERIC",
+                   path + " has unknown key(s): " + ", ".join(extra))
+    missing = sorted(key for key in allowed if key not in value)
+    if missing:
+        raise Fail(EXIT_BAD_STDIN, "GENERIC",
+                   path + " is missing key(s): " + ", ".join(missing))
+    return value
+
+
+def _text(value, path, maxlen, allow_empty=False, allow_ctrl=False):
+    if not isinstance(value, str):
+        raise Fail(EXIT_BAD_STDIN, "GENERIC", path + " must be a string")
+    if len(value) > maxlen:
+        raise Fail(EXIT_BAD_STDIN, "GENERIC",
+                   path + " is longer than " + str(maxlen) + " characters")
+    if not allow_empty and value == "":
+        raise Fail(EXIT_BAD_STDIN, "GENERIC", path + " must not be empty")
+    if not allow_ctrl and CTRL_RE.search(value):
+        raise Fail(EXIT_BAD_STDIN, "GENERIC", path + " contains a control character")
+    return value
+
+
+def _bool(value, path):
+    if not isinstance(value, bool):
+        raise Fail(EXIT_BAD_STDIN, "GENERIC", path + " must be true or false")
+    return value
+
+
+def _int(value, path, lo, hi):
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise Fail(EXIT_BAD_STDIN, "GENERIC", path + " must be an integer")
+    if value < lo or value > hi:
+        raise Fail(EXIT_BAD_STDIN, "GENERIC",
+                   path + " must be between " + str(lo) + " and " + str(hi))
+    return value
+
+
+def _abs_path(value, path, maxlen=PATH_MAX):
+    text = _text(value, path, maxlen)
+    if not text.startswith("/"):
+        raise Fail(EXIT_BAD_STDIN, "GENERIC", path + " must be an absolute path")
+    segments = text.split("/")
+    if ".." in segments or "." in segments:
+        raise Fail(EXIT_BAD_STDIN, "GENERIC",
+                   path + " must not contain '.' or '..' segments")
+    return text
+
+
+def _argv(value, path, allow_empty):
+    if not isinstance(value, list):
+        raise Fail(EXIT_BAD_STDIN, "GENERIC", path + " must be an array of strings")
+    if not allow_empty and not value:
+        raise Fail(EXIT_BAD_STDIN, "GENERIC", path + " must not be empty")
+    if len(value) > 64:
+        raise Fail(EXIT_BAD_STDIN, "GENERIC", path + " has more than 64 elements")
+    return [_text(item, path + "[" + str(i) + "]", PATH_MAX, allow_empty=True)
+            for i, item in enumerate(value)]
+
+
+def download_target(argv):
+    """The destination of a download step, per C14.
+
+    `-o` (or `--output`) is its OWN argv element, immediately followed by the
+    destination. An `-o` buried inside a shell string is deliberately NOT a
+    match: that ambiguity is what broke two previous rounds.
+    """
+    for i in range(len(argv) - 1):
+        if argv[i] in ("-o", "--output"):
+            return argv[i + 1]
+    return None
+
+
+def shell_join(argv):
+    return " ".join(shlex.quote(item) for item in argv)
+
+
+# ---- Envelope v1 (C2) -------------------------------------------------------
+
+def validate_step(raw, path):
+    src = _obj(raw, path, STEP_KEYS)
+    step = {}
+    step["id"] = _text(src["id"], path + ".id", 64)
+    if not STEP_ID_RE.match(step["id"]):
+        raise Fail(EXIT_BAD_STDIN, "GENERIC",
+                   path + ".id must be a lowercase slug like 'fetch-api'")
+    step["title"] = _text(src["title"], path + ".title", 200)
+    step["mutating"] = _bool(src["mutating"], path + ".mutating")
+    step["why"] = _text(src["why"], path + ".why", 500)
+    step["secret"] = _bool(src["secret"], path + ".secret")
+
+    if src["write"] is None:
+        step["write"] = None
+    else:
+        w = _obj(src["write"], path + ".write", WRITE_KEYS)
+        mode = _text(w["mode"], path + ".write.mode", 4)
+        if not FILE_MODE_RE.match(mode):
+            raise Fail(EXIT_BAD_STDIN, "GENERIC",
+                       path + ".write.mode must look like 0644")
+        owner = _text(w["owner"], path + ".write.owner", 65)
+        if not OWNER_RE.match(owner):
+            raise Fail(EXIT_BAD_STDIN, "GENERIC",
+                       path + ".write.owner must look like user:group")
+        step["write"] = {
+            "path": _abs_path(w["path"], path + ".write.path"),
+            "mode": mode,
+            # File content legitimately contains newlines, so control characters
+            # are allowed here and nowhere else.
+            "content": _text(w["content"], path + ".write.content",
+                             1024 * 1024, allow_empty=True, allow_ctrl=True),
+            "owner": owner,
+        }
+
+    step["argv"] = _argv(src["argv"], path + ".argv",
+                         allow_empty=step["write"] is not None)
+    if step["write"] is not None and step["argv"]:
+        raise Fail(EXIT_BAD_STDIN, "GENERIC",
+                   path + " has both write and argv; a write step must have argv []")
+
+    if src["check"] is None:
+        step["check"] = None
+    else:
+        c = _obj(src["check"], path + ".check", CHECK_KEYS)
+        expect = _text(c["expect"], path + ".check.expect", 8)
+        if expect not in ("zero", "nonzero"):
+            raise Fail(EXIT_BAD_STDIN, "GENERIC",
+                       path + ".check.expect must be 'zero' or 'nonzero'")
+        step["check"] = {"argv": _argv(c["argv"], path + ".check.argv", False),
+                         "expect": expect}
+
+    if src["sha256"] is None:
+        step["sha256"] = None
+    else:
+        digest = _text(src["sha256"], path + ".sha256", 64)
+        if not SHA256_RE.match(digest):
+            raise Fail(EXIT_BAD_STDIN, "GENERIC",
+                       path + ".sha256 must be 64 lowercase hex characters")
+        target = download_target(step["argv"])
+        if target is None:
+            raise Fail(EXIT_BAD_STDIN, "GENERIC",
+                       path + " carries sha256 but its argv has no '-o <path>' "
+                       "element pair; download steps are literal argv, never shell "
+                       "strings (C14)")
+        _abs_path(target, path + ".argv '-o' destination")
+        step["sha256"] = digest
+
+    return step
+
+
+def validate_ssh(raw, transport, path="envelope.ssh"):
+    if transport == "local":
+        if raw is not None:
+            raise Fail(EXIT_BAD_STDIN, "GENERIC",
+                       path + " must be null when transport is 'local'")
+        return None
+    if raw is None:
+        raise Fail(EXIT_BAD_STDIN, "GENERIC",
+                   path + " is required when transport is 'ssh'")
+    src = _obj(raw, path, SSH_KEYS)
+    host = _text(src["host"], path + ".host", 255)
+    if not HOST_RE.match(host):
+        raise Fail(EXIT_BAD_STDIN, "GENERIC",
+                   path + ".host is not a valid hostname or address")
+    user = _text(src["user"], path + ".user", 32)
+    if not USER_RE.match(user):
+        raise Fail(EXIT_BAD_STDIN, "GENERIC", path + ".user is not a valid username")
+    auth = _text(src["auth"], path + ".auth", 8)
+    if auth not in ("password", "pem", "agent"):
+        raise Fail(EXIT_BAD_STDIN, "GENERIC",
+                   path + ".auth must be 'password', 'pem' or 'agent'")
+    fingerprint = src["accept_fingerprint"]
+    if fingerprint is not None:
+        fingerprint = _text(fingerprint, path + ".accept_fingerprint", 64)
+        if not FINGERPRINT_RE.match(fingerprint):
+            raise Fail(EXIT_BAD_STDIN, "GENERIC",
+                       path + ".accept_fingerprint must look like "
+                       "SHA256:<43 base64 characters>")
+    return {"host": host, "port": _int(src["port"], path + ".port", 1, 65535),
+            "user": user, "auth": auth, "accept_fingerprint": fingerprint}
+
+
+def validate_credentials(raw, path="envelope.credentials"):
+    if raw is None:
+        return None
+    src = _obj(raw, path, CRED_KEYS)
+    password = src["password"]
+    if password is not None:
+        password = _text(password, path + ".password", 1024)
+        # Redactor.add() deliberately ignores needles under 4 characters to avoid
+        # mass over-redaction (a 1-character secret would mask itself out of every
+        # log line). A password that short would therefore reach --run and never
+        # be masked, so it is refused here instead of silently shipping unmasked.
+        if len(password) < 4:
+            raise Fail(EXIT_BAD_STDIN, "GENERIC",
+                       path + ".password must be at least 4 characters so the "
+                       "redactor can mask it")
+    pem = src["pem"]
+    if pem is not None:
+        pem = _text(pem, path + ".pem", 64 * 1024, allow_ctrl=True)
+    return {"password": password, "pem": pem}
+
+
+def validate_envelope(raw):
+    src = _obj(raw, "envelope", ENVELOPE_KEYS)
+    if isinstance(src["version"], bool) or src["version"] != VERSION:
+        raise Fail(EXIT_BAD_STDIN, "GENERIC", "envelope.version must be 1")
+    transport = _text(src["transport"], "envelope.transport", 8)
+    if transport not in ("local", "ssh"):
+        raise Fail(EXIT_BAD_STDIN, "GENERIC",
+                   "envelope.transport must be 'local' or 'ssh'")
+    run_id = _text(src["run_id"], "envelope.run_id", 32)
+    if not RUN_ID_RE.match(run_id):
+        raise Fail(EXIT_BAD_STDIN, "GENERIC",
+                   "envelope.run_id must look like 20260803T204500Z")
+    raw_steps = src["steps"]
+    if not isinstance(raw_steps, list) or not raw_steps:
+        raise Fail(EXIT_BAD_STDIN, "GENERIC", "envelope.steps must be a non-empty array")
+    if len(raw_steps) > MAX_STEPS:
+        raise Fail(EXIT_BAD_STDIN, "GENERIC",
+                   "envelope.steps has more than " + str(MAX_STEPS) + " steps")
+    steps = []
+    seen = set()
+    for i, raw_step in enumerate(raw_steps):
+        step = validate_step(raw_step, "envelope.steps[" + str(i) + "]")
+        if step["id"] in seen:
+            raise Fail(EXIT_BAD_STDIN, "GENERIC",
+                       "envelope.steps has a duplicate step id: " + step["id"])
+        seen.add(step["id"])
+        steps.append(step)
+    return {"version": VERSION, "transport": transport, "run_id": run_id,
+            "ssh": validate_ssh(src["ssh"], transport),
+            "credentials": validate_credentials(src["credentials"]),
+            "steps": steps}
+
+
+def read_stdin_json(stdin):
+    data = stdin.read(MAX_STDIN + 1)
+    if len(data) > MAX_STDIN:
+        raise Fail(EXIT_BAD_STDIN, "GENERIC",
+                   "stdin document is larger than " + str(MAX_STDIN) + " bytes")
+    if not data.strip():
+        raise Fail(EXIT_BAD_STDIN, "GENERIC", "stdin document is empty")
+    try:
+        doc = json.loads(data)
+    except ValueError as exc:
+        raise Fail(EXIT_BAD_STDIN, "GENERIC", "stdin is not valid JSON: " + str(exc))
+    if not isinstance(doc, dict):
+        raise Fail(EXIT_BAD_STDIN, "GENERIC", "stdin document must be a JSON object")
+    return doc
+
+
+# ---- modes that touch nothing ----------------------------------------------
+
+def cmd_print_plan(stdin, out):
+    env = validate_envelope(read_stdin_json(stdin))
+    out.write(json.dumps({"t": "plan", "run_id": env["run_id"],
+                          "transport": env["transport"],
+                          "steps": len(env["steps"])}) + "\n")
+    for step in env["steps"]:
+        if step["secret"]:
+            cmd = SECRET_MASK
+        elif step["write"] is not None:
+            cmd = "write " + step["write"]["path"]
+        else:
+            cmd = shell_join(step["argv"])
+        out.write(json.dumps({
+            "t": "plan-step",
+            "id": step["id"],
+            "title": step["title"],
+            "mutating": step["mutating"],
+            "why": step["why"],
+            "cmd": cmd,
+            "write": None if step["write"] is None else step["write"]["path"],
+            "check": None if step["check"] is None else shell_join(step["check"]["argv"]),
+            "sha256": step["sha256"],
+            "sha256_target": download_target(step["argv"]),
+            "secret": step["secret"],
+        }, ensure_ascii=False) + "\n")
+    out.flush()
+    return EXIT_OK
+
+
+def cmd_selftest_redact(stdin, out):
+    password = "hunter2horse"
+    pem_body = "b3BlbnNzaC1rZXktdjEAAAAABG5vbmU"
+    pem = ("-----BEGIN OPENSSH PRIVATE KEY-----\n" + pem_body +
+           "\n-----END OPENSSH PRIVATE KEY-----")
+    redactor = Redactor()
+    redactor.add(password)
+    redactor.add(pem)
+    encoded = base64.b64encode(password.encode("utf-8")).decode("ascii")
+
+    cases = []
+
+    def case(name, text, forbidden):
+        got = redactor.scrub(text)
+        cases.append({"name": name,
+                      "ok": forbidden not in got and SECRET_MASK in got})
+
+    case("plain", password, password)
+    case("embedded-in-argv", "sshpass -p " + password + " ssh root@host", password)
+    case("repeated", password + " and again " + password, password)
+    case("unicode-neighbours", "é" + password + "中", password)
+    case("base64-basic-auth", "Authorization: Basic " + encoded, encoded)
+    case("whole-pem", pem, pem_body)
+    case("single-pem-line", "read key material: " + pem_body, pem_body)
+
+    scrubbed = redactor.scrub_obj({"cmd": "echo " + password,
+                                   "lines": [pem_body], "exit": 7})
+    dumped = json.dumps(scrubbed)
+    cases.append({"name": "nested-object",
+                  "ok": password not in dumped and pem_body not in dumped
+                  and scrubbed["exit"] == 7})
+    cases.append({"name": "clean-text-untouched",
+                  "ok": redactor.scrub("nothing secret here") == "nothing secret here"})
+
+    ok = all(entry["ok"] for entry in cases)
+    out.write(json.dumps({"t": "selftest", "ok": ok, "mask": SECRET_MASK,
+                          "cases": cases}, ensure_ascii=False) + "\n")
+    out.flush()
+    return EXIT_OK if ok else EXIT_RUN_FAILED
+
+
+# ---- the transport boundary -------------------------------------------------
+#
+# Everything above this line is shared by both targets. A localhost install and a
+# remote install differ only in which Transport instance run_steps() is handed,
+# which is what makes "the same plan behaves identically on both" a testable
+# claim rather than an aspiration.
+
+DEFAULT_TIMEOUT = float(os.environ.get("PILOT_STEP_TIMEOUT", "900"))
+
+# Preference order when a host offers several key types. Ed25519 first: it is the
+# type OpenSSH itself prefers, so the fingerprint the user confirms is the one
+# their own ssh client would show.
+KEY_PREFERENCE = ("ssh-ed25519", "ecdsa-sha2-nistp256", "ssh-rsa")
+
+
+def _now_ms():
+    return int(time.monotonic() * 1000)
+
+
+def _pump(proc, on_line, stdin_text, timeout):
+    """Stream both output channels live, then reap the process.
+
+    Reader threads rather than a poll loop: the transcript is the feature, and a
+    step that produces no output for ten minutes must not look hung while a step
+    that produces a great deal must not deadlock on a full pipe.
+
+    Each reader iterates its handle in TEXT mode, which means it only ever yields
+    a COMPLETE line (readline() keeps pulling from the underlying pipe until it
+    sees '\\n' or EOF) — a secret split across two 4KB read() calls is reassembled
+    here, before on_line (and therefore Redactor.scrub) ever sees it. Redaction
+    is never applied to a raw partial chunk.
+    """
+    threads = []
+
+    def reader(handle, stream):
+        try:
+            for raw in handle:
+                on_line(stream, raw.rstrip("\r\n"))
+        except (IOError, ValueError):
+            pass
+        finally:
+            try:
+                handle.close()
+            except (IOError, ValueError):
+                pass
+
+    for handle, stream in ((proc.stdout, "stdout"), (proc.stderr, "stderr")):
+        thread = threading.Thread(target=reader, args=(handle, stream))
+        thread.daemon = True
+        thread.start()
+        threads.append(thread)
+
+    if stdin_text is not None and proc.stdin is not None:
+        try:
+            proc.stdin.write(stdin_text)
+            proc.stdin.close()
+        except (IOError, ValueError):
+            pass
+
+    try:
+        rc = proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        rc = proc.wait()
+        on_line("stderr", "pilot-exec: step timed out after " + str(timeout) + "s")
+    for thread in threads:
+        thread.join(timeout=5)
+    return rc
+
+
+class Emitter:
+    """The single place a protocol line is produced — and therefore the single
+    place redaction can be enforced. Nothing else writes to stdout during a run."""
+
+    def __init__(self, out, redactor, run_id, runs_dir=None):
+        self._out = out
+        self._redactor = redactor
+        self._lock = threading.Lock()
+        self._handle = None
+        directory = RUNS_DIR if runs_dir is None else runs_dir
+        try:
+            os.makedirs(directory, exist_ok=True)
+            # run_id is validated against RUN_ID_RE before we get here, so it
+            # cannot escape the directory.
+            self._handle = open(os.path.join(directory, run_id + ".jsonl"),
+                                "a", encoding="utf-8")
+        except (IOError, OSError):
+            self._handle = None
+
+    def emit(self, obj):
+        line = json.dumps(self._redactor.scrub_obj(obj), ensure_ascii=False)
+        with self._lock:
+            self._out.write(line + "\n")
+            self._out.flush()
+            if self._handle is not None:
+                try:
+                    self._handle.write(line + "\n")
+                    self._handle.flush()
+                except (IOError, OSError):
+                    pass
+
+    def close(self):
+        if self._handle is not None:
+            try:
+                self._handle.close()
+            except (IOError, OSError):
+                pass
+            self._handle = None
+
+
+class Transport:
+    """The whole seam between shared orchestration and where a step runs."""
+
+    name = "base"
+
+    def start(self, emitter=None):
+        return None
+
+    def run(self, argv, on_line, stdin_text=None, timeout=None):
+        raise NotImplementedError
+
+    def capture(self, argv, stdin_text=None, timeout=None):
+        out_lines = []
+        err_lines = []
+
+        def sink(stream, line):
+            (out_lines if stream == "stdout" else err_lines).append(line)
+
+        rc = self.run(argv, sink, stdin_text, timeout)
+        return rc, "\n".join(out_lines), "\n".join(err_lines)
+
+    def write_file(self, path, content, mode, owner):
+        raise NotImplementedError
+
+    def sha256(self, path):
+        raise NotImplementedError
+
+    def close(self):
+        return None
+
+
+class LocalTransport(Transport):
+    name = "local"
+
+    def __init__(self, timeout=None):
+        self._timeout = DEFAULT_TIMEOUT if timeout is None else timeout
+
+    def run(self, argv, on_line, stdin_text=None, timeout=None):
+        if not argv:
+            on_line("stderr", "pilot-exec: empty argv")
+            return 127
+        try:
+            proc = subprocess.Popen(
+                argv,
+                stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                universal_newlines=True, bufsize=1)
+        except OSError as exc:
+            on_line("stderr", "pilot-exec: cannot run " + argv[0] + ": " + str(exc))
+            return 127
+        return _pump(proc, on_line, stdin_text,
+                     self._timeout if timeout is None else timeout)
+
+    def write_file(self, path, content, mode, owner):
+        directory = os.path.dirname(path) or "/"
+        try:
+            if not os.path.isdir(directory):
+                os.makedirs(directory, mode=0o755, exist_ok=True)
+            tmp = path + ".pilot-tmp"
+            # The builtin open() creates a new file at 0666 & ~umask — under a
+            # typical umask 022 that is 0644, wider than most requested modes
+            # (0600, 0640) — and a subsequent chmod only narrows it after the
+            # fact, leaving a window where a secret write step's content is
+            # briefly group/other-readable. Passing the target mode straight
+            # into the creating os.open() means the file never exists at a
+            # mode wider than requested, not even for one syscall.
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, int(mode, 8))
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(content)
+            # umask can still narrow bits the caller actually wants (e.g. a
+            # mode with the group-write bit set under a umask that strips it),
+            # so pin the exact requested mode; this can only match or narrow
+            # what os.open() already produced, never widen it.
+            os.chmod(tmp, int(mode, 8))
+        except (IOError, OSError) as exc:
+            return 1, "pilot-exec: cannot write " + path + ": " + str(exc)
+        rc, _out, err = self.capture(["chown", owner, tmp])
+        if rc != 0:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            return rc, err or ("chown " + owner + " failed with exit " + str(rc))
+        try:
+            os.replace(tmp, path)
+        except OSError as exc:
+            return 1, "pilot-exec: cannot install " + path + ": " + str(exc)
+        return 0, ""
+
+    def sha256(self, path):
+        digest = hashlib.sha256()
+        try:
+            with open(path, "rb") as handle:
+                while True:
+                    chunk = handle.read(65536)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+        except (IOError, OSError) as exc:
+            return None, str(exc)
+        return digest.hexdigest(), ""
+
+
+# ---- TOFU host keys ---------------------------------------------------------
+#
+# A turnkey installer that silently accepts any host key is a turnkey MITM, so
+# the key is never accepted by ssh's own prompt. Pilot keeps its own known_hosts
+# in OpenSSH's format, which means the file it writes is one an administrator can
+# read, audit and edit.
+
+def _kh_id(host, port):
+    return host if int(port) == 22 else "[" + host + "]:" + str(int(port))
+
+
+def read_known_hosts(path=None):
+    target = KNOWN_HOSTS if path is None else path
+    entries = []
+    try:
+        with open(target, "r", encoding="utf-8") as handle:
+            for raw in handle:
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split()
+                if len(parts) < 3:
+                    continue
+                entries.append({"id": parts[0], "keytype": parts[1], "key": parts[2]})
+    except (IOError, OSError):
+        return []
+    return entries
+
+
+def known_hosts_lookup(host, port, path=None):
+    wanted = _kh_id(host, port)
+    return [entry for entry in read_known_hosts(path) if entry["id"] == wanted]
+
+
+def known_hosts_record(host, port, keytype, key, path=None):
+    target = KNOWN_HOSTS if path is None else path
+    directory = os.path.dirname(target) or "."
+    if not os.path.isdir(directory):
+        os.makedirs(directory, mode=0o755, exist_ok=True)
+    line = _kh_id(host, port) + " " + keytype + " " + key + "\n"
+    existing = []
+    try:
+        with open(target, "r", encoding="utf-8") as handle:
+            existing = handle.readlines()
+    except (IOError, OSError):
+        existing = []
+    if line in existing:
+        return
+    with open(target, "a", encoding="utf-8") as handle:
+        handle.write(line)
+    try:
+        os.chmod(target, 0o644)
+    except OSError:
+        pass
+
+
+def openssh_fingerprint(key_b64):
+    if not key_b64:
+        # An empty blob is never a real host key; base64.b64decode("") does not
+        # raise (it is valid base64 of zero bytes), so it must be refused here
+        # or an empty offered key would silently fingerprint as a real one.
+        return None
+    try:
+        blob = base64.b64decode(key_b64, validate=True)
+    except (ValueError, TypeError):
+        return None
+    digest = hashlib.sha256(blob).digest()
+    return "SHA256:" + base64.b64encode(digest).decode("ascii").rstrip("=")
+
+
+def scan_hostkeys(host, port, timeout=15):
+    argv = ["ssh-keyscan", "-T", "10", "-p", str(int(port)), host]
+    try:
+        proc = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              universal_newlines=True, timeout=timeout)
+    except OSError:
+        raise Fail(EXIT_TRANSPORT, "SSH_UNREACHABLE",
+                   "ssh-keyscan is not installed on the Cockpit host")
+    except subprocess.TimeoutExpired:
+        raise Fail(EXIT_TRANSPORT, "SSH_UNREACHABLE",
+                   "timed out reading the host key of " + host)
+    keys = []
+    for raw in proc.stdout.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        keys.append({"keytype": parts[1], "key": parts[2]})
+    if not keys:
+        raise Fail(EXIT_TRANSPORT, "SSH_UNREACHABLE",
+                   "no SSH host key was offered by " + host + ":" + str(int(port)))
+    keys.sort(key=lambda entry: KEY_PREFERENCE.index(entry["keytype"])
+              if entry["keytype"] in KEY_PREFERENCE else len(KEY_PREFERENCE))
+    return keys
+
+
+def hostkey_status(host, port):
+    offered = scan_hostkeys(host, port)
+    best = offered[0]
+    fingerprint = openssh_fingerprint(best["key"])
+    if fingerprint is None:
+        raise Fail(EXIT_TRANSPORT, "SSH_UNREACHABLE",
+                   "the host key offered by " + host + " is not valid base64")
+    recorded = known_hosts_lookup(host, port)
+    if not recorded:
+        return {"fingerprint": fingerprint, "known": False,
+                "kind": "SSH_HOSTKEY_UNKNOWN",
+                "keytype": best["keytype"], "key": best["key"]}
+    offered_keys = set(entry["key"] for entry in offered)
+    for entry in recorded:
+        if entry["key"] in offered_keys:
+            return {"fingerprint": openssh_fingerprint(entry["key"]), "known": True,
+                    "kind": "OK", "keytype": entry["keytype"], "key": entry["key"]}
+    # The host is known and the key is not the one recorded. This is the single
+    # condition that is never "warn and continue".
+    return {"fingerprint": fingerprint, "known": True,
+            "kind": "SSH_HOSTKEY_CHANGED",
+            "keytype": best["keytype"], "key": best["key"]}
+
+
+def hostkey_gate(ssh):
+    status = hostkey_status(ssh["host"], ssh["port"])
+    if status["kind"] == "SSH_HOSTKEY_CHANGED":
+        raise Fail(EXIT_HOSTKEY_CHANGED, "SSH_HOSTKEY_CHANGED",
+                   "the SSH host key of " + ssh["host"] + " has CHANGED; refusing to "
+                   "connect. The offered key is " + status["fingerprint"])
+    if not status["known"]:
+        accepted = ssh.get("accept_fingerprint")
+        if not accepted:
+            raise Fail(EXIT_HOSTKEY_UNKNOWN, "SSH_HOSTKEY_UNKNOWN",
+                       "unknown host key " + status["fingerprint"] + "; confirm it "
+                       "and re-run with ssh.accept_fingerprint set")
+        if accepted != status["fingerprint"]:
+            raise Fail(EXIT_HOSTKEY_CHANGED, "SSH_HOSTKEY_CHANGED",
+                       "the confirmed fingerprint " + accepted + " does not match "
+                       "the offered " + status["fingerprint"])
+        known_hosts_record(ssh["host"], ssh["port"], status["keytype"], status["key"])
+    return status
+
+
+class SshTransport(Transport):
+    name = "ssh"
+
+    def __init__(self, ssh, credentials, timeout=None):
+        self._ssh = ssh
+        self._creds = credentials or {"password": None, "pem": None}
+        self._timeout = DEFAULT_TIMEOUT if timeout is None else timeout
+        self._pem_file = None
+        self._kh_file = None
+
+    def start(self, emitter=None):
+        status = hostkey_gate(self._ssh)
+        # tempfile.mkstemp/os.fdopen/os.chmod can fail for ordinary reasons
+        # (disk full, /tmp unwritable, out of file descriptors). Every other
+        # failure path in this file surfaces as a clean C4 `fatal` line via
+        # Fail; a bare OSError escaping here would instead crash as an
+        # uncaught traceback, so it is converted the same way.
+        try:
+            handle, self._kh_file = tempfile.mkstemp(prefix="pilot-kh-")
+            with os.fdopen(handle, "w") as fh:
+                fh.write(_kh_id(self._ssh["host"], self._ssh["port"]) + " " +
+                         status["keytype"] + " " + status["key"] + "\n")
+            os.chmod(self._kh_file, 0o600)
+            if self._ssh["auth"] == "pem":
+                pem = self._creds.get("pem")
+                if not pem:
+                    raise Fail(EXIT_TRANSPORT, "SSH_AUTH_FAILED",
+                               "ssh.auth is 'pem' but credentials.pem is empty")
+                handle, self._pem_file = tempfile.mkstemp(prefix="pilot-pem-")
+                with os.fdopen(handle, "w") as fh:
+                    fh.write(pem if pem.endswith("\n") else pem + "\n")
+                os.chmod(self._pem_file, 0o600)
+            elif self._ssh["auth"] == "password":
+                if not self._creds.get("password"):
+                    raise Fail(EXIT_TRANSPORT, "SSH_AUTH_FAILED",
+                               "ssh.auth is 'password' but credentials.password is empty")
+        except (IOError, OSError) as exc:
+            raise Fail(EXIT_TRANSPORT, "SSH_UNREACHABLE",
+                       "cannot prepare local SSH transport state: " + str(exc))
+        return status
+
+    def _base_argv(self):
+        argv = ["ssh", "-p", str(int(self._ssh["port"])),
+                "-o", "StrictHostKeyChecking=yes",
+                "-o", "UserKnownHostsFile=" + self._kh_file,
+                "-o", "GlobalKnownHostsFile=/dev/null",
+                "-o", "ConnectTimeout=15",
+                "-o", "NumberOfPasswordPrompts=1"]
+        if self._ssh["auth"] == "pem":
+            argv += ["-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes",
+                     "-i", self._pem_file]
+        elif self._ssh["auth"] == "agent":
+            argv += ["-o", "BatchMode=yes", "-o", "PreferredAuthentications=publickey"]
+        else:
+            argv += ["-o", "BatchMode=no", "-o", "PubkeyAuthentication=no",
+                     "-o", "PreferredAuthentications=password,keyboard-interactive"]
+        argv.append(self._ssh["user"] + "@" + self._ssh["host"])
+        return argv
+
+    def _wrap(self, argv):
+        """Builds the full local argv for one remote command, plus any file
+        descriptors that must survive exec into the child.
+
+        Password auth NEVER appears in argv or in the environment: both
+        /proc/<pid>/cmdline and /proc/<pid>/environ are readable by anyone who
+        can already inspect this process, so either one is a leak. Instead the
+        password travels down a pipe this process opens and writes exactly once;
+        sshpass's own `-d <fd>` reads it from there. Only the (non-secret) file
+        descriptor NUMBER appears in argv — never the secret itself — and the
+        descriptor is closed on our side the moment the child has it.
+        """
+        remote = " ".join(shlex.quote(item) for item in argv)
+        base = self._base_argv() + [remote]
+        if self._ssh["auth"] != "password":
+            return base, ()
+        read_fd, write_fd = os.pipe()
+        os.write(write_fd, (self._creds["password"] + "\n").encode("utf-8"))
+        os.close(write_fd)
+        return ["sshpass", "-d", str(read_fd)] + base, (read_fd,)
+
+    def run(self, argv, on_line, stdin_text=None, timeout=None):
+        if not argv:
+            on_line("stderr", "pilot-exec: empty argv")
+            return 127
+        full, extra_fds = self._wrap(argv)
+        try:
+            try:
+                proc = subprocess.Popen(
+                    full,
+                    stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    universal_newlines=True, bufsize=1, pass_fds=extra_fds)
+            except OSError as exc:
+                on_line("stderr", "pilot-exec: cannot run " + full[0] + ": " + str(exc))
+                return 127
+        finally:
+            # The child received its own copy across fork(); our copy is no
+            # longer needed whether or not the exec succeeded.
+            for fd in extra_fds:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+        return _pump(proc, on_line, stdin_text,
+                     self._timeout if timeout is None else timeout)
+
+    def write_file(self, path, content, mode, owner):
+        quote = shlex.quote
+        # set -e means the FIRST failing command (base64, chmod, chown or the
+        # mv itself) ends the script immediately; without the trap that
+        # leaves ".pilot-tmp" behind on the remote host — a real gap in
+        # transport parity with LocalTransport.write_file, which unlinks its
+        # own temp file on failure, and worse for a secret step, whose
+        # content the temp file holds under 0600 either way (umask 077).
+        # A single-quoted EXIT trap runs on every exit path, success or
+        # failure; by the time it fires after a successful "mv -f", "$t" no
+        # longer exists, so "rm -f" is a harmless no-op and the success path
+        # is unchanged.
+        script = ("set -e; umask 077; "
+                  "d=$(dirname " + quote(path) + "); mkdir -p \"$d\"; "
+                  "t=" + quote(path + ".pilot-tmp") + "; "
+                  "trap 'rm -f \"$t\"' EXIT; "
+                  "base64 -d > \"$t\"; "
+                  "chmod " + quote(mode) + " \"$t\"; "
+                  "chown " + quote(owner) + " \"$t\"; "
+                  "mv -f \"$t\" " + quote(path))
+        payload = base64.b64encode(content.encode("utf-8")).decode("ascii")
+        rc, _out, err = self.capture(["/bin/sh", "-c", script],
+                                     stdin_text=payload + "\n")
+        if rc != 0:
+            return rc, err or ("remote write of " + path + " failed with exit " + str(rc))
+        return 0, ""
+
+    def sha256(self, path):
+        rc, out, err = self.capture(["sha256sum", "--", path])
+        if rc != 0:
+            return None, err or ("sha256sum failed with exit " + str(rc))
+        tokens = out.strip().split()
+        if not tokens or not SHA256_RE.match(tokens[0].lower()):
+            return None, "could not read a digest from sha256sum output"
+        return tokens[0].lower(), ""
+
+    def close(self):
+        for temp in (self._pem_file, self._kh_file):
+            if temp:
+                try:
+                    os.unlink(temp)
+                except OSError:
+                    pass
+        self._pem_file = None
+        self._kh_file = None
+
+
+def make_transport(doc):
+    """Builds the transport from the document's own transport field.
+
+    Accepts an Envelope or a DetectRequest: both carry transport/ssh/credentials
+    with identical meaning, which is why there is no --transport flag to disagree
+    with them.
+    """
+    if doc["transport"] == "local":
+        return LocalTransport()
+    return SshTransport(doc["ssh"], doc["credentials"])
+
+
+# ---- the shared run engine --------------------------------------------------
+
+def _verify_sha256(step, transport, emitter):
+    target = download_target(step["argv"])
+    digest, message = transport.sha256(target)
+    if digest is None:
+        emitter.emit({"t": "output", "id": step["id"], "stream": "stderr",
+                      "line": "pilot-exec: cannot hash " + target + ": " + message})
+        return 1, "CHECKSUM_MISMATCH"
+    if digest != step["sha256"]:
+        emitter.emit({"t": "output", "id": step["id"], "stream": "stderr",
+                      "line": "pilot-exec: sha256 mismatch for " + target +
+                              ": expected " + step["sha256"] + ", got " + digest})
+        return 1, "CHECKSUM_MISMATCH"
+    emitter.emit({"t": "output", "id": step["id"], "stream": "stdout",
+                  "line": "pilot-exec: sha256 verified for " + target})
+    return 0, None
+
+
+def run_steps(env, transport, emitter):
+    completed = 0
+    for step in env["steps"]:
+        if step["secret"]:
+            cmd = SECRET_MASK
+        elif step["write"] is not None:
+            cmd = "write " + step["write"]["path"]
+        else:
+            cmd = shell_join(step["argv"])
+        emitter.emit({"t": "step-start", "id": step["id"],
+                      "title": step["title"], "cmd": cmd})
+        started = _now_ms()
+
+        if step["check"] is not None:
+            rc, _out, _err = transport.capture(step["check"]["argv"])
+            satisfied = (rc == 0) if step["check"]["expect"] == "zero" else (rc != 0)
+            if satisfied:
+                emitter.emit({"t": "step-end", "id": step["id"], "status": "skipped",
+                              "exit": rc, "ms": _now_ms() - started})
+                completed += 1
+                continue
+
+        if step["write"] is not None:
+            rc, message = transport.write_file(step["write"]["path"],
+                                               step["write"]["content"],
+                                               step["write"]["mode"],
+                                               step["write"]["owner"])
+            if rc != 0 and message:
+                emitter.emit({"t": "output", "id": step["id"],
+                              "stream": "stderr", "line": message})
+        else:
+            def on_line(stream, line, step_id=step["id"]):
+                emitter.emit({"t": "output", "id": step_id,
+                              "stream": stream, "line": line})
+            rc = transport.run(step["argv"], on_line)
+
+        if rc == 0 and step["sha256"] is not None:
+            rc, kind = _verify_sha256(step, transport, emitter)
+            if kind is not None:
+                emitter.emit({"t": "step-end", "id": step["id"], "status": "failed",
+                              "exit": rc, "ms": _now_ms() - started})
+                emitter.emit({"t": "run-end", "status": "failed", "kind": kind})
+                failure = Fail(EXIT_CHECKSUM, kind,
+                               "sha256 mismatch on " + str(download_target(step["argv"])))
+                failure.run_end_emitted = True
+                raise failure
+
+        emitter.emit({"t": "step-end", "id": step["id"],
+                      "status": "ok" if rc == 0 else "failed",
+                      "exit": rc, "ms": _now_ms() - started})
+        if rc != 0:
+            return ("partial" if completed else "failed"), "GENERIC"
+        completed += 1
+    return "ok", None
+
+
+def cmd_run(stdin, out):
+    env = validate_envelope(read_stdin_json(stdin))
+    redactor = Redactor()
+    creds = env["credentials"] or {}
+    redactor.add(creds.get("password") or "")
+    redactor.add(creds.get("pem") or "")
+    for step in env["steps"]:
+        if step["secret"] and step["write"] is not None:
+            redactor.add(step["write"]["content"])
+
+    emitter = Emitter(out, redactor, env["run_id"])
+    transport = None
+    try:
+        # run-start is emitted before the host-key gate so the UI always has a
+        # frame to attach a failure to, including a hard stop on the key itself.
+        emitter.emit({"t": "run-start", "run_id": env["run_id"],
+                      "transport": env["transport"], "steps": len(env["steps"])})
+        transport = make_transport(env)
+        transport.start(emitter)
+        status, kind = run_steps(env, transport, emitter)
+        emitter.emit({"t": "run-end", "status": status, "kind": kind})
+        return EXIT_OK if status == "ok" else EXIT_RUN_FAILED
+    except Fail as exc:
+        if not getattr(exc, "run_end_emitted", False):
+            emitter.emit({"t": "run-end", "status": "failed", "kind": exc.kind})
+        raise
+    finally:
+        if transport is not None:
+            transport.close()
+        emitter.close()
+
+
+# ---- detection --------------------------------------------------------------
+#
+# One probe script, one parser, one request validator. The probe emits key=value
+# lines and nothing else: a shell script that tries to emit JSON is a quoting bug
+# waiting to happen, and the parser has to survive arbitrary junk anyway because
+# it runs on a machine Pilot does not control.
+
+DETECT_TIMEOUT = float(os.environ.get("PILOT_DETECT_TIMEOUT", "60"))
+DETECT_KEYS = ("version", "transport", "ssh", "credentials")
+HOSTKEY_KEYS = ("host", "port")
+DETECT_KEY_RE = re.compile(r"\A[a-z][a-z0-9_]{0,63}\Z")
+DETECT_IP_RE = re.compile(r"\A[0-9a-fA-F.:]{3,45}\Z")
+
+DETECT_SCRIPT = """set -u
+emit() { printf '%s=%s\\n' "$1" "$2"; }
+if [ -r /etc/os-release ]; then . /etc/os-release 2>/dev/null || true; fi
+emit os_id "${ID:-}"
+emit os_id_like "${ID_LIKE:-}"
+emit os_version_id "${VERSION_ID:-}"
+emit os_pretty_name "${PRETTY_NAME:-}"
+emit arch "$(uname -m 2>/dev/null || echo unknown)"
+if [ -d /run/systemd/system ]; then emit init systemd; else emit init other; fi
+fw=none
+if command -v firewall-cmd >/dev/null 2>&1; then fw=firewalld
+elif command -v ufw >/dev/null 2>&1; then fw=ufw
+elif command -v nft >/dev/null 2>&1; then fw=nftables
+fi
+emit firewall "$fw"
+if command -v curl >/dev/null 2>&1 && \
+   curl -fsS --max-time 8 -o /dev/null https://api.github.com/ 2>/dev/null; then
+    emit egress true
+else
+    emit egress false
+fi
+emit disk_free_mb "$(df -Pm / 2>/dev/null | awk 'NR==2 {print $4}')"
+hbbs_bin=""
+for p in /usr/bin/hbbs /usr/local/bin/hbbs /opt/rustdesk-server/hbbs; do
+    if [ -x "$p" ]; then hbbs_bin="$p"; break; fi
+done
+if [ -n "$hbbs_bin" ]; then
+    emit hbbs_present true
+    v=$("$hbbs_bin" --version 2>/dev/null | head -n1 | tr -d '\\r')
+    emit hbbs_version "${v:-unknown}"
+    if command -v dpkg-query >/dev/null 2>&1 && \
+       dpkg-query -W rustdesk-server-hbbs >/dev/null 2>&1; then
+        emit hbbs_install deb
+    else
+        emit hbbs_install binary
+    fi
+    dd=""
+    for d in /var/lib/rustdesk-server /opt/rustdesk-server; do
+        if [ -d "$d" ]; then dd="$d"; break; fi
+    done
+    emit hbbs_data_dir "$dd"
+    if [ -n "$dd" ] && [ -r "$dd/id_ed25519.pub" ]; then
+        emit hbbs_pubkey "$(head -n1 "$dd/id_ed25519.pub" | tr -d '\\r\\n')"
+    fi
+    ports=$(ss -H -ltun 2>/dev/null | awk '{print $5}' | sed 's/.*://' \
+            | sort -un | tr '\\n' ',' | sed 's/,$//')
+    emit hbbs_ports "${ports:-}"
+else
+    emit hbbs_present false
+fi
+if [ -x /opt/rustdesk-api/apimain ]; then
+    emit api_present true
+    emit api_install binary
+    av=$(/opt/rustdesk-api/apimain --version 2>/dev/null | head -n1 | tr -d '\\r')
+    emit api_version "${av:-unknown}"
+    ap=$(sed -n 's/^[[:space:]]*api-addr:[[:space:]]*//p' \
+         /opt/rustdesk-api/conf/config.yaml 2>/dev/null | head -n1 \
+         | sed 's/.*://' | tr -cd '0-9')
+    emit api_port "${ap:-21114}"
+else
+    emit api_present false
+fi
+if command -v curl >/dev/null 2>&1; then
+    emit public_ip "$(curl -fsS --max-time 8 https://api.ipify.org 2>/dev/null | tr -d '\\r\\n')"
+else
+    emit public_ip ""
+fi
+"""
+
+
+def _clean(value, maxlen=200):
+    text = CTRL_RE.sub("", value or "")
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in ("\"", "'"):
+        text = text[1:-1]
+    return text[:maxlen]
+
+
+def validate_detect_request(raw):
+    src = _obj(raw, "request", DETECT_KEYS)
+    if isinstance(src["version"], bool) or src["version"] != VERSION:
+        raise Fail(EXIT_BAD_STDIN, "GENERIC", "request.version must be 1")
+    transport = _text(src["transport"], "request.transport", 8)
+    if transport not in ("local", "ssh"):
+        raise Fail(EXIT_BAD_STDIN, "GENERIC",
+                   "request.transport must be 'local' or 'ssh'")
+    return {"version": VERSION, "transport": transport,
+            "ssh": validate_ssh(src["ssh"], transport, "request.ssh"),
+            "credentials": validate_credentials(src["credentials"],
+                                                "request.credentials")}
+
+
+def parse_detection(text):
+    values = {}
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _sep, value = line.partition("=")
+        key = key.strip()
+        if DETECT_KEY_RE.match(key):
+            values[key] = value.strip()
+
+    def get(name):
+        return _clean(values.get(name, ""))
+
+    # A probe running on a machine we do not control can emit a digit run of
+    # any length. Python's int() refuses to convert a string of more than 4300
+    # digits (a guard against a quadratic-time DoS), which would otherwise
+    # escape parse_detection as a raw ValueError instead of this file's
+    # {"t":"fatal",...} contract. 15 digits is far beyond any plausible port
+    # or disk size, so the digit run is bounded to that before int() ever
+    # sees it — an oversized value collapses to the default/out-of-range path
+    # exactly like any other hostile input, it does not raise.
+    NUMBER_DIGITS_MAX = 15
+
+    def number(name, default):
+        digits = re.sub(r"[^0-9]", "", values.get(name, ""))[:NUMBER_DIGITS_MAX]
+        return int(digits) if digits else default
+
+    hbbs = None
+    if values.get("hbbs_present") == "true":
+        ports = []
+        for token in values.get("hbbs_ports", "").split(","):
+            digits = re.sub(r"[^0-9]", "", token)[:NUMBER_DIGITS_MAX]
+            if not digits:
+                continue
+            port = int(digits)
+            if 0 < port < 65536 and port not in ports:
+                ports.append(port)
+        ports.sort()
+        install = get("hbbs_install")
+        hbbs = {
+            "version": get("hbbs_version") or "unknown",
+            "install": install if install in ("deb", "binary") else "unknown",
+            "ports": ports,
+            # Restricted to the base64 alphabet: this string is written into a
+            # generated config file, so nothing shell-active may survive.
+            "pubkey": re.sub(r"[^A-Za-z0-9+/=]", "",
+                             values.get("hbbs_pubkey", ""))[:1024],
+            # Never the empty string: a consumer must not have to guess whether
+            # "" means "not found" or "the filesystem root".
+            "data_dir": get("hbbs_data_dir") or "/var/lib/rustdesk-server",
+        }
+
+    api = None
+    if values.get("api_present") == "true":
+        install = get("api_install")
+        # Same out-of-range-collapses-to-default treatment as hbbs_ports below,
+        # rather than only catching the falsy (zero) case: an oversized or
+        # otherwise nonsensical port is exactly as "not a real port" as 0 is.
+        api_port = number("api_port", 21114)
+        if not 0 < api_port < 65536:
+            api_port = 21114
+        api = {"version": get("api_version") or "unknown",
+               "port": api_port,
+               "install": install if install == "binary" else "unknown"}
+
+    init = get("init")
+    firewall = get("firewall")
+    public_ip = get("public_ip")
+    return {
+        "os_release": {"id": get("os_id"), "id_like": get("os_id_like"),
+                       "version_id": get("os_version_id"),
+                       "pretty_name": get("os_pretty_name")},
+        "arch": get("arch") or "unknown",
+        "init": "systemd" if init == "systemd" else "other",
+        "firewall": firewall if firewall in ("firewalld", "ufw", "nftables") else "none",
+        "egress": values.get("egress") == "true",
+        "disk_free_mb": number("disk_free_mb", 0),
+        "hbbs": hbbs,
+        "api": api,
+        "public_ip": public_ip if DETECT_IP_RE.match(public_ip or "") else None,
+    }
+
+
+def cmd_detect(stdin, out):
+    request = validate_detect_request(read_stdin_json(stdin))
+    redactor = Redactor()
+    creds = request["credentials"] or {}
+    redactor.add(creds.get("password") or "")
+    redactor.add(creds.get("pem") or "")
+    transport = make_transport(request)
+    try:
+        transport.start(None)
+        rc, text, err = transport.capture(["/bin/sh", "-c", DETECT_SCRIPT],
+                                          timeout=DETECT_TIMEOUT)
+    finally:
+        transport.close()
+    if rc != 0 and not text.strip():
+        kind = "SSH_UNREACHABLE" if request["transport"] == "ssh" else "GENERIC"
+        raise Fail(EXIT_TRANSPORT, kind,
+                   "detection failed with exit " + str(rc) + ": " +
+                   redactor.scrub(err)[:500])
+    out.write(json.dumps(redactor.scrub_obj(parse_detection(text)),
+                         ensure_ascii=False) + "\n")
+    out.flush()
+    return EXIT_OK
+
+
+def cmd_check_hostkey(stdin, out):
+    src = _obj(read_stdin_json(stdin), "request", HOSTKEY_KEYS)
+    host = _text(src["host"], "request.host", 255)
+    if not HOST_RE.match(host):
+        raise Fail(EXIT_BAD_STDIN, "GENERIC",
+                   "request.host is not a valid hostname or address")
+    port = _int(src["port"], "request.port", 1, 65535)
+    # Deliberately does NOT record the key: this mode only reports what is there,
+    # so trust is established by the run the user actually approved.
+    status = hostkey_status(host, port)
+    out.write(json.dumps({"fingerprint": status["fingerprint"],
+                          "known": status["known"],
+                          "kind": status["kind"]}) + "\n")
+    out.flush()
+    return EXIT_HOSTKEY_CHANGED if status["kind"] == "SSH_HOSTKEY_CHANGED" else EXIT_OK
+
+
+# ---- entry point ------------------------------------------------------------
+
+def parse_args(argv):
+    modes = []
+    for arg in argv:
+        if arg in MODES:
+            if arg in modes:
+                raise Fail(EXIT_USAGE, "GENERIC", "repeated mode flag: " + arg)
+            modes.append(arg)
+        else:
+            raise Fail(EXIT_USAGE, "GENERIC", "unknown argument: " + arg)
+    if len(modes) != 1:
+        raise Fail(EXIT_USAGE, "GENERIC",
+                   "exactly one mode flag is required, one of: " + " ".join(MODES))
+    return modes[0]
+
+
+def main(argv, stdin, out, err):
+    try:
+        mode = parse_args(argv)
+        handler = MODE_HANDLERS.get(mode)
+        if handler is None:
+            raise Fail(EXIT_USAGE, "GENERIC",
+                       "mode is not implemented in this build: " + mode)
+        return handler(stdin, out)
+    except Fail as exc:
+        err.write(json.dumps({"t": "fatal", "kind": exc.kind,
+                              "message": exc.message}, ensure_ascii=False) + "\n")
+        err.flush()
+        return exc.code
+    except BrokenPipeError:
+        return EXIT_RUN_FAILED
+
+
+# ---- mode registry ----------------------------------------------------------
+#
+# One line per mode, appended as each mode is implemented. An entry is never
+# replaced and a handler is never redefined.
+MODE_HANDLERS["--print-plan"] = cmd_print_plan
+MODE_HANDLERS["--selftest-redact"] = cmd_selftest_redact
+MODE_HANDLERS["--run"] = cmd_run
+MODE_HANDLERS["--detect"] = cmd_detect
+MODE_HANDLERS["--check-hostkey"] = cmd_check_hostkey
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:], sys.stdin, sys.stdout, sys.stderr))

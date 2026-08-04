@@ -1,0 +1,9 @@
+# synthetic - hand-written. Every line below is deliberately malformed.
+ID="deb\"ian"
+NOT A LINE AT ALL
+=novalue
+9BADKEY=x
+ID_LIKE='debian  '
+VERSION_ID=
+PRETTY_NAME="Debian ../../etc/shadow"
+ID=ubuntu

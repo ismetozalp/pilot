@@ -1,0 +1,264 @@
+/* themes.css -- Bootstrap 5.3 `data-bs-theme` palettes for Pilot.
+
+   `system` / `light` / `dark` use Bootstrap's built-in modes and deliberately have
+   NO block here; see js/core/themes.js for the registry. tests/smoke.mjs rule 7
+   checks that every other registry id has a block below, so a theme added to the
+   registry but never styled fails the build.
+
+   Pilot's own accents are namespaced --pl-* (mirroring manifest's --mf-*).
+
+   IMPORTANT: --pl-log-bg / --pl-log-fg are deliberately NOT declared in the :root
+   block below, even though every other --pl-* accent is. tools/pilot-wire.mjs
+   links this stylesheet after css/pilot.css, and a plain :root selector has the
+   same specificity as an attribute selector on the built-in dark theme, so a
+   :root declaration here would win over pilot.css's own attribute-scoped
+   override -- silently flattening the built-in dark theme's transcript pane
+   back to pilot.css's light-mode shade.
+   Leaving them undeclared here means pilot.css's :root default and its dark
+   override both keep working for system/light/dark, exactly as Task 1 intended;
+   every custom theme below still sets its own --pl-log-bg/--pl-log-fg pair, so
+   nothing loses coverage. See tests/unit/themes.test.js for the regression test
+   and task-28-report.md for the full writeup. --pl-row-selected-bg is safe to
+   declare here: both files express it as var(--bs-tertiary-bg, ...), and that
+   variable is itself corrected per-theme by Bootstrap's own dark-mode CSS, so
+   either file "winning" resolves to the same computed colour.
+
+   Contrast checked for WCAG AA body text (>=4.5:1) against its own background,
+   and for WCAG 1.4.11 non-text/graphical accents (--bs-primary/success/warning/
+   danger, >=3:1) against their own background, for every custom palette -- see
+   task-28-report.md for the computed ratios. */
+
+:root {
+    --pl-step-ok: var(--bs-success, #2e7d32);
+    --pl-step-fail: var(--bs-danger, #c62828);
+    --pl-step-running: var(--bs-primary, #0d6efd);
+    --pl-dot-online: var(--bs-success, #2e7d32);
+    --pl-dot-offline: var(--bs-secondary-color, #6c757d);
+    --pl-progress-fg: var(--bs-primary, #0d6efd);
+    --pl-row-selected-bg: var(--bs-tertiary-bg, #f1f3f5);
+}
+
+/* Aqua -- deep teal */
+[data-bs-theme="aqua"] {
+    --bs-body-bg: #071a1f;
+    --bs-body-color: #d8f3f0;
+    --bs-emphasis-color: #ffffff;
+    --bs-secondary-color: rgba(216, 243, 240, 0.75);
+    --bs-secondary-bg: #0e2a31;
+    --bs-tertiary-bg: #123640;
+    --bs-border-color: #1d4a55;
+    --bs-primary: #2dd4bf;
+    --bs-success: #34d399;
+    --bs-warning: #fbbf24;
+    --bs-danger: #f87171;
+    --bs-link-color: #5eead4;
+    --bs-link-hover-color: #99f6e4;
+    --pl-log-bg: #041216;
+    --pl-log-fg: #b8e6e1;
+}
+
+/* Nord -- arctic blue-grey */
+[data-bs-theme="nord"] {
+    --bs-body-bg: #2e3440;
+    --bs-body-color: #e5e9f0;
+    --bs-emphasis-color: #eceff4;
+    --bs-secondary-color: rgba(229, 233, 240, 0.75);
+    --bs-secondary-bg: #3b4252;
+    --bs-tertiary-bg: #434c5e;
+    --bs-border-color: #4c566a;
+    --bs-primary: #88c0d0;
+    --bs-success: #a3be8c;
+    --bs-warning: #ebcb8b;
+    --bs-danger: #bf616a;
+    --bs-link-color: #88c0d0;
+    --bs-link-hover-color: #8fbcbb;
+    --pl-log-bg: #272c36;
+    --pl-log-fg: #d8dee9;
+}
+
+/* Solarized (dark) -- warm amber accents */
+[data-bs-theme="solarized"] {
+    --bs-body-bg: #002b36;
+    --bs-body-color: #d3c9ab;
+    --bs-emphasis-color: #fdf6e3;
+    --bs-secondary-color: rgba(211, 201, 171, 0.75);
+    --bs-secondary-bg: #073642;
+    --bs-tertiary-bg: #0a4351;
+    --bs-border-color: #12586a;
+    --bs-primary: #b58900;
+    --bs-success: #859900;
+    --bs-warning: #cb4b16;
+    --bs-danger: #dc322f;
+    --bs-link-color: #cb9500;
+    --bs-link-hover-color: #eaa900;
+    --pl-log-bg: #00212b;
+    --pl-log-fg: #93a1a1;
+}
+
+/* Dracula */
+[data-bs-theme="dracula"] {
+    --bs-body-bg: #282a36;
+    --bs-body-color: #f8f8f2;
+    --bs-emphasis-color: #ffffff;
+    --bs-secondary-color: rgba(248, 248, 242, 0.75);
+    --bs-secondary-bg: #343746;
+    --bs-tertiary-bg: #3b3e4f;
+    --bs-border-color: #44475a;
+    --bs-primary: #bd93f9;
+    --bs-success: #50fa7b;
+    --bs-warning: #f1fa8c;
+    --bs-danger: #ff5555;
+    --bs-link-color: #ff79c6;
+    --bs-link-hover-color: #ff92d0;
+    --pl-log-bg: #21222c;
+    --pl-log-fg: #f8f8f2;
+}
+
+/* Gruvbox -- retro warm */
+[data-bs-theme="gruvbox"] {
+    --bs-body-bg: #282828;
+    --bs-body-color: #ebdbb2;
+    --bs-emphasis-color: #fbf1c7;
+    --bs-secondary-color: rgba(235, 219, 178, 0.75);
+    --bs-secondary-bg: #3c3836;
+    --bs-tertiary-bg: #504945;
+    --bs-border-color: #665c54;
+    --bs-primary: #d65d0e;
+    --bs-success: #98971a;
+    --bs-warning: #d79921;
+    --bs-danger: #fb4934;
+    --bs-link-color: #83a598;
+    --bs-link-hover-color: #a3c5b8;
+    --pl-log-bg: #1d2021;
+    --pl-log-fg: #d5c4a1;
+}
+
+/* Catppuccin Mocha */
+[data-bs-theme="catppuccin"] {
+    --bs-body-bg: #1e1e2e;
+    --bs-body-color: #cdd6f4;
+    --bs-emphasis-color: #ffffff;
+    --bs-secondary-color: rgba(205, 214, 244, 0.75);
+    --bs-secondary-bg: #313244;
+    --bs-tertiary-bg: #45475a;
+    --bs-border-color: #585b70;
+    --bs-primary: #cba6f7;
+    --bs-success: #a6e3a1;
+    --bs-warning: #f9e2af;
+    --bs-danger: #f38ba8;
+    --bs-link-color: #89b4fa;
+    --bs-link-hover-color: #a6c8ff;
+    --pl-log-bg: #181825;
+    --pl-log-fg: #bac2de;
+}
+
+/* Tokyo Night */
+[data-bs-theme="tokyonight"] {
+    --bs-body-bg: #1a1b26;
+    --bs-body-color: #c0caf5;
+    --bs-emphasis-color: #ffffff;
+    --bs-secondary-color: rgba(192, 202, 245, 0.75);
+    --bs-secondary-bg: #24283b;
+    --bs-tertiary-bg: #2f334d;
+    --bs-border-color: #414868;
+    --bs-primary: #7aa2f7;
+    --bs-success: #9ece6a;
+    --bs-warning: #e0af68;
+    --bs-danger: #f7768e;
+    --bs-link-color: #7dcfff;
+    --bs-link-hover-color: #9ddcff;
+    --pl-log-bg: #16161e;
+    --pl-log-fg: #a9b1d6;
+}
+
+/* Rose Pine */
+[data-bs-theme="rosepine"] {
+    --bs-body-bg: #191724;
+    --bs-body-color: #e0def4;
+    --bs-emphasis-color: #ffffff;
+    --bs-secondary-color: rgba(224, 222, 244, 0.75);
+    --bs-secondary-bg: #1f1d2e;
+    --bs-tertiary-bg: #26233a;
+    --bs-border-color: #403d52;
+    --bs-primary: #eb6f92;
+    --bs-success: #9ccfd8;
+    --bs-warning: #f6c177;
+    --bs-danger: #eb6f92;
+    --bs-link-color: #c4a7e7;
+    --bs-link-hover-color: #d7bffa;
+    --pl-log-bg: #14121f;
+    --pl-log-fg: #e0def4;
+}
+
+/* Sunset -- warm plum and orange */
+[data-bs-theme="sunset"] {
+    --bs-body-bg: #2b1e2e;
+    --bs-body-color: #f5e0d8;
+    --bs-emphasis-color: #fff5f0;
+    --bs-secondary-color: rgba(245, 224, 216, 0.75);
+    --bs-secondary-bg: #3a2836;
+    --bs-tertiary-bg: #4a3344;
+    --bs-border-color: #5e4256;
+    --bs-primary: #f97316;
+    --bs-success: #fbbf24;
+    --bs-warning: #f59e0b;
+    --bs-danger: #ef4444;
+    --bs-link-color: #fb7185;
+    --bs-link-hover-color: #fda4af;
+    --pl-log-bg: #221827;
+    --pl-log-fg: #f0d5cc;
+}
+
+/* Sepia -- the one light custom palette */
+[data-bs-theme="sepia"] {
+    --bs-body-bg: #f4ecd8;
+    --bs-body-color: #5b4636;
+    --bs-emphasis-color: #3a2c1e;
+    --bs-secondary-color: rgba(91, 70, 54, 0.75);
+    --bs-secondary-bg: #ece0c8;
+    --bs-tertiary-bg: #e3d5b8;
+    --bs-border-color: #d3c4a3;
+    --bs-primary: #a0522d;
+    --bs-success: #6b8e23;
+    --bs-warning: #8b6508;
+    --bs-danger: #a52a2a;
+    --bs-link-color: #8b4513;
+    --bs-link-hover-color: #6f370f;
+    --pl-log-bg: #e8dcc0;
+    --pl-log-fg: #4a3928;
+}
+
+/* Picker swatches. One colour per registry id, including the three ids that have
+   no palette block: system shows the split, light and dark show Bootstrap's. */
+.pl-swatch {
+    display: inline-block;
+    width: 1.25rem;
+    height: 1.25rem;
+    border-radius: 0.25rem;
+    border: 1px solid var(--bs-border-color);
+    vertical-align: -0.25rem;
+}
+.pl-swatch-system { background: linear-gradient(135deg, #ffffff 50%, #212529 50%); }
+.pl-swatch-light { background: #ffffff; }
+.pl-swatch-dark { background: #212529; }
+.pl-swatch-aqua { background: #071a1f; }
+.pl-swatch-nord { background: #2e3440; }
+.pl-swatch-solarized { background: #002b36; }
+.pl-swatch-dracula { background: #282a36; }
+.pl-swatch-gruvbox { background: #282828; }
+.pl-swatch-catppuccin { background: #1e1e2e; }
+.pl-swatch-tokyonight { background: #1a1b26; }
+.pl-swatch-rosepine { background: #191724; }
+.pl-swatch-sunset { background: #2b1e2e; }
+.pl-swatch-sepia { background: #f4ecd8; }
+
+/* The update badge's two states. Colour only -- never display -- so nothing here
+   can defeat an Alpine x-show on the same element. */
+.pl-badge-update.available {
+    border-color: var(--bs-primary);
+    color: var(--bs-primary);
+}
+.pl-badge-update.failed {
+    border-color: var(--bs-danger);
+    color: var(--bs-danger);
+}

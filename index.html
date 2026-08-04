@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Pilot</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel="stylesheet" href="css/bootstrap.min.css">
+    <link rel="stylesheet" href="css/pilot.css">
+    <link rel="stylesheet" href="css/themes.css">
+    <script src="../base1/cockpit.js"></script>
+</head>
+<body>
+
+<!-- js/features/overview.js's server switcher only persists the choice and
+     dispatches 'pilot:server-changed' (it has no reference to pilotApp()'s own
+     switchServer() and must stay unit-testable with no DOM/Alpine at all) --
+     this listener is what actually closes the loop and re-wires PilotApi's
+     transport to the newly active server. switchServer() itself guards against
+     the resulting re-entrant dispatch (see js/app.js).
+
+     'pilot:open-wizard' is GAP B's fix (task 33): js/features/server-ops-ui.js's
+     "Run setup" and js/features/overview.js's "Set up TLS" CTAs both dispatch it
+     ({} and {step:'tls', serverId} respectively), but had zero production
+     listeners until now. This switches the tab; #pilot-setup below has its own
+     listener for the same event to take the wizard to a specific step (the TLS
+     CTA lands on the wizard's 'tls' step), since that is a separate x-data
+     scope this one cannot reach into. -->
+<div class="pilot-shell" x-data="pilotApp()" x-cloak
+     @pilot:server-changed.document="switchServer($event.detail.id)"
+     @pilot:open-wizard.document="openWizard($event.detail)">
+
+    <div class="pilot-header d-flex align-items-center gap-3">
+        <strong class="me-2">Pilot</strong>
+        <ul class="nav nav-pills nav-sm flex-grow-1">
+            <template x-for="t in tabs" :key="t.id">
+                <li class="nav-item">
+                    <button class="nav-link py-1 px-3"
+                            :class="{ active: tab === t.id }"
+                            :data-tab="t.id"
+                            @click="tab = t.id"
+                            x-text="t.label"></button>
+                </li>
+            </template>
+        </ul>
+    </div>
+
+    <!-- The control-plane strip. NOT the "global something went wrong" banner
+         spec §7.2 forbids: every one of these is a fact about the shell's own
+         wiring (which server is live, whether its token file could be read,
+         whether the version probe answered, whether the active-server choice
+         could be persisted), and no per-surface alert reports any of them —
+         they were all write-only state in js/app.js until now. A surface's own
+         fetch failure still belongs to that surface alone. -->
+    <div class="pilot-status" data-testid="pilot-status">
+        <p class="small text-secondary mb-1" data-testid="active-server" x-show="apiReady">
+          Connected to <span x-text="activeServerId"></span>.</p>
+        <div class="alert alert-warning py-1" data-testid="token-error" x-show="tokenError">
+          The stored API token for this server exists but could not be read, so Pilot is
+          talking to it anonymously:
+          <span x-text="tokenError ? (tokenError.message || String(tokenError)) : ''"></span>
+        </div>
+        <div class="alert alert-warning py-1" data-testid="compat-error" x-show="compatError">
+          Pilot could not confirm this server's version is supported:
+          <span x-text="compatError ? (compatError.message || String(compatError)) : ''"></span>
+        </div>
+        <div class="alert alert-warning py-1" data-testid="switch-error" x-show="switchError">
+          The active-server choice could not be saved, so it will not survive a reload:
+          <span x-text="switchError ? (switchError.message || String(switchError)) : ''"></span>
+        </div>
+    </div>
+
+    <div class="pilot-body">
+        <!-- One mount per surface. Each surface reports its own failure into
+             errors[<tab>]; there is deliberately no global error banner (spec §7.2). -->
+        <div x-show="tab === 'overview'"    id="pilot-overview"></div>
+        <div x-show="tab === 'setup'" id="pilot-setup" x-data="pilotSetupUi()"
+             @pilot:open-wizard.document="onOpenWizard($event.detail)">
+          <ol class="nav nav-pills mb-3" data-testid="setup-steps">
+            <template x-for="id in steps()" :key="id">
+              <li class="nav-item"><span class="nav-link" :class="{ active: isStep(id) }"
+                  :data-step="id" x-text="stepTitle(id)"></span></li>
+            </template>
+          </ol>
+
+          <div x-show="isStep('target')" data-testid="pane-target">
+            <label class="form-label">Where should Pilot install?</label>
+            <select class="form-select mb-2" data-testid="target" x-model="choices.target">
+              <option value="local">This machine (localhost)</option>
+              <option value="ssh">A remote host over SSH</option>
+            </select>
+            <div x-show="choices.target === 'ssh'">
+              <input class="form-control mb-1" data-testid="host" placeholder="host" x-model="choices.host">
+              <input class="form-control mb-1" data-testid="port" type="number" x-model.number="choices.port">
+              <input class="form-control mb-1" data-testid="user" placeholder="user" x-model="choices.user">
+              <select class="form-select mb-1" data-testid="auth" x-model="choices.auth">
+                <option value="agent">SSH agent / existing key</option>
+                <option value="password">Password</option>
+                <option value="pem">PEM private key</option>
+              </select>
+              <input class="form-control mb-1" data-testid="password" type="password" x-model="choices.password"
+                     x-show="choices.auth === 'password'">
+              <textarea class="form-control mb-1" data-testid="pem" x-model="choices.pem"
+                        x-show="choices.auth === 'pem'"></textarea>
+              <div class="form-check"><input class="form-check-input" type="checkbox" id="pl-remember"
+                   data-testid="remember" x-model="choices.remember">
+                <label class="form-check-label" for="pl-remember">Remember for day-2 operations</label></div>
+            </div>
+            <template x-for="(msg, field) in errors" :key="field">
+              <p class="text-danger mb-0" data-testid="target-error" x-text="msg"></p>
+            </template>
+          </div>
+
+          <div x-show="isStep('hostkey')" data-testid="pane-hostkey">
+            <p>Confirm this host key fingerprint before Pilot connects.</p>
+            <p data-testid="hostkey-checking" x-show="busy">Checking the host key…</p>
+            <pre class="border p-2" data-testid="fingerprint" x-text="hostkey ? hostkey.fingerprint : ''"></pre>
+            <button class="btn btn-primary" data-testid="accept-hostkey" @click="acceptHostKey()">
+              This fingerprint is correct</button>
+            <button class="btn btn-link" data-testid="retry-hostkey" @click="checkHostKey()">Retry</button>
+            <p class="text-danger mb-0" data-testid="hostkey-error" x-text="errors.hostkey || ''"></p>
+            <!-- C6 hard stop: a CHANGED host key is never auto-accepted, and is
+                 surfaced here explicitly rather than folded into the generic
+                 next()-validation message above. -->
+            <p class="text-danger fw-bold" data-testid="hostkey-hardstop"
+               x-show="error && error.kind === 'SSH_HOSTKEY_CHANGED'" x-text="error ? error.message : ''"></p>
+            <!-- Any OTHER failure to reach the helper (SSH_UNREACHABLE, etc.) —
+                 a blank fingerprint pane with no explanation is never acceptable. -->
+            <p class="text-danger mb-0" data-testid="hostkey-check-error"
+               x-show="error && error.kind !== 'SSH_HOSTKEY_CHANGED' && !hostkey"
+               x-text="error ? error.message : ''"></p>
+          </div>
+
+          <div x-show="isStep('detect')" data-testid="pane-detect">
+            <button class="btn btn-secondary mb-2" data-testid="run-detect" @click="detect()">Detect</button>
+            <div x-show="!!plan">
+              <table class="table"><tbody>
+                <template x-for="s in (plan ? plan.steps : [])" :key="s.id">
+                  <tr :data-plan-step="s.id"><td x-text="s.title"></td><td x-text="s.why"></td></tr>
+                </template>
+              </tbody></table>
+              <button class="btn btn-link" data-testid="manual-toggle" @click="manual = !manual">Manual mode</button>
+              <div x-show="manual"><pre data-testid="manual-script" x-text="manualScript()"></pre></div>
+            </div>
+            <p class="text-danger mb-0" data-testid="detect-error" x-text="error ? error.message : ''"></p>
+          </div>
+
+          <!-- TLS & domain (spec §6.1). The tier vocabulary, the validation and
+               the DNS pre-flight all come from js/core/tls.js through the
+               component — this pane invents no second model. The DuckDNS token
+               is a credential: type="password", bound to component state only,
+               never persisted and never put in an argv (it reaches the target
+               inside the plan's own 0600 secret write step, on stdin). -->
+          <div x-show="isStep('tls')" data-testid="pane-tls">
+            <label class="form-label" for="pl-tls-tier">How should this server be reached over TLS?</label>
+            <select class="form-select mb-2" id="pl-tls-tier" data-testid="tls-tier" x-model="choices.tlsTier">
+              <template x-for="t in tlsTiers()" :key="t">
+                <option :value="t" x-text="tlsTierLabel(t)"></option>
+              </template>
+            </select>
+
+            <div x-show="choices.tlsTier === 'own'">
+              <label class="form-label" for="pl-tls-domain">Domain (its DNS must already point at this server)</label>
+              <input class="form-control mb-1" id="pl-tls-domain" data-testid="tls-domain"
+                     placeholder="rustdesk.example.com" x-model="choices.domain">
+            </div>
+
+            <div x-show="choices.tlsTier === 'sslip'">
+              <p class="mb-1" data-testid="tls-detected-ip">
+                Detected public IP: <span x-text="detectedIp() || 'none'"></span></p>
+            </div>
+
+            <div x-show="choices.tlsTier === 'duckdns'">
+              <label class="form-label" for="pl-tls-dd-sub">DuckDNS subdomain (just the part before .duckdns.org)</label>
+              <input class="form-control mb-1" id="pl-tls-dd-sub" data-testid="tls-duckdns-sub"
+                     placeholder="pilot-demo" x-model="choices.duckdnsSub">
+              <label class="form-label" for="pl-tls-dd-token">DuckDNS account token</label>
+              <input class="form-control mb-1" id="pl-tls-dd-token" data-testid="tls-duckdns-token"
+                     type="password" autocomplete="off" x-model="choices.duckdnsToken">
+            </div>
+
+            <p class="text-secondary mb-1" data-testid="tls-advisory" x-show="tlsAdvisory()"
+               x-text="tlsAdvisory()"></p>
+            <p class="mb-1" data-testid="tls-host" x-show="tlsHost()">
+              Certificate will be requested for <span x-text="tlsHost()"></span>.</p>
+            <button class="btn btn-outline-secondary btn-sm mb-2" data-testid="tls-check-dns"
+                    x-show="tlsOn()" @click="checkDns()">Check DNS now</button>
+            <p class="mb-1" data-testid="tls-preflight" :data-kind="preflight ? preflight.kind : ''"
+               x-show="preflight" x-text="preflight ? preflight.message : ''"></p>
+            <p class="text-danger mb-0" data-testid="tls-error" x-text="errors.tls || ''"></p>
+            <!-- rebuildPlan() reports here too: arriving straight on this step
+                 from Overview's "Set up TLS" CTA, with no detection run yet, has
+                 to say so rather than look like a button that does nothing. -->
+            <p class="text-danger mb-0" data-testid="tls-plan-error" x-show="error"
+               x-text="error ? error.message : ''"></p>
+          </div>
+
+          <div x-show="isStep('ports')" data-testid="pane-ports">
+            <h5>Pilot will open these on the host firewall</h5>
+            <ul data-testid="host-ports"><template x-for="p in hostPorts()" :key="p.port + p.proto">
+              <li x-text="p.port + '/' + p.proto + ' — ' + p.component"></li></template></ul>
+            <p x-show="!hostPorts().length" data-testid="no-host-fw">
+              No supported host firewall was detected — open these yourself.</p>
+            <h5>You must open these on your cloud or edge firewall</h5>
+            <ul data-testid="cloud-ports"><template x-for="p in cloudPorts()" :key="p.port + p.proto">
+              <li x-text="p.port + '/' + p.proto + ' — ' + p.component"></li></template></ul>
+            <input class="form-control mb-1" data-testid="sg-id" placeholder="sg-…" x-model="aws.groupId">
+            <input class="form-control mb-1" data-testid="sg-region" placeholder="eu-west-1" x-model="aws.region">
+            <pre class="border p-2" data-testid="aws-command" x-text="awsLine()"></pre>
+            <p x-show="portsUnavailable()" data-testid="ports-unavailable">
+              Pilot could not work out the required port list. This is not a statement that no ports are needed.</p>
+          </div>
+
+          <div x-show="isStep('execute')" data-testid="pane-execute">
+            <button class="btn btn-primary mb-2" data-testid="run-start" @click="start()" :disabled="busy">Start</button>
+            <div class="progress mb-2" role="progressbar">
+              <div class="progress-bar" data-testid="progress-bar" :style="'width: ' + progress().percent + '%'"
+                   x-text="progress().done + ' / ' + progress().total"></div>
+            </div>
+            <button class="btn btn-sm btn-outline-secondary mb-2" data-testid="copy-transcript"
+                    @click="copyTranscript()">Copy full transcript</button>
+            <span data-testid="copied" x-show="copied">Copied.</span>
+            <!-- start() can refuse before it spawns anything at all — the §6.1
+                 DNS pre-flight is exactly that case — and this is the only pane
+                 the user is looking at when it happens. Without this the Start
+                 button would appear to do nothing. -->
+            <div class="alert alert-danger" data-testid="execute-error" x-show="error">
+              <span data-testid="execute-error-message" x-text="error ? error.message : ''"></span>
+              <span class="fw-semibold ms-1" data-testid="execute-remediation"
+                    x-text="remediationText(error)"></span>
+            </div>
+            <div data-testid="transcript">
+              <template x-for="s in exec.steps" :key="s.id">
+                <div class="border-bottom py-1" :data-step-id="s.id" :data-status="s.status">
+                  <button class="btn btn-link p-0" :data-toggle-step="s.id" @click="toggleStep(s)"
+                          x-text="s.title + ' — ' + s.status + ' (exit ' + (s.exit === null ? 'n/a' : s.exit) + ')'"></button>
+                  <div x-show="s.open">
+                    <pre class="mb-0" :data-cmd="s.id" x-text="'$ ' + s.cmd"></pre>
+                    <template x-for="(l, i) in s.lines" :key="i">
+                      <pre class="mb-0" :data-stream="l.stream" x-text="l.text"></pre>
+                    </template>
+                  </div>
+                </div>
+              </template>
+            </div>
+          </div>
+
+          <div x-show="isStep('handover')" data-testid="pane-handover">
+            <p data-testid="handover-status" :data-status="handoverResult ? handoverResult.status : 'none'"
+               x-text="handoverResult ? handoverResult.message : ''"></p>
+            <ul data-testid="blocked-ports">
+              <template x-for="b in (handoverResult ? handoverResult.blocked : [])" :key="b.port + b.proto">
+                <li x-text="b.port + '/' + b.proto + ' (' + b.scope + ')'"></li></template>
+            </ul>
+
+            <!-- Registration outcome (task 34). registerServer() writes the
+                 server record every management surface reads; without this the
+                 wizard showed a green handover while PilotServers.write() had
+                 rejected and every console tab stayed empty with no reason. -->
+            <p class="text-success mb-1" data-testid="registered" x-show="registered">
+              Registered as <span x-text="registeredServerId"></span> — this is now the active server.</p>
+            <div class="alert alert-danger" data-testid="registration-error" x-show="registrationError">
+              <p class="mb-1">This server could not be registered, so the other tabs will stay empty:
+                <span data-testid="registration-error-message"
+                      x-text="registrationError ? registrationError.message : ''"></span></p>
+              <p class="mb-1" data-testid="registration-cause" x-show="registrationError && registrationError.cause">
+                Reason reported by the system: <span x-text="registrationError ? registrationError.cause : ''"></span></p>
+              <p class="mb-1 fw-semibold" data-testid="registration-remediation"
+                 x-show="remediationText(registrationError)"
+                 x-text="remediationText(registrationError)"></p>
+              <button class="btn btn-sm btn-outline-dark" data-testid="registration-retry"
+                      @click="registerServer()">Try registering again</button>
+            </div>
+
+            <!-- A failed TLS step, classified by PilotTls.classifyAcmeFailure()
+                 into a rate limit / DNS mismatch / generic ACME failure, because
+                 those need three different next actions. -->
+            <div class="alert alert-warning" data-testid="tls-failure" x-show="tlsFailure"
+                 :data-kind="tlsFailure ? tlsFailure.kind : ''">
+              <span x-text="tlsFailure ? tlsFailure.message : ''"></span>
+            </div>
+
+            <!-- Day-2 credential outcome: "remember" that silently did not save
+                 is the same class of lie as a silent registration failure. -->
+            <p class="text-success mb-1" data-testid="credential-saved" x-show="credentialSaved">
+              The SSH credential was stored for day-2 operations.</p>
+            <div class="alert alert-warning" data-testid="credential-error" x-show="credentialSaveError">
+              <span x-text="credentialSaveError ? credentialSaveError.message : ''"></span>
+            </div>
+            <input class="form-control mb-1" data-testid="new-password" type="password" x-model="pw.password">
+            <input class="form-control mb-1" data-testid="confirm-password" type="password" x-model="pw.confirm">
+            <button class="btn btn-primary" data-testid="finish" @click="finish()">Change password and finish</button>
+            <p class="text-danger mb-0" data-testid="pw-error"
+               x-text="(pwErrors.password || '') + ' ' + (pwErrors.confirm || '')"></p>
+            <p data-testid="finished" x-show="finished">Setup finished.</p>
+          </div>
+
+          <div class="mt-3">
+            <button class="btn btn-outline-secondary" data-testid="back" @click="back()">Back</button>
+            <button class="btn btn-outline-primary" data-testid="next" @click="next()">Next</button>
+          </div>
+        </div>
+        <div x-show="tab === 'devices'"     id="pilot-devices"></div>
+        <div x-show="tab === 'addressbook'" id="pilot-addressbook"></div>
+        <div x-show="tab === 'users'"       id="pilot-users"></div>
+        <div x-show="tab === 'audit'"       id="pilot-audit"></div>
+        <div x-show="tab === 'server-ops'"  id="pilot-server-ops"></div>
+    </div>
+
+    <!-- Modal partials are injected here by boot.js before Alpine starts. -->
+    <div id="pilot-partials"></div>
+
+</div>
+
+<!-- Vendor. Fetched by `make vendor`, not committed. Alpine is NOT loaded here:
+     js/boot.js loads it after injecting the partials, so Alpine walks a complete
+     DOM. That is the whole boot trick, identical to hangar and manifest. -->
+<script src="js/bootstrap.bundle.min.js"></script>
+
+<!-- Core modules — C7 order, js/core/errors.js always first. A task that creates a
+     core module inserts its tag immediately BEFORE the marker below, at the
+     position C7 pins. tests/smoke.mjs rule 4 fails loudly on a C7 inversion. -->
+<script src="js/core/errors.js"></script>
+<script src="js/core/semver.js"></script>
+<script src="js/core/themes.js"></script>
+<script src="js/core/settings.js"></script>
+<script src="js/core/ostarget.js"></script>
+<script src="js/core/ports.js"></script>
+<script src="js/core/firewall.js"></script>
+<script src="js/core/tls.js"></script>
+<script src="js/core/provision-plan.js"></script>
+<script src="js/core/servers.js"></script>
+<script src="js/core/api-io.js"></script>
+<script src="js/core/api-client.js"></script>
+<script src="js/core/console-view.js"></script>
+<script src="js/core/addressbook.js"></script>
+<script src="js/core/emptystate.js"></script>
+<script src="js/features/update.js"></script>
+<script src="js/features/theme-ui.js"></script>
+<!-- pilot:core-scripts -->
+
+<!-- Feature modules — C7 order. Same rule: insert before the marker. -->
+<script src="js/features/setup-ui.js"></script>
+<!-- pilot:feature-scripts -->
+
+<script src="js/features/devices-ui.js"></script>
+<script src="js/features/addressbook-ui.js"></script>
+<script src="js/features/users-ui.js"></script>
+<script src="js/features/audit-ui.js"></script>
+<script src="js/features/server-ops-ui.js"></script>
+<script src="js/features/overview.js"></script>
+<script src="js/app.js"></script>
+<script src="js/boot.js"></script>
+
+</body>
+</html>

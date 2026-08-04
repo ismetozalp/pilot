@@ -1,0 +1,6 @@
+# synthetic - hand-written, not captured from a real host.
+# Arch is rolling and ships no VERSION_ID at all.
+NAME="Arch Linux"
+PRETTY_NAME="Arch Linux"
+ID=arch
+BUILD_ID=rolling

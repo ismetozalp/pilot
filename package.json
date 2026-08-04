@@ -1,0 +1,16 @@
+{
+  "name": "pilot-dev",
+  "private": true,
+  "description": "Dev/test harness for the Pilot Cockpit plugin (not shipped).",
+  "scripts": {
+    "test": "node --test tests/unit/*.test.js",
+    "test:integration": "node --test tests/integration/*.test.js",
+    "test:smoke": "node tests/smoke.mjs",
+    "test:e2e": "E2E=1 node tests/e2e.mjs",
+    "test:e2e:setup": "E2E=1 node tests/e2e/setup.e2e.mjs",
+    "test:live": "PILOT_LIVE=1 node tests/e2e/run-live.mjs"
+  },
+  "devDependencies": {
+    "playwright": "^1.49.0"
+  }
+}
