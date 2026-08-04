@@ -14,6 +14,9 @@
         ? require : null;
     const Errors = root.PilotErrors || (req ? req('../core/errors.js') : null);
     const AB = root.PilotAddressBook || (req ? req('../core/addressbook.js') : null);
+    // GAP D (task 33): the Tags empty state (below) is EmptyState.forKind('tag')'s
+    // one and only consumer anywhere in the repo before this fix.
+    const EmptyState = root.PilotEmptyState || (req ? req('../core/emptystate.js') : null);
 
     // api-client.js loads before this file in the browser (C7). Resolving it
     // lazily keeps the unit tests, which always inject a fake facade, from
@@ -109,6 +112,18 @@
         return selectionOf(state).length > 0 && AB.normalizeTags(state.bulkTags).length > 0;
     }
 
+    // GAP D (task 33): spec §7.3 forbids an empty data-driven control rendering
+    // NOTHING — the chip list at data-pilot="tag" did exactly that with zero
+    // tags. EmptyState.forKind('tag').tab is 'addressbook', which is where this
+    // surface already lives, so a tab-switch CTA would be a self-referential
+    // no-op; focusing the add-tag input is the genuinely useful next action
+    // instead. Falls back to plain text if js/core/emptystate.js is ever
+    // missing, rather than rendering nothing.
+    function tagEmptyState() {
+        const entry = (EmptyState && typeof EmptyState.forKind === 'function') ? EmptyState.forKind('tag') : null;
+        return entry || { message: 'No tags yet.', ctaLabel: 'Add a tag', tab: 'addressbook' };
+    }
+
     function csvFilename(book, now) {
         const when = (now instanceof Date && !isNaN(now.getTime())) ? now : new Date();
         const stamp = String(when.getUTCFullYear()) +
@@ -182,6 +197,13 @@
         '        <span x-text="t"></span>',
         '        <button type="button" class="btn-close btn-close-white ms-1" aria-label="Delete tag"',
         '                @click="deleteTag(t)"></button>',
+        '      </span>',
+        '    </template>',
+        '    <template x-if="!tags.length">',
+        '      <span data-pilot="tags-empty">',
+        '        <span class="text-secondary small" x-text="tagEmptyState().message"></span>',
+        '        <button type="button" class="btn btn-sm btn-link p-0 ms-1" data-pilot="tags-empty-action"',
+        '                @click="focusNewTag()" x-text="tagEmptyState().ctaLabel"></button>',
         '      </span>',
         '    </template>',
         '  </div>',
@@ -394,6 +416,21 @@
             },
 
             visible() { return visiblePeers(this); },
+
+            // GAP D (task 33): the empty state's own copy, and the action
+            // its CTA actually performs. forKind('tag').tab is 'addressbook'
+            // — the tab this surface already renders in — so switching tabs
+            // would be a self-referential no-op; focusing the add-tag input
+            // is the genuinely useful next step instead.
+            tagEmptyState() { return tagEmptyState(); },
+            focusNewTag() {
+                const d = this.doc || root.document || null;
+                if (!d || typeof d.getElementById !== 'function') return false;
+                const el = d.getElementById('pilot-ab-newtag');
+                if (!el || typeof el.focus !== 'function') return false;
+                el.focus();
+                return true;
+            },
 
             peersEmptyKind() {
                 if (this.busy) return 'none';
@@ -678,7 +715,7 @@
 
     const PilotAddressBookUi = {
         HOST_ID, SERVER_CHANGED_EVENT, TEMPLATE, blankState, toAlert, activeBookOf, visiblePeers,
-        selectionOf, canBulkTag, csvFilename, mount, safeMount, pilotAddressBookUi
+        selectionOf, canBulkTag, csvFilename, tagEmptyState, mount, safeMount, pilotAddressBookUi
     };
     root.PilotAddressBookUi = PilotAddressBookUi;
     if (typeof module !== 'undefined' && module.exports) module.exports = PilotAddressBookUi;

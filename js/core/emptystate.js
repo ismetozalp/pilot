@@ -34,6 +34,18 @@
         tag: Object.freeze({
             message: 'No tags yet.', ctaLabel: 'Add a tag', tab: 'addressbook'
         }),
+        // RESERVED (task 33 / GAP D audit): 'group' and 'device-group' are named in
+        // the design spec's Appendix A8 table alongside every other kind here, but
+        // no task has ever built a "list of groups" or "list of device groups" UI
+        // to be the empty state FOR — js/features/users-ui.js's own group handling
+        // is a per-account ASSIGNMENT dropdown, a different situation entirely (an
+        // unresolved group id on one row, not an empty groups list), and no
+        // "device groups" concept exists anywhere else in this codebase.
+        // Kept rather than removed because the spec still names them as part of
+        // the closed vocabulary; if a future task adds that UI, forKind('group')/
+        // forKind('device-group') are already here and already tested. If no such
+        // UI is ever planned, removing these two entries (and their spec rows) is
+        // the honest fix — not leaving them to keep looking like a wired feature.
         group: Object.freeze({
             message: 'No groups yet.', ctaLabel: 'Create a group', tab: 'users'
         }),

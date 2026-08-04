@@ -202,6 +202,20 @@ export default async function run(ctx) {
                 (els) => els.map((e) => e.textContent.trim()));
             assertOk(cells.every((c) => !c.includes('HQ') && !c.includes('office')),
                 'the deleted tag is gone from every peer row: ' + cells.join(' | '));
+
+            // GAP D (task 33): the chip list rendered NOTHING with zero tags —
+            // no message, no next action, forbidden by spec §7.3. This is now
+            // genuinely zero tags (the only one just got deleted above), so
+            // it is the real moment to prove the empty state actually shows.
+            assertOk(await visible(page, '#pilot-addressbook [data-pilot="tags-empty"]'),
+                'an empty tag list must show a message and a next action, not nothing');
+            const emptyText = (await text(page, '#pilot-addressbook [data-pilot="tags-empty"]')).replace(/\s+/g, ' ').trim();
+            assertEqual(emptyText, 'No tags yet. Add a tag',
+                'must be EmptyState.forKind(\'tag\')\'s own copy, not ad hoc text');
+            await page.click('#pilot-addressbook [data-pilot="tags-empty-action"]');
+            const focused = await page.evaluate(() => document.activeElement && document.activeElement.id);
+            assertEqual(focused, 'pilot-ab-newtag',
+                'the action must focus the add-tag input, not switch tabs (this surface already IS Address Book)');
         } finally {
             await page.ctx.close();
         }

@@ -270,6 +270,72 @@ test('deleteTag removes it locally only after the server accepts', async () => {
     assert.equal(await c2.deleteTag('a,b'), false);
 });
 
+// -------------------------------------------------- GAP D (task 33): tags empty state
+
+test('tagEmptyState() is EmptyState.forKind(\'tag\'), not an inline copy that can drift from it', () => {
+    const ES = require('../../js/core/emptystate.js');
+    assert.deepEqual(Ui.tagEmptyState(), ES.forKind('tag'));
+});
+
+test('tagEmptyState() degrades to plain text rather than rendering nothing if ' +
+    'js/core/emptystate.js is ever unavailable (neither the global nor require() resolves it)', () => {
+    const hadGlobal = Object.prototype.hasOwnProperty.call(globalThis, 'PilotEmptyState');
+    const prevGlobal = globalThis.PilotEmptyState;
+    const emptystatePath = require.resolve('../../js/core/emptystate.js');
+    const abPath = require.resolve('../../js/features/addressbook-ui.js');
+    const hadEmptystateCache = Object.prototype.hasOwnProperty.call(require.cache, emptystatePath);
+    const prevEmptystateCache = require.cache[emptystatePath];
+    delete globalThis.PilotEmptyState;
+    // Fakes emptystate.js resolving to nothing usable — the closest a unit
+    // test can get to "the module genuinely is not there", without deleting
+    // a real file mid-suite.
+    require.cache[emptystatePath] = Object.assign({}, prevEmptystateCache, { exports: null });
+    try {
+        delete require.cache[abPath];
+        const fresh = require('../../js/features/addressbook-ui.js');
+        assert.deepEqual(fresh.tagEmptyState(), { message: 'No tags yet.', ctaLabel: 'Add a tag', tab: 'addressbook' });
+    } finally {
+        if (hadGlobal) globalThis.PilotEmptyState = prevGlobal; else delete globalThis.PilotEmptyState;
+        if (hadEmptystateCache) require.cache[emptystatePath] = prevEmptystateCache;
+        else delete require.cache[emptystatePath];
+        delete require.cache[abPath];
+        require('../../js/features/addressbook-ui.js');
+    }
+});
+
+test('with no tags at all, the chip list renders the empty state instead of nothing (spec 7.3)', async () => {
+    const c = make(fakeApi({ tags: async () => ({ tags: [] }) }));
+    await c.load();
+    assert.deepEqual(c.tags, []);
+    assert.equal(c.tagEmptyState().message, 'No tags yet.');
+    assert.equal(c.tagEmptyState().ctaLabel, 'Add a tag');
+});
+
+test('focusNewTag() focuses the add-tag input rather than switching tabs -- ' +
+    'forKind(\'tag\').tab is \'addressbook\', where this surface already is', () => {
+    let focused = 0;
+    const fakeDoc = {
+        getElementById(id) {
+            assert.equal(id, 'pilot-ab-newtag');
+            return { focus() { focused += 1; } };
+        }
+    };
+    const c = Ui.pilotAddressBookUi({ api: fakeApi(), doc: fakeDoc });
+    assert.equal(c.focusNewTag(), true);
+    assert.equal(focused, 1);
+});
+
+test('focusNewTag() never throws with no document, no element, or a hostile stand-in', () => {
+    const c1 = Ui.pilotAddressBookUi({ api: fakeApi() });
+    assert.equal(c1.focusNewTag(), false);
+
+    const c2 = Ui.pilotAddressBookUi({ api: fakeApi(), doc: { getElementById() { return null; } } });
+    assert.equal(c2.focusNewTag(), false);
+
+    const c3 = Ui.pilotAddressBookUi({ api: fakeApi(), doc: { getElementById() { return {}; } } });
+    assert.equal(c3.focusNewTag(), false);
+});
+
 test('exportCsv round-trips through the core parser', async () => {
     const c = make();
     await c.load();
@@ -530,7 +596,7 @@ test('the template renders every peer/tag value with x-text, never x-html or x-s
     for (const hook of ['reload', 'book', 'filter', 'peer-row', 'peer-check', 'tag',
         'bulk-tags', 'bulk-mode', 'bulk-apply', 'tags-error', 'peers-error',
         'books-error', 'write-error', 'select-all', 'export-csv', 'import-csv',
-        'csv-file', 'peers-empty', 'peers-empty-filtered'])
+        'csv-file', 'peers-empty', 'peers-empty-filtered', 'tags-empty', 'tags-empty-action'])
         assert.ok(Ui.TEMPLATE.includes('data-pilot="' + hook + '"'), 'missing hook: ' + hook);
     for (const line of Ui.TEMPLATE.split('\n')) {
         assert.ok(!/x-show/.test(line), 'x-show must not be used: ' + line.trim());
