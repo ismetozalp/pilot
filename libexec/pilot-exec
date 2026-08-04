@@ -768,6 +768,11 @@ def known_hosts_record(host, port, keytype, key, path=None):
 
 
 def openssh_fingerprint(key_b64):
+    if not key_b64:
+        # An empty blob is never a real host key; base64.b64decode("") does not
+        # raise (it is valid base64 of zero bytes), so it must be refused here
+        # or an empty offered key would silently fingerprint as a real one.
+        return None
     try:
         blob = base64.b64decode(key_b64, validate=True)
     except (ValueError, TypeError):
@@ -1109,6 +1114,219 @@ def cmd_run(stdin, out):
         emitter.close()
 
 
+# ---- detection --------------------------------------------------------------
+#
+# One probe script, one parser, one request validator. The probe emits key=value
+# lines and nothing else: a shell script that tries to emit JSON is a quoting bug
+# waiting to happen, and the parser has to survive arbitrary junk anyway because
+# it runs on a machine Pilot does not control.
+
+DETECT_TIMEOUT = float(os.environ.get("PILOT_DETECT_TIMEOUT", "60"))
+DETECT_KEYS = ("version", "transport", "ssh", "credentials")
+HOSTKEY_KEYS = ("host", "port")
+DETECT_KEY_RE = re.compile(r"\A[a-z][a-z0-9_]{0,63}\Z")
+DETECT_IP_RE = re.compile(r"\A[0-9a-fA-F.:]{3,45}\Z")
+
+DETECT_SCRIPT = """set -u
+emit() { printf '%s=%s\\n' "$1" "$2"; }
+if [ -r /etc/os-release ]; then . /etc/os-release 2>/dev/null || true; fi
+emit os_id "${ID:-}"
+emit os_id_like "${ID_LIKE:-}"
+emit os_version_id "${VERSION_ID:-}"
+emit os_pretty_name "${PRETTY_NAME:-}"
+emit arch "$(uname -m 2>/dev/null || echo unknown)"
+if [ -d /run/systemd/system ]; then emit init systemd; else emit init other; fi
+fw=none
+if command -v firewall-cmd >/dev/null 2>&1; then fw=firewalld
+elif command -v ufw >/dev/null 2>&1; then fw=ufw
+elif command -v nft >/dev/null 2>&1; then fw=nftables
+fi
+emit firewall "$fw"
+if command -v curl >/dev/null 2>&1 && \
+   curl -fsS --max-time 8 -o /dev/null https://api.github.com/ 2>/dev/null; then
+    emit egress true
+else
+    emit egress false
+fi
+emit disk_free_mb "$(df -Pm / 2>/dev/null | awk 'NR==2 {print $4}')"
+hbbs_bin=""
+for p in /usr/bin/hbbs /usr/local/bin/hbbs /opt/rustdesk-server/hbbs; do
+    if [ -x "$p" ]; then hbbs_bin="$p"; break; fi
+done
+if [ -n "$hbbs_bin" ]; then
+    emit hbbs_present true
+    v=$("$hbbs_bin" --version 2>/dev/null | head -n1 | tr -d '\\r')
+    emit hbbs_version "${v:-unknown}"
+    if command -v dpkg-query >/dev/null 2>&1 && \
+       dpkg-query -W rustdesk-server-hbbs >/dev/null 2>&1; then
+        emit hbbs_install deb
+    else
+        emit hbbs_install binary
+    fi
+    dd=""
+    for d in /var/lib/rustdesk-server /opt/rustdesk-server; do
+        if [ -d "$d" ]; then dd="$d"; break; fi
+    done
+    emit hbbs_data_dir "$dd"
+    if [ -n "$dd" ] && [ -r "$dd/id_ed25519.pub" ]; then
+        emit hbbs_pubkey "$(head -n1 "$dd/id_ed25519.pub" | tr -d '\\r\\n')"
+    fi
+    ports=$(ss -H -ltun 2>/dev/null | awk '{print $5}' | sed 's/.*://' \
+            | sort -un | tr '\\n' ',' | sed 's/,$//')
+    emit hbbs_ports "${ports:-}"
+else
+    emit hbbs_present false
+fi
+if [ -x /opt/rustdesk-api/apimain ]; then
+    emit api_present true
+    emit api_install binary
+    av=$(/opt/rustdesk-api/apimain --version 2>/dev/null | head -n1 | tr -d '\\r')
+    emit api_version "${av:-unknown}"
+    ap=$(sed -n 's/^[[:space:]]*api-addr:[[:space:]]*//p' \
+         /opt/rustdesk-api/conf/config.yaml 2>/dev/null | head -n1 \
+         | sed 's/.*://' | tr -cd '0-9')
+    emit api_port "${ap:-21114}"
+else
+    emit api_present false
+fi
+if command -v curl >/dev/null 2>&1; then
+    emit public_ip "$(curl -fsS --max-time 8 https://api.ipify.org 2>/dev/null | tr -d '\\r\\n')"
+else
+    emit public_ip ""
+fi
+"""
+
+
+def _clean(value, maxlen=200):
+    text = CTRL_RE.sub("", value or "")
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in ("\"", "'"):
+        text = text[1:-1]
+    return text[:maxlen]
+
+
+def validate_detect_request(raw):
+    src = _obj(raw, "request", DETECT_KEYS)
+    if isinstance(src["version"], bool) or src["version"] != VERSION:
+        raise Fail(EXIT_BAD_STDIN, "GENERIC", "request.version must be 1")
+    transport = _text(src["transport"], "request.transport", 8)
+    if transport not in ("local", "ssh"):
+        raise Fail(EXIT_BAD_STDIN, "GENERIC",
+                   "request.transport must be 'local' or 'ssh'")
+    return {"version": VERSION, "transport": transport,
+            "ssh": validate_ssh(src["ssh"], transport, "request.ssh"),
+            "credentials": validate_credentials(src["credentials"],
+                                                "request.credentials")}
+
+
+def parse_detection(text):
+    values = {}
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _sep, value = line.partition("=")
+        key = key.strip()
+        if DETECT_KEY_RE.match(key):
+            values[key] = value.strip()
+
+    def get(name):
+        return _clean(values.get(name, ""))
+
+    def number(name, default):
+        digits = re.sub(r"[^0-9]", "", values.get(name, ""))
+        return int(digits) if digits else default
+
+    hbbs = None
+    if values.get("hbbs_present") == "true":
+        ports = []
+        for token in values.get("hbbs_ports", "").split(","):
+            digits = re.sub(r"[^0-9]", "", token)
+            if not digits:
+                continue
+            port = int(digits)
+            if 0 < port < 65536 and port not in ports:
+                ports.append(port)
+        ports.sort()
+        install = get("hbbs_install")
+        hbbs = {
+            "version": get("hbbs_version") or "unknown",
+            "install": install if install in ("deb", "binary") else "unknown",
+            "ports": ports,
+            # Restricted to the base64 alphabet: this string is written into a
+            # generated config file, so nothing shell-active may survive.
+            "pubkey": re.sub(r"[^A-Za-z0-9+/=]", "",
+                             values.get("hbbs_pubkey", ""))[:1024],
+            # Never the empty string: a consumer must not have to guess whether
+            # "" means "not found" or "the filesystem root".
+            "data_dir": get("hbbs_data_dir") or "/var/lib/rustdesk-server",
+        }
+
+    api = None
+    if values.get("api_present") == "true":
+        install = get("api_install")
+        api = {"version": get("api_version") or "unknown",
+               "port": number("api_port", 21114) or 21114,
+               "install": install if install == "binary" else "unknown"}
+
+    init = get("init")
+    firewall = get("firewall")
+    public_ip = get("public_ip")
+    return {
+        "os_release": {"id": get("os_id"), "id_like": get("os_id_like"),
+                       "version_id": get("os_version_id"),
+                       "pretty_name": get("os_pretty_name")},
+        "arch": get("arch") or "unknown",
+        "init": "systemd" if init == "systemd" else "other",
+        "firewall": firewall if firewall in ("firewalld", "ufw", "nftables") else "none",
+        "egress": values.get("egress") == "true",
+        "disk_free_mb": number("disk_free_mb", 0),
+        "hbbs": hbbs,
+        "api": api,
+        "public_ip": public_ip if DETECT_IP_RE.match(public_ip or "") else None,
+    }
+
+
+def cmd_detect(stdin, out):
+    request = validate_detect_request(read_stdin_json(stdin))
+    redactor = Redactor()
+    creds = request["credentials"] or {}
+    redactor.add(creds.get("password") or "")
+    redactor.add(creds.get("pem") or "")
+    transport = make_transport(request)
+    try:
+        transport.start(None)
+        rc, text, err = transport.capture(["/bin/sh", "-c", DETECT_SCRIPT],
+                                          timeout=DETECT_TIMEOUT)
+    finally:
+        transport.close()
+    if rc != 0 and not text.strip():
+        kind = "SSH_UNREACHABLE" if request["transport"] == "ssh" else "GENERIC"
+        raise Fail(EXIT_TRANSPORT, kind,
+                   "detection failed with exit " + str(rc) + ": " +
+                   redactor.scrub(err)[:500])
+    out.write(json.dumps(redactor.scrub_obj(parse_detection(text)),
+                         ensure_ascii=False) + "\n")
+    out.flush()
+    return EXIT_OK
+
+
+def cmd_check_hostkey(stdin, out):
+    src = _obj(read_stdin_json(stdin), "request", HOSTKEY_KEYS)
+    host = _text(src["host"], "request.host", 255)
+    if not HOST_RE.match(host):
+        raise Fail(EXIT_BAD_STDIN, "GENERIC",
+                   "request.host is not a valid hostname or address")
+    port = _int(src["port"], "request.port", 1, 65535)
+    # Deliberately does NOT record the key: this mode only reports what is there,
+    # so trust is established by the run the user actually approved.
+    status = hostkey_status(host, port)
+    out.write(json.dumps({"fingerprint": status["fingerprint"],
+                          "known": status["known"],
+                          "kind": status["kind"]}) + "\n")
+    out.flush()
+    return EXIT_HOSTKEY_CHANGED if status["kind"] == "SSH_HOSTKEY_CHANGED" else EXIT_OK
+
+
 # ---- entry point ------------------------------------------------------------
 
 def parse_args(argv):
@@ -1150,6 +1368,8 @@ def main(argv, stdin, out, err):
 MODE_HANDLERS["--print-plan"] = cmd_print_plan
 MODE_HANDLERS["--selftest-redact"] = cmd_selftest_redact
 MODE_HANDLERS["--run"] = cmd_run
+MODE_HANDLERS["--detect"] = cmd_detect
+MODE_HANDLERS["--check-hostkey"] = cmd_check_hostkey
 
 if __name__ == "__main__":
     sys.exit(main(sys.argv[1:], sys.stdin, sys.stdout, sys.stderr))
