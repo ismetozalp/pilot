@@ -27,9 +27,12 @@ test('module loads with no DOM and no cockpit global', () => {
     assert.equal(globalThis.PilotSetupUi, UI);
 });
 
-test('the six wizard steps are exactly the spec order', () => {
+test('the seven wizard steps are exactly the spec order, with tls between detect and ports', () => {
+    // tls sits after detect (the sslip tier needs the public IP --detect
+    // reports) and before ports (443/80 are only required once a tier is
+    // chosen, and 21114 stops being internet-facing when one is).
     assert.deepEqual(UI.STEP_IDS,
-        ['target', 'hostkey', 'detect', 'ports', 'execute', 'handover']);
+        ['target', 'hostkey', 'detect', 'tls', 'ports', 'execute', 'handover']);
     for (const id of UI.STEP_IDS)
         assert.equal(typeof UI.STEP_TITLES[id], 'string');
 });
@@ -40,7 +43,7 @@ test('the host-key step is skipped entirely for localhost', () => {
     const s = UI.blankState();
     s.choices.target = 'local';
     assert.deepEqual(UI.visibleSteps(s),
-        ['target', 'detect', 'ports', 'execute', 'handover']);
+        ['target', 'detect', 'tls', 'ports', 'execute', 'handover']);
 });
 
 test('the host-key step is required for a remote target', () => {
@@ -90,13 +93,22 @@ test('applyWizardStep jumps to a step that is currently visible', () => {
     assert.equal(UI.applyWizardStep(s, { step: 'ports' }), 'ports');
 });
 
-test('applyWizardStep never jumps to a step this wizard does not recognise ' +
-    '(there is no "tls" step -- TLS is a field on the target step\'s own choices, ' +
-    'not a step of its own) -- it leaves the current step untouched rather than ' +
-    'landing on a pane nothing renders', () => {
+test('applyWizardStep honours {step:"tls"} -- the "Set up TLS" CTA must actually land there', () => {
+    // js/features/overview.js's disabled web-client link dispatches
+    // pilot:open-wizard with {step:'tls'}. Before the TLS step existed this
+    // returned the current step and the CTA was a no-op with a listener.
+    for (const target of ['local', 'ssh']) {
+        const s = UI.blankState();
+        s.choices.target = target;
+        s.step = 'target';
+        assert.equal(UI.applyWizardStep(s, { step: 'tls' }), 'tls', target);
+    }
+});
+
+test('applyWizardStep still refuses a step id this wizard does not have', () => {
     const s = UI.blankState();
     s.step = 'target';
-    assert.equal(UI.applyWizardStep(s, { step: 'tls' }), 'target');
+    assert.equal(UI.applyWizardStep(s, { step: 'certificates' }), 'target');
 });
 
 test('applyWizardStep never jumps to a step that exists but is not currently visible ' +
@@ -1465,4 +1477,150 @@ test('persistCredential and registerServer key the SAME target under the SAME id
         assert.deepEqual(calls.writeSshCredential, ['rd-example-com-2222'],
             'the credential must be keyed under the exact id the record was registered under');
     }));
+});
+
+// =================================================== FINAL REVIEW, FINDING 1
+//
+// TLS was fully built in js/core/tls.js and js/core/provision-plan.js and had no
+// path to it from the UI at all: planChoicesFor() hardcoded tlsTier:'none', so
+// PilotTls.dnsPreflight/classifyAcmeFailure/webClientUrl had zero production
+// references and provision-plan's whole tls-* branch was unreachable. These
+// cover the pure half of the wizard's TLS step; tests/e2e/setup.e2e.mjs drives
+// the same logic through a real browser and asserts on the emitted plan.
+
+const TLS_DETECTION = { public_ip: '203.0.113.10' };
+
+test('tlsChoices maps the wizard\'s flat fields onto the exact C13 shape tls.js reads', () => {
+    assert.deepEqual(UI.tlsChoices({ tlsTier: 'own', domain: 'rd.example.com',
+        duckdnsSub: 'x', duckdnsToken: 't' }),
+    { tlsTier: 'own', domain: 'rd.example.com', duckdns: null },
+    'a DuckDNS pair typed and then abandoned must not travel with the own-domain tier');
+    assert.deepEqual(UI.tlsChoices({ tlsTier: 'duckdns', domain: 'rd.example.com',
+        duckdnsSub: 'pilot-demo', duckdnsToken: 'abcdefgh' }),
+    { tlsTier: 'duckdns', domain: null, duckdns: { subdomain: 'pilot-demo', token: 'abcdefgh' } });
+    assert.deepEqual(UI.tlsChoices({}), { tlsTier: 'none', domain: null, duckdns: null });
+    assert.deepEqual(UI.tlsChoices(null), { tlsTier: 'none', domain: null, duckdns: null });
+});
+
+test('validateTls delegates to PilotTls.validate — the same authority provision-plan uses', () => {
+    const Tls = require('../../js/core/tls.js');
+    const cases = [
+        { tlsTier: 'none' },
+        { tlsTier: 'own', domain: 'rd.example.com' },
+        { tlsTier: 'own', domain: '203.0.113.10' },
+        { tlsTier: 'own', domain: 'nope' },
+        { tlsTier: 'sslip' },
+        { tlsTier: 'duckdns', duckdnsSub: 'pilot-demo', duckdnsToken: 'a'.repeat(20) },
+        { tlsTier: 'duckdns', duckdnsSub: 'pilot-demo', duckdnsToken: 'short' },
+        { tlsTier: 'duckdns', duckdnsSub: 'Bad Sub', duckdnsToken: 'a'.repeat(20) }
+    ];
+    for (const c of cases) {
+        const mine = UI.validateTls(c, { public_ip: TLS_DETECTION.public_ip });
+        const theirs = Tls.validate(UI.tlsChoices(c), { public_ip: TLS_DETECTION.public_ip });
+        assert.deepEqual(mine, theirs, JSON.stringify(c));
+    }
+});
+
+test('validateTls never echoes the DuckDNS token, valid or not', () => {
+    const token = 'SuperSecretToken12345';
+    for (const sub of ['pilot-demo', '', 'Bad Sub']) {
+        const r = UI.validateTls({ tlsTier: 'duckdns', duckdnsSub: sub, duckdnsToken: token },
+            TLS_DETECTION);
+        assert.equal(JSON.stringify(r).indexOf(token), -1, JSON.stringify(sub));
+    }
+});
+
+test('tlsHostFor names the exact hostname each tier certifies', () => {
+    assert.equal(UI.tlsHostFor({ tlsTier: 'own', domain: 'RD.Example.COM.' }, TLS_DETECTION),
+        'rd.example.com');
+    assert.equal(UI.tlsHostFor({ tlsTier: 'sslip' }, TLS_DETECTION), '203.0.113.10.sslip.io');
+    assert.equal(UI.tlsHostFor({ tlsTier: 'duckdns', duckdnsSub: 'pilot-demo' }, TLS_DETECTION),
+        'pilot-demo.duckdns.org');
+    assert.equal(UI.tlsHostFor({ tlsTier: 'none' }, TLS_DETECTION), '');
+    assert.equal(UI.tlsHostFor({ tlsTier: 'own', domain: '203.0.113.10' }, TLS_DETECTION), '',
+        'a bare IP certifies nothing');
+});
+
+test('planChoicesFor passes the TLS choice through instead of hardcoding "none"', () => {
+    const own = UI.planChoicesFor({ target: 'local', tlsTier: 'own', domain: 'rd.example.com' });
+    assert.equal(own.tlsTier, 'own');
+    assert.equal(own.domain, 'rd.example.com');
+    assert.equal(own.duckdns, null);
+    const dd = UI.planChoicesFor({ target: 'local', tlsTier: 'duckdns',
+        duckdnsSub: 'pilot-demo', duckdnsToken: 'abcdefghij' });
+    assert.equal(dd.tlsTier, 'duckdns');
+    assert.deepEqual(dd.duckdns, { subdomain: 'pilot-demo', token: 'abcdefghij' });
+    // The default is still "no TLS": TLS is opt-in, never turned on by omission.
+    assert.equal(UI.planChoicesFor({ target: 'local' }).tlsTier, 'none');
+});
+
+test('a TLS choice really reaches PilotProvisionPlan: the built plan carries the tls-* steps', () => {
+    const Plan = require('../../js/core/provision-plan.js');
+    const detection = {
+        os_release: { id: 'debian', id_like: '', version_id: '12', pretty_name: 'Debian 12' },
+        arch: 'x86_64', init: 'systemd', firewall: 'firewalld', egress: true, disk_free_mb: 4096,
+        hbbs: null, api: null, public_ip: '203.0.113.10'
+    };
+    const ids = Plan.stepIds(Plan.build(detection,
+        UI.planChoicesFor({ target: 'local', tlsTier: 'own', domain: 'rd.example.com' })));
+    for (const id of ['tls-caddy', 'tls-caddyfile', 'tls-reload'])
+        assert.ok(ids.includes(id), id + ' missing from ' + ids.join(','));
+    const none = Plan.stepIds(Plan.build(detection, UI.planChoicesFor({ target: 'local' })));
+    assert.ok(!none.some((id) => id.indexOf('tls-') === 0), 'no tier means no tls steps');
+});
+
+test('recordForRegistration records the real tls/domain a TLS run configured', () => {
+    const state = {
+        choices: { target: 'local', tlsTier: 'own', domain: 'RD.Example.com' },
+        detection: { public_ip: '203.0.113.10' }
+    };
+    const rec = UI.recordForRegistration(state, null, '2026-08-04T00:00:00.000Z');
+    assert.equal(rec.tls, true);
+    assert.equal(rec.domain, 'rd.example.com', 'the normalised host tls.js certifies');
+});
+
+test('recordForRegistration never records TLS for a tier that does not validate', () => {
+    const rec = UI.recordForRegistration({
+        choices: { target: 'local', tlsTier: 'own', domain: '203.0.113.10' },
+        detection: { public_ip: '203.0.113.10' }
+    }, null, '2026-08-04T00:00:00.000Z');
+    assert.equal(rec.tls, false, 'the bare-IP guard is the authority here too');
+    assert.equal(rec.domain, null);
+});
+
+test('recordForRegistration never writes the DuckDNS token into the server record', () => {
+    const token = 'DuckSecret-0123456789';
+    const rec = UI.recordForRegistration({
+        choices: { target: 'local', tlsTier: 'duckdns', duckdnsSub: 'pilot-demo', duckdnsToken: token },
+        detection: { public_ip: '203.0.113.10' }
+    }, null, '2026-08-04T00:00:00.000Z');
+    assert.equal(rec.tls, true);
+    assert.equal(rec.domain, 'pilot-demo.duckdns.org');
+    assert.equal(JSON.stringify(rec).indexOf(token), -1,
+        'the token is single-use for the record update; nothing persists it');
+});
+
+test('a "none" run carries an existing record\'s TLS forward instead of clobbering it', () => {
+    const existing = { id: 'local', tls: true, domain: 'rd.example.com', createdAt: '2020-01-01T00:00:00.000Z' };
+    const rec = UI.recordForRegistration({ choices: { target: 'local', tlsTier: 'none' }, detection: {} },
+        existing, '2026-08-04T00:00:00.000Z');
+    assert.equal(rec.tls, true, 'Pilot did not tear TLS down, so it must not record that it did');
+    assert.equal(rec.domain, 'rd.example.com');
+});
+
+test('acmeFailureFrom classifies a failed tls step through PilotTls.classifyAcmeFailure', () => {
+    const mk = (line) => ({ steps: [
+        { id: 'fetch-api', status: 'ok', lines: [] },
+        { id: 'tls-reload', status: 'failed', lines: [{ stream: 'stderr', text: line }] }
+    ] });
+    assert.equal(UI.acmeFailureFrom(mk('too many certificates already issued')).kind, 'TLS_RATE_LIMITED');
+    assert.equal(UI.acmeFailureFrom(mk('DNS problem: NXDOMAIN looking up A')).kind, 'TLS_DNS_MISMATCH');
+    assert.equal(UI.acmeFailureFrom(mk('something else entirely')).kind, 'TLS_ACME_FAILED');
+    for (const k of ['TLS_RATE_LIMITED', 'TLS_DNS_MISMATCH', 'TLS_ACME_FAILED'])
+        assert.ok(UI.acmeFailureFrom(mk(k === 'TLS_RATE_LIMITED' ? 'rate limit' : 'x')).message.length > 20);
+    assert.equal(UI.acmeFailureFrom({ steps: [{ id: 'tls-reload', status: 'ok', lines: [] }] }), null,
+        'a tls step that SUCCEEDED is not an ACME failure');
+    assert.equal(UI.acmeFailureFrom({ steps: [{ id: 'fetch-api', status: 'failed', lines: [] }] }), null,
+        'a non-tls failure is not an ACME failure either');
+    assert.equal(UI.acmeFailureFrom(null), null);
 });

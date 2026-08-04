@@ -176,15 +176,15 @@ const SCENARIO_TIMEOUT_MS = 120000;
 // two storages and innerHTML itself. The password's own field is excluded:
 // it legitimately holds the value while the user is looking at that step,
 // which is the form doing its job, not a leak. Anywhere else is a real leak.
-async function credentialLeaked(page, secret) {
-    return page.evaluate((needle) => {
+async function credentialLeaked(page, secret, ownFields) {
+    return page.evaluate(({ needle, own }) => {
         const stores = [localStorage, sessionStorage];
         for (const store of stores)
             for (let i = 0; i < store.length; i++)
                 if (String(store.getItem(store.key(i))).includes(needle)) return true;
         if (document.body.innerHTML.includes(needle)) return true;
         for (const el of document.querySelectorAll('input, textarea')) {
-            if (el.getAttribute('data-testid') === 'password') continue;
+            if (own.includes(el.getAttribute('data-testid'))) continue;
             if (typeof el.value === 'string' && el.value.includes(needle)) return true;
         }
         for (const el of document.querySelectorAll('*')) {
@@ -193,17 +193,17 @@ async function credentialLeaked(page, secret) {
             }
         }
         return false;
-    }, secret);
+    }, { needle: secret, own: ['password'].concat(Array.isArray(ownFields) ? ownFields : []) });
 }
 
 async function runBody(ctx) {
-    const { browser, check, assertEqual, assertOk, shot } = ctx;
+    const { browser, check, assertEqual, assertOk, assertMatch, shot } = ctx;
 
     await check('localhost wizard never shows the host-key step', async () => {
         await withPage(ctx, STUB(RUN_OK), async (page) => {
             await page.selectOption('[data-testid="target"]', 'local');
             assertEqual((await stepIds(page)).join(','),
-                'target,detect,ports,execute,handover', 'host key must be absent for localhost');
+                'target,detect,tls,ports,execute,handover', 'host key must be absent for localhost');
             await page.click('[data-testid="next"]');
             assertOk(await visible(page, '[data-testid="pane-detect"]'), 'localhost skips to detection');
             await shot(page, 'setup-local-steps');
@@ -216,7 +216,7 @@ async function runBody(ctx) {
             await page.selectOption('[data-testid="target"]', 'ssh');
             await page.fill('[data-testid="host"]', 'rd.example.com');
             assertEqual((await stepIds(page)).join(','),
-                'target,hostkey,detect,ports,execute,handover', 'host key must be present for remote');
+                'target,hostkey,detect,tls,ports,execute,handover', 'host key must be present for remote');
             await page.click('[data-testid="next"]');
             assertOk(await visible(page, '[data-testid="pane-hostkey"]'), 'remote stops at the host key');
             await page.click('[data-testid="next"]');
@@ -308,6 +308,7 @@ async function runBody(ctx) {
             await page.click('[data-testid="run-detect"]');
             await wait(page, '[data-plan-step]');
             await page.click('[data-testid="next"]');
+            await page.click('[data-testid="next"]');
             await page.fill('[data-testid="sg-id"]', 'sg-0123456789abcdef0');
             await page.fill('[data-testid="sg-region"]', 'eu-west-1');
             const cmd = await page.textContent('[data-testid="aws-command"]');
@@ -323,6 +324,7 @@ async function runBody(ctx) {
             await page.click('[data-testid="next"]');
             await page.click('[data-testid="run-detect"]');
             await wait(page, '[data-plan-step]');
+            await page.click('[data-testid="next"]');
             await page.click('[data-testid="next"]');
             await page.click('[data-testid="next"]');
             await page.click('[data-testid="run-start"]');
@@ -345,6 +347,7 @@ async function runBody(ctx) {
             await wait(page, '[data-plan-step]');
             await page.click('[data-testid="next"]');
             await page.click('[data-testid="next"]');
+            await page.click('[data-testid="next"]');
             await page.click('[data-testid="run-start"]');
             await wait(page, '[data-step-id="fetch-api"][data-status="failed"]');
             assertOk((await page.textContent('[data-toggle-step="fetch-api"]')).includes('exit 7'),
@@ -363,6 +366,7 @@ async function runBody(ctx) {
             await page.click('[data-testid="next"]');
             await page.click('[data-testid="run-detect"]');
             await wait(page, '[data-plan-step]');
+            await page.click('[data-testid="next"]');
             await page.click('[data-testid="next"]');
             await page.click('[data-testid="next"]');
             await page.click('[data-testid="run-start"]');
@@ -419,6 +423,7 @@ async function runBody(ctx) {
             await page.click('[data-testid="next"]');
             await page.click('[data-testid="run-detect"]');
             await wait(page, '[data-plan-step]');
+            await page.click('[data-testid="next"]');
             await page.click('[data-testid="next"]');
             await page.click('[data-testid="next"]');
             await page.click('[data-testid="run-start"]');
@@ -490,6 +495,7 @@ async function runBody(ctx) {
             await wait(page, '[data-plan-step]');
             await page.click('[data-testid="next"]');
             await page.click('[data-testid="next"]');
+            await page.click('[data-testid="next"]');
             await page.click('[data-testid="run-start"]');
             await wait(page, '[data-step-id="reachability"]');
 
@@ -529,6 +535,188 @@ async function runBody(ctx) {
             await shot(page, 'setup-remember-credential-persisted');
         } finally {
             await page.ctx.close();
+        }
+    });
+
+    // ============================================== FINAL REVIEW, FINDING 1 ==
+    //
+    // THE DEFECT: js/core/tls.js, js/core/provision-plan.js's tls-* steps and
+    // js/features/overview.js's web-client link were all fully built and fully
+    // unit-tested, and NOTHING could reach any of them: planChoicesFor()
+    // hardcoded tlsTier:'none', index.html had no domain/tier/DuckDNS input at
+    // all, and the Overview "Set up TLS" CTA jumped to a step id the wizard did
+    // not have. These checks drive the REAL page through the real TLS step and
+    // assert on what the plan the page actually built contains -- never on a
+    // component's internal state.
+
+    // Reads the plan the page is really holding, exactly as the detect pane
+    // renders it: the step ids in the DOM, not a component property.
+    async function planStepIds(page) {
+        return page.$$eval('[data-plan-step]', (els) => els.map((e) => e.getAttribute('data-plan-step')));
+    }
+
+    // The wizard's own DNS pre-flight runs `getent ahostsv4 <host>` through the
+    // bridge. 203.0.113.10 is DETECTION's public_ip, so this is the "DNS
+    // already points here" answer.
+    const GETENT_OK = '203.0.113.10 STREAM rd.example.com\n203.0.113.10 DGRAM\n';
+    const GETENT_ELSEWHERE = '198.51.100.7  STREAM other.example.com\n';
+    const GETENT_NXDOMAIN = { error: true, message: 'getent: key not found', exit_status: 2 };
+
+    await check("FINDING 1: the wizard's TLS step drives a real Let's Encrypt plan -- " +
+        'the emitted plan carries the tls-* steps and the ports step switches to 443', async () => {
+        await withPage(ctx, { spawn: { 'pilot-exec --detect': DETECTION, 'pilot-exec --run': RUN_OK,
+            'getent ahostsv4': GETENT_OK } }, async (page) => {
+            await page.selectOption('[data-testid="target"]', 'local');
+            await page.click('[data-testid="next"]');
+            await page.click('[data-testid="run-detect"]');
+            await wait(page, '[data-plan-step]');
+
+            const before = await planStepIds(page);
+            assertOk(!before.some((id) => id.indexOf('tls-') === 0),
+                'the default plan is still TLS-free: ' + before.join(','));
+
+            await page.click('[data-testid="next"]');
+            assertOk(await visible(page, '[data-testid="pane-tls"]'), 'the wizard has a TLS step');
+            await page.selectOption('[data-testid="tls-tier"]', 'own');
+            await page.fill('[data-testid="tls-domain"]', 'rd.example.com');
+            assertMatch(await page.textContent('[data-testid="tls-host"]'), /rd\.example\.com/,
+                'the pane names the host the certificate will be requested for');
+            await page.click('[data-testid="next"]');
+            assertOk(await visible(page, '[data-testid="pane-ports"]'), 'a valid domain lets the wizard on');
+
+            // THE proof: the plan the page is holding now really contains the
+            // steps that were unreachable before.
+            await page.click('[data-testid="back"]');
+            await page.click('[data-testid="back"]');
+            const after = await planStepIds(page);
+            for (const id of ['tls-caddy', 'tls-caddyfile', 'tls-reload'])
+                assertOk(after.includes(id), `the plan must contain ${id}, got: ${after.join(',')}`);
+            assertOk(!after.includes('tls-duckdns'), 'the own-domain tier needs no DuckDNS step');
+
+            // The manual script is a rendering of that same plan.
+            await page.click('[data-testid="manual-toggle"]');
+            const script = await page.textContent('[data-testid="manual-script"]');
+            assertMatch(script, /https:\/\/rd\.example\.com \{/, 'the Caddyfile is rendered for the domain');
+
+            // And the ports step follows the tier: 443 and 80 required, and
+            // 21114 no longer offered to the internet.
+            await page.click('[data-testid="next"]');
+            await page.click('[data-testid="next"]');
+            const cloud = await page.textContent('[data-testid="cloud-ports"]');
+            assertMatch(cloud, /443\/tcp/, 'the TLS tier requires 443');
+            assertMatch(cloud, /80\/tcp/, 'ACME HTTP-01 requires 80');
+            assertOk(cloud.indexOf('21114/tcp') < 0,
+                'with TLS the API port is reached through the proxy, not opened: ' + cloud);
+            await shot(page, 'setup-tls-letsencrypt');
+        });
+    });
+
+    await check('FINDING 1: a bare IP can never become a TLS target -- PilotTls.validate() ' +
+        'is still the authority and the wizard will not leave the step', async () => {
+        await withPage(ctx, STUB(RUN_OK), async (page) => {
+            await page.selectOption('[data-testid="target"]', 'local');
+            await page.click('[data-testid="next"]');
+            await page.click('[data-testid="run-detect"]');
+            await wait(page, '[data-plan-step]');
+            await page.click('[data-testid="next"]');
+            await page.selectOption('[data-testid="tls-tier"]', 'own');
+            await page.fill('[data-testid="tls-domain"]', '203.0.113.10');
+            await page.click('[data-testid="next"]');
+            assertOk(await visible(page, '[data-testid="pane-tls"]'), 'a bare IP must not pass');
+            assertMatch(await page.textContent('[data-testid="tls-error"]'), /bare IP address/i,
+                'and it must say why');
+        });
+    });
+
+    await check('FINDING 1: the DuckDNS token reaches the helper on stdin ONLY -- never in an ' +
+        'argv, the DOM, storage, the transcript or the written server record', async () => {
+        const TOKEN = 'DuckSecret-0123456789';
+        await withPage(ctx, { spawn: { 'pilot-exec --detect': DETECTION, 'pilot-exec --run': RUN_OK,
+            'getent ahostsv4': GETENT_OK, chmod: '', chown: '',
+            'find /etc/pilot/servers -maxdepth 1 -type f -name *.json': '/etc/pilot/servers/local.json\n' },
+        files: {} }, async (page) => {
+            await page.selectOption('[data-testid="target"]', 'local');
+            await page.click('[data-testid="next"]');
+            await page.click('[data-testid="run-detect"]');
+            await wait(page, '[data-plan-step]');
+            await page.click('[data-testid="next"]');
+            await page.selectOption('[data-testid="tls-tier"]', 'duckdns');
+            await page.fill('[data-testid="tls-duckdns-sub"]', 'pilot-demo');
+            await page.fill('[data-testid="tls-duckdns-token"]', TOKEN);
+            await page.click('[data-testid="next"]');
+            assertOk(await visible(page, '[data-testid="pane-ports"]'), 'a valid DuckDNS pair lets the wizard on');
+            await page.click('[data-testid="back"]');
+            await page.click('[data-testid="back"]');
+            const ids = await planStepIds(page);
+            for (const id of ['tls-duckdns-token', 'tls-duckdns', 'tls-caddyfile'])
+                assertOk(ids.includes(id), `the plan must contain ${id}, got: ${ids.join(',')}`);
+
+            // The manual script must not print it either.
+            await page.click('[data-testid="manual-toggle"]');
+            const script = await page.textContent('[data-testid="manual-script"]');
+            assertOk(script.indexOf(TOKEN) < 0, 'the manual script must never render the token');
+            assertMatch(script, /DUCKDNS_TOKEN:\?/, 'it asks for the token from the environment instead');
+
+            // detect -> tls -> ports -> execute
+            await page.click('[data-testid="next"]');
+            await page.click('[data-testid="next"]');
+            await page.click('[data-testid="next"]');
+            await page.click('[data-testid="run-start"]');
+            await wait(page, '[data-step-id="reachability"]');
+
+            assertEqual(await credentialLeaked(page, TOKEN, ['tls-duckdns-token']), false,
+                'the DuckDNS token must not reach storage, the DOM, another input or a data-* attribute');
+            const calls = await page.evaluate(() => window.__pilotStub.calls);
+            for (const c of calls) {
+                if (c.kind === 'spawn')
+                    assertOk(c.argv.join(' ').indexOf(TOKEN) < 0,
+                        'the token must never appear in any spawned argv: ' + JSON.stringify(c.argv));
+                if (c.kind === 'replace')
+                    assertOk(String(c.content).indexOf(TOKEN) < 0,
+                        'the token must never be written to ' + c.path);
+            }
+            const runCall = calls.filter((c) => c.kind === 'spawn').find((c) => c.argv.indexOf('--run') >= 0);
+            assertOk(runCall.input.indexOf(TOKEN) >= 0,
+                'it legitimately travels inside the envelope on stdin');
+            const envelope = JSON.parse(runCall.input);
+            const staged = envelope.steps.filter((s) => s.id === 'tls-duckdns-token')[0];
+            assertOk(staged && staged.secret === true, 'and only inside a step marked secret');
+            assertEqual(staged.write.mode, '0600');
+            for (const step of envelope.steps)
+                assertOk(step.argv.join(' ').indexOf(TOKEN) < 0,
+                    'no step argv may carry the token: ' + step.id);
+            const transcript = await page.textContent('[data-testid="transcript"]');
+            assertOk(transcript.indexOf(TOKEN) < 0, 'the transcript must not carry the token');
+            await shot(page, 'setup-tls-duckdns');
+        });
+    });
+
+    await check('FINDING 1: the spec §6.1 DNS pre-flight blocks the run before ACME is invoked, ' +
+        'so no rate-limit attempt is burnt', async () => {
+        for (const [label, getent] of [['pointing elsewhere', GETENT_ELSEWHERE], ['no A record', GETENT_NXDOMAIN]]) {
+            await withPage(ctx, { spawn: { 'pilot-exec --detect': DETECTION, 'pilot-exec --run': RUN_OK,
+                'getent ahostsv4': getent } }, async (page) => {
+                await page.selectOption('[data-testid="target"]', 'local');
+                await page.click('[data-testid="next"]');
+                await page.click('[data-testid="run-detect"]');
+                await wait(page, '[data-plan-step]');
+                await page.click('[data-testid="next"]');
+                await page.selectOption('[data-testid="tls-tier"]', 'own');
+                await page.fill('[data-testid="tls-domain"]', 'rd.example.com');
+                await page.click('[data-testid="tls-check-dns"]');
+                await waitForText(page, '[data-testid="tls-preflight"]', (t) => t.length > 0, 'preflight');
+                assertEqual(await page.getAttribute('[data-testid="tls-preflight"]', 'data-kind'),
+                    'TLS_DNS_MISMATCH', `${label}: the pre-flight must name the mismatch`);
+
+                await page.click('[data-testid="next"]');
+                await page.click('[data-testid="next"]');
+                await page.click('[data-testid="run-start"]');
+                await waitForText(page, '[data-testid="detect-error"]', (t) => t.length > 0, 'run error');
+                const spawned = (await page.evaluate(() => window.__pilotStub.calls))
+                    .filter((c) => c.kind === 'spawn' && c.argv.indexOf('--run') >= 0);
+                assertEqual(spawned.length, 0,
+                    `${label}: pilot-exec --run must never be spawned when DNS does not point here`);
+            });
         }
     });
 
@@ -620,6 +808,7 @@ async function runBody(ctx) {
             await wait(page, '[data-plan-step]');
             await page.click('[data-testid="next"]');
             await page.click('[data-testid="next"]');
+            await page.click('[data-testid="next"]');
             await page.click('[data-testid="run-start"]');
             await wait(page, '[data-step-id="reachability"][data-status="ok"]');
             await page.click('[data-testid="next"]');
@@ -681,6 +870,78 @@ async function runBody(ctx) {
                 'the rendered row is not the device this scenario\'s own stub attached to /admin/peer');
 
             await shot(page, 'setup-registers-server-e2e');
+        } finally {
+            await page.ctx.close();
+        }
+    });
+
+    // The other half of FINDING 1: js/features/overview.js's web client could
+    // only ever be disabled, because no shipped path could record a server with
+    // TLS. This drives the whole loop in one page -- wizard TLS step, real run,
+    // real registration, then Overview -- and asserts the link is enabled with
+    // the exact https address, plus that the CTA on a NON-TLS server actually
+    // lands on the wizard's TLS step (it was a no-op with a listener before).
+    await check('FINDING 1 (end to end): a TLS install records the domain and Overview\'s ' +
+        'web client link becomes enabled, and "Set up TLS" really opens the TLS step', async () => {
+        const stub = {
+            spawn: {
+                'pilot-exec --detect': DETECTION, 'pilot-exec --run': RUN_OK,
+                'getent ahostsv4': '203.0.113.10 STREAM rd.example.com\n',
+                'find /etc/pilot/servers -maxdepth 1 -type f -name *.json':
+                    '/etc/pilot/servers/local.json\n'
+            },
+            files: {},
+            http: REGISTERS_STUB.http
+        };
+        const page = await ctx.open(ctx.browser, stub);
+        page.setDefaultTimeout(WAIT);
+        try {
+            // Before any install: no server has TLS, so the link is disabled and
+            // its CTA is the only route forward.
+            await page.click('[data-tab="overview"]');
+            await wait(page, '#pilot-overview [data-test="web-client-disabled"]');
+            assertMatch(await page.textContent('#pilot-overview [data-test="web-client-reason"]'),
+                /TLS is not configured/i, 'the reason is shown, not just a dead button');
+            await page.click('#pilot-overview [data-test="web-client-fix"]');
+            assertOk(await visible(page, '[data-testid="pane-tls"]'),
+                'the "Set up TLS" CTA must land on the wizard\'s TLS step');
+
+            // Now actually do it. Back out of the TLS step the CTA jumped to
+            // (tls -> detect -> target) and drive the wizard properly.
+            await page.click('[data-testid="back"]');
+            await page.click('[data-testid="back"]');
+            await page.selectOption('[data-testid="target"]', 'local');
+            await page.click('[data-testid="next"]');
+            await page.click('[data-testid="run-detect"]');
+            await wait(page, '[data-plan-step]');
+            await page.click('[data-testid="next"]');
+            await page.selectOption('[data-testid="tls-tier"]', 'own');
+            await page.fill('[data-testid="tls-domain"]', 'rd.example.com');
+            await page.click('[data-testid="next"]');
+            await page.click('[data-testid="next"]');
+            await page.click('[data-testid="run-start"]');
+            await wait(page, '[data-step-id="reachability"][data-status="ok"]');
+            await page.click('[data-testid="next"]');
+            assertEqual(await page.getAttribute('[data-testid="handover-status"]', 'data-status'), 'ok');
+
+            // FINDING 2's half: the registration outcome is now RENDERED.
+            assertOk(await visible(page, '[data-testid="registered"]'),
+                'the handover must say which server it registered');
+            assertMatch(await page.textContent('[data-testid="registered"]'), /local/,
+                'and name it');
+
+            // The record itself carries the TLS facts the Overview link needs.
+            const record = await page.evaluate(() => window.PilotServers.read('local'));
+            assertEqual(record.tls, true, 'a TLS install must record tls:true');
+            assertEqual(record.domain, 'rd.example.com', 'and the exact certified hostname');
+
+            await page.click('[data-tab="overview"]');
+            await page.click('#pilot-overview [data-test="refresh"]');
+            await page.waitForFunction(() => {
+                const a = document.querySelector('#pilot-overview [data-test="web-client-link"]');
+                return !!a && a.getAttribute('href') === 'https://rd.example.com/';
+            }, null, { timeout: WAIT });
+            await shot(page, 'overview-web-client-enabled');
         } finally {
             await page.ctx.close();
         }

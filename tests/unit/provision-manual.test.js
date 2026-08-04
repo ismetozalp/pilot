@@ -195,19 +195,45 @@ test('a write step with dangerous content ($(...), backticks, $VAR) is quoted sa
     assert.ok(out.indexOf("<<'PILOT_EOF") !== -1, 'delimiter is quoted');
 });
 
-test('a secret DuckDNS step redacts the token, never emitting it in cleartext', () => {
-    // DuckDNS step has secret: true and the token in argv
+test('the DuckDNS token write step renders from $DUCKDNS_TOKEN, never in cleartext', () => {
+    // The token no longer travels in an argv at all (that was a /proc/<pid>/cmdline
+    // leak on the target); it is a secret WRITE step, whose content the ordinary
+    // heredoc path would otherwise print verbatim into an artifact meant to be
+    // pasted somewhere. This is the enrolled allow-path for that.
     const out = P.manualScript(rawPlan([
-        rawStep({ id: 'tls-duckdns', argv: ['curl', '-fsS', 'https://www.duckdns.org/update?domains=myhost&token=SECRET123ABC&ip='], secret: true })
+        rawStep({ id: 'tls-duckdns-token', secret: true,
+            write: { path: '/run/pilot/duckdns.token', mode: '0600', owner: 'root:root',
+                content: 'SECRET123ABC\n' } })
     ]));
-    // The literal token must NOT appear anywhere
     assert.equal(out.indexOf('SECRET123ABC'), -1, 'literal token does not appear');
-    // Placeholder must be present
-    assert.ok(out.indexOf('${DUCKDNS_TOKEN}') !== -1, 'placeholder present');
-    // Env var requirement must be present (:? means fail loudly if unset)
-    assert.ok(out.indexOf('DUCKDNS_TOKEN:?') !== -1, 'env var requirement present');
-    // Domain must be assigned to a variable
-    assert.ok(out.indexOf('PILOT_DUCKDNS_DOMAINS=') !== -1, 'domain variable present');
+    assert.equal(out.indexOf('<<'), -1, 'a secret write step never renders a heredoc of its content');
+    assert.ok(out.indexOf('DUCKDNS_TOKEN:?') !== -1, 'unset token must fail loudly, naming the variable');
+    assert.ok(out.indexOf('"$DUCKDNS_TOKEN"') !== -1, 'the value comes from the environment, quoted');
+    assert.ok(out.indexOf('umask 077') !== -1, 'the file is never briefly world-readable');
+    assert.ok(out.indexOf('chmod 0600 /run/pilot/duckdns.token') !== -1, 'mode is pinned');
+    assert.ok(out.indexOf('chown root:root /run/pilot/duckdns.token') !== -1, 'owner is pinned');
+});
+
+test('an UNENROLLED secret write step is suppressed, never printed', () => {
+    // Fail-closed default: enrolment in WRITE_SAFE_STEPS is per id and explicit,
+    // so a future secret write step cannot leak merely by existing.
+    const out = P.manualScript(rawPlan([
+        rawStep({ id: 'some-new-secret-write', secret: true,
+            write: { path: '/etc/pilot/whatever', mode: '0600', owner: 'root:root',
+                content: 'TOPSECRET-VALUE-9999\n' } })
+    ]));
+    assert.equal(out.indexOf('TOPSECRET-VALUE-9999'), -1, 'an unenrolled secret write must not print');
+    assert.ok(out.indexOf('MANUAL STEP') !== -1, 'marked as manual step');
+    assert.ok(out.indexOf('shareable script') !== -1, 'warned about sharing');
+});
+
+test('a NON-secret write step still renders its content as a heredoc', () => {
+    const out = P.manualScript(rawPlan([
+        rawStep({ id: 'configure', write: { path: '/etc/x.yaml', mode: '0640', owner: 'root:root',
+            content: 'key: value\n' } })
+    ]));
+    assert.ok(out.indexOf('key: value') !== -1, 'ordinary config content is still rendered');
+    assert.ok(out.indexOf("<<'PILOT_EOF") !== -1, 'via the quoted heredoc');
 });
 
 test('an idempotency-checked step is truly skipped on re-run (resumable script)', () => {

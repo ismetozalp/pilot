@@ -43,6 +43,31 @@
         </ul>
     </div>
 
+    <!-- The control-plane strip. NOT the "global something went wrong" banner
+         spec §7.2 forbids: every one of these is a fact about the shell's own
+         wiring (which server is live, whether its token file could be read,
+         whether the version probe answered, whether the active-server choice
+         could be persisted), and no per-surface alert reports any of them —
+         they were all write-only state in js/app.js until now. A surface's own
+         fetch failure still belongs to that surface alone. -->
+    <div class="pilot-status" data-testid="pilot-status">
+        <p class="small text-secondary mb-1" data-testid="active-server" x-show="apiReady">
+          Connected to <span x-text="activeServerId"></span>.</p>
+        <div class="alert alert-warning py-1" data-testid="token-error" x-show="tokenError">
+          The stored API token for this server exists but could not be read, so Pilot is
+          talking to it anonymously:
+          <span x-text="tokenError ? (tokenError.message || String(tokenError)) : ''"></span>
+        </div>
+        <div class="alert alert-warning py-1" data-testid="compat-error" x-show="compatError">
+          Pilot could not confirm this server's version is supported:
+          <span x-text="compatError ? (compatError.message || String(compatError)) : ''"></span>
+        </div>
+        <div class="alert alert-warning py-1" data-testid="switch-error" x-show="switchError">
+          The active-server choice could not be saved, so it will not survive a reload:
+          <span x-text="switchError ? (switchError.message || String(switchError)) : ''"></span>
+        </div>
+    </div>
+
     <div class="pilot-body">
         <!-- One mount per surface. Each surface reports its own failure into
              errors[<tab>]; there is deliberately no global error banner (spec §7.2). -->
@@ -118,6 +143,51 @@
             <p class="text-danger mb-0" data-testid="detect-error" x-text="error ? error.message : ''"></p>
           </div>
 
+          <!-- TLS & domain (spec §6.1). The tier vocabulary, the validation and
+               the DNS pre-flight all come from js/core/tls.js through the
+               component — this pane invents no second model. The DuckDNS token
+               is a credential: type="password", bound to component state only,
+               never persisted and never put in an argv (it reaches the target
+               inside the plan's own 0600 secret write step, on stdin). -->
+          <div x-show="isStep('tls')" data-testid="pane-tls">
+            <label class="form-label" for="pl-tls-tier">How should this server be reached over TLS?</label>
+            <select class="form-select mb-2" id="pl-tls-tier" data-testid="tls-tier" x-model="choices.tlsTier">
+              <template x-for="t in tlsTiers()" :key="t">
+                <option :value="t" x-text="tlsTierLabel(t)"></option>
+              </template>
+            </select>
+
+            <div x-show="choices.tlsTier === 'own'">
+              <label class="form-label" for="pl-tls-domain">Domain (its DNS must already point at this server)</label>
+              <input class="form-control mb-1" id="pl-tls-domain" data-testid="tls-domain"
+                     placeholder="rustdesk.example.com" x-model="choices.domain">
+            </div>
+
+            <div x-show="choices.tlsTier === 'sslip'">
+              <p class="mb-1" data-testid="tls-detected-ip">
+                Detected public IP: <span x-text="detectedIp() || 'none'"></span></p>
+            </div>
+
+            <div x-show="choices.tlsTier === 'duckdns'">
+              <label class="form-label" for="pl-tls-dd-sub">DuckDNS subdomain (just the part before .duckdns.org)</label>
+              <input class="form-control mb-1" id="pl-tls-dd-sub" data-testid="tls-duckdns-sub"
+                     placeholder="pilot-demo" x-model="choices.duckdnsSub">
+              <label class="form-label" for="pl-tls-dd-token">DuckDNS account token</label>
+              <input class="form-control mb-1" id="pl-tls-dd-token" data-testid="tls-duckdns-token"
+                     type="password" autocomplete="off" x-model="choices.duckdnsToken">
+            </div>
+
+            <p class="text-secondary mb-1" data-testid="tls-advisory" x-show="tlsAdvisory()"
+               x-text="tlsAdvisory()"></p>
+            <p class="mb-1" data-testid="tls-host" x-show="tlsHost()">
+              Certificate will be requested for <span x-text="tlsHost()"></span>.</p>
+            <button class="btn btn-outline-secondary btn-sm mb-2" data-testid="tls-check-dns"
+                    x-show="tlsOn()" @click="checkDns()">Check DNS now</button>
+            <p class="mb-1" data-testid="tls-preflight" :data-kind="preflight ? preflight.kind : ''"
+               x-show="preflight" x-text="preflight ? preflight.message : ''"></p>
+            <p class="text-danger mb-0" data-testid="tls-error" x-text="errors.tls || ''"></p>
+          </div>
+
           <div x-show="isStep('ports')" data-testid="pane-ports">
             <h5>Pilot will open these on the host firewall</h5>
             <ul data-testid="host-ports"><template x-for="p in hostPorts()" :key="p.port + p.proto">
@@ -166,6 +236,38 @@
               <template x-for="b in (handoverResult ? handoverResult.blocked : [])" :key="b.port + b.proto">
                 <li x-text="b.port + '/' + b.proto + ' (' + b.scope + ')'"></li></template>
             </ul>
+
+            <!-- Registration outcome (task 34). registerServer() writes the
+                 server record every management surface reads; without this the
+                 wizard showed a green handover while PilotServers.write() had
+                 rejected and every console tab stayed empty with no reason. -->
+            <p class="text-success mb-1" data-testid="registered" x-show="registered">
+              Registered as <span x-text="registeredServerId"></span> — this is now the active server.</p>
+            <div class="alert alert-danger" data-testid="registration-error" x-show="registrationError">
+              <p class="mb-1">This server could not be registered, so the other tabs will stay empty:
+                <span data-testid="registration-error-message"
+                      x-text="registrationError ? registrationError.message : ''"></span></p>
+              <p class="mb-1 fw-semibold" data-testid="registration-remediation"
+                 x-text="registrationError ? (registrationError.remediation || '') : ''"></p>
+              <button class="btn btn-sm btn-outline-dark" data-testid="registration-retry"
+                      @click="registerServer()">Try registering again</button>
+            </div>
+
+            <!-- A failed TLS step, classified by PilotTls.classifyAcmeFailure()
+                 into a rate limit / DNS mismatch / generic ACME failure, because
+                 those need three different next actions. -->
+            <div class="alert alert-warning" data-testid="tls-failure" x-show="tlsFailure"
+                 :data-kind="tlsFailure ? tlsFailure.kind : ''">
+              <span x-text="tlsFailure ? tlsFailure.message : ''"></span>
+            </div>
+
+            <!-- Day-2 credential outcome: "remember" that silently did not save
+                 is the same class of lie as a silent registration failure. -->
+            <p class="text-success mb-1" data-testid="credential-saved" x-show="credentialSaved">
+              The SSH credential was stored for day-2 operations.</p>
+            <div class="alert alert-warning" data-testid="credential-error" x-show="credentialSaveError">
+              <span x-text="credentialSaveError ? credentialSaveError.message : ''"></span>
+            </div>
             <input class="form-control mb-1" data-testid="new-password" type="password" x-model="pw.password">
             <input class="form-control mb-1" data-testid="confirm-password" type="password" x-model="pw.confirm">
             <button class="btn btn-primary" data-testid="finish" @click="finish()">Change password and finish</button>

@@ -55,6 +55,20 @@ body {
     border-bottom: 1px solid var(--bs-border-color, rgba(0, 0, 0, 0.15));
 }
 
+/* The control-plane strip between the header and the surfaces: which server is
+   wired, and the shell-level wiring failures (unreadable token file, failed
+   version probe, unpersisted server choice) that no per-surface alert reports.
+   Fixed height contribution of zero when everything is fine — every child is
+   x-show'd — so it costs the surfaces no room on a healthy page. */
+.pilot-status {
+    flex: 0 0 auto;
+    padding: 0 var(--pl-gutter);
+}
+
+.pilot-status:empty {
+    padding: 0;
+}
+
 .pilot-body {
     flex: 1 1 auto;
     overflow: auto;

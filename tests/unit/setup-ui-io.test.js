@@ -275,7 +275,7 @@ test('a localhost wizard never lands on the host-key step', () => {
     c.choices.target = 'local';
     assert.equal(c.next(), true);
     assert.equal(c.step, 'detect');
-    assert.deepEqual(c.steps(), ['target', 'detect', 'ports', 'execute', 'handover']);
+    assert.deepEqual(c.steps(), ['target', 'detect', 'tls', 'ports', 'execute', 'handover']);
 });
 
 test('the wizard will not leave the host-key step until the fingerprint is confirmed', () => {
@@ -612,4 +612,127 @@ test('copyTranscript returns false rather than claiming a copy with no clipboard
     assert.equal(await c.copyTranscript(), false);
     assert.equal(c.copied, false);
     assert.equal(typeof c.transcript(), 'string');
+});
+
+// ============================================ FINAL REVIEW, FINDING 1: DNS
+//
+// Spec §6.1: "before invoking ACME, Pilot resolves the chosen hostname and
+// compares it to the server's public IP ... no rate-limit attempt is burnt".
+// PilotTls.dnsPreflight() had ZERO production references before this; these
+// prove the wizard both calls it and acts on what it says.
+
+function tlsComponent(extra) {
+    const c = UI.pilotSetupUi();
+    c.choices.target = 'local';
+    c.detection = DETECTION;
+    c.plan = { target: 'local', host: null, arch: 'amd64', warnings: [], steps: [] };
+    Object.assign(c.choices, extra || {});
+    return c;
+}
+
+test('checkDns compares the real resolver answer against the target public IP', async () => {
+    const fake = fakeCockpit({ spawn: { 'getent ahostsv4': '203.0.113.10 STREAM rd.example.com\n' },
+        noStream: true });
+    await withCockpit(fake, async () => {
+        const c = tlsComponent({ tlsTier: 'own', domain: 'rd.example.com' });
+        const pf = await c.checkDns();
+        assert.equal(pf.ok, true, pf.message);
+        assert.equal(pf.kind, 'OK');
+        assert.equal(pf.host, 'rd.example.com');
+        const call = fake.calls.find((x) => x.argv && x.argv[0] === 'getent');
+        assert.ok(call, 'a real lookup must actually be spawned');
+        assert.deepEqual(call.argv, ['getent', 'ahostsv4', 'rd.example.com']);
+    });
+});
+
+test('start() REFUSES to run when the name resolves somewhere else — no ACME attempt is burnt', async () => {
+    const fake = fakeCockpit({ spawn: { 'getent ahostsv4': '198.51.100.7 STREAM x\n',
+        '--run': RUN_LINES.join('\n') + '\n' }, noStream: true });
+    await withCockpit(fake, async () => {
+        const c = tlsComponent({ tlsTier: 'own', domain: 'rd.example.com' });
+        assert.equal(await c.start(), false);
+        assert.equal(c.error.kind, 'TLS_DNS_MISMATCH');
+        assert.match(c.error.message, /198\.51\.100\.7/);
+        assert.equal(fake.calls.filter((x) => x.argv && x.argv.join(' ').indexOf('--run') >= 0).length, 0,
+            'pilot-exec --run must never be spawned when DNS does not point here');
+        assert.equal(c.busy, false, 'the wizard must not be left stuck busy');
+    });
+});
+
+test('start() REFUSES on a name with no A record at all (getent exit status 2)', async () => {
+    const fake = fakeCockpit({ spawn: { 'getent ahostsv4': { error: true, exit_status: 2, message: 'not found' },
+        '--run': RUN_LINES.join('\n') + '\n' }, noStream: true });
+    await withCockpit(fake, async () => {
+        const c = tlsComponent({ tlsTier: 'own', domain: 'rd.example.com' });
+        assert.equal(await c.start(), false);
+        assert.equal(c.error.kind, 'TLS_DNS_MISMATCH');
+        assert.match(c.preflight.message, /no A record yet/i);
+        assert.equal(fake.calls.filter((x) => x.argv && x.argv.join(' ').indexOf('--run') >= 0).length, 0);
+    });
+});
+
+test('a pre-flight that could not RUN never blocks — "not checked" is not evidence of a problem', async () => {
+    // getent missing, or any failure other than "key not found": nothing may be
+    // concluded, so the run proceeds and says the check did not happen.
+    const fake = fakeCockpit({ spawn: { 'getent ahostsv4': { error: true, exit_status: 127, message: 'not found' },
+        '--run': RUN_LINES.join('\n') + '\n' }, noStream: true });
+    await withCockpit(fake, async () => {
+        const c = tlsComponent({ tlsTier: 'own', domain: 'rd.example.com' });
+        await c.start();
+        assert.equal(c.preflight.checked, false);
+        assert.match(c.preflight.message, /not pre-flighted/i);
+        assert.equal(fake.calls.filter((x) => x.argv && x.argv.join(' ').indexOf('--run') >= 0).length, 1,
+            'the run still goes ahead');
+    });
+});
+
+test('no TLS tier means no lookup at all', async () => {
+    const fake = fakeCockpit({ spawn: { '--run': RUN_LINES.join('\n') + '\n' }, noStream: true });
+    await withCockpit(fake, async () => {
+        const c = tlsComponent({ tlsTier: 'none' });
+        await c.start();
+        assert.equal(c.preflight, null);
+        assert.equal(fake.calls.filter((x) => x.argv && x.argv[0] === 'getent').length, 0);
+    });
+});
+
+test('a failed tls step is classified for the handover pane, not left as "exit 1"', async () => {
+    const lines = [
+        '{"t":"run-start","run_id":"20260803T204500Z","transport":"local","steps":1}',
+        '{"t":"step-start","id":"tls-reload","title":"Enable Caddy","cmd":"systemctl"}',
+        '{"t":"output","id":"tls-reload","stream":"stderr","line":"acme: too many certificates already issued"}',
+        '{"t":"step-end","id":"tls-reload","status":"failed","exit":1,"ms":10}',
+        '{"t":"run-end","status":"failed","kind":"GENERIC"}'
+    ].join('\n') + '\n';
+    const fake = fakeCockpit({ spawn: { 'getent ahostsv4': '203.0.113.10 STREAM x\n', '--run': lines },
+        noStream: true });
+    await withCockpit(fake, async () => {
+        const c = tlsComponent({ tlsTier: 'own', domain: 'rd.example.com' });
+        await c.start();
+        assert.ok(c.tlsFailure, 'a failed tls-* step must produce a classified verdict');
+        assert.equal(c.tlsFailure.kind, 'TLS_RATE_LIMITED');
+        assert.equal(c.tlsFailure.stepId, 'tls-reload');
+    });
+});
+
+test('the TLS step will not be left until PilotTls accepts the choice, and the plan is rebuilt when it is', () => {
+    const c = UI.pilotSetupUi();
+    c.choices.target = 'local';
+    c.detection = DETECTION;
+    c.step = 'tls';
+    c.choices.tlsTier = 'own';
+    c.choices.domain = '203.0.113.10';
+    assert.equal(c.next(), false, 'a bare IP must not pass');
+    assert.equal(c.step, 'tls');
+    assert.match(c.errors.tls, /bare IP address/i);
+
+    c.choices.domain = 'rd.example.com';
+    assert.equal(c.next(), true);
+    assert.equal(c.step, 'ports');
+    const ids = c.plan.steps.map((s) => s.id);
+    for (const id of ['tls-caddy', 'tls-caddyfile', 'tls-reload'])
+        assert.ok(ids.includes(id), id + ' missing from the rebuilt plan: ' + ids.join(','));
+    const ports = c.required.map((r) => r.port + '/' + r.proto);
+    assert.ok(ports.includes('443/tcp'), 'the ports step must now require 443: ' + ports.join(','));
+    assert.ok(ports.includes('80/tcp'), 'and 80 for the ACME challenge');
 });

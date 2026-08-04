@@ -27,11 +27,31 @@
         return underNode ? require('../core/servers.js') : null;
     }
 
-    const STEP_IDS = ['target', 'hostkey', 'detect', 'ports', 'execute', 'handover'];
+    // js/core/tls.js owns every TLS decision — the tier vocabulary, domain
+    // validation, the DNS pre-flight comparison and the ACME failure
+    // classification. This module collects input and calls it; it never
+    // re-implements any of that (a second definition of "is this a certifiable
+    // domain" is exactly the divergence js/features/overview.js was carrying).
+    // A live lookup rather than a const captured at load, for the same reason
+    // servers() below is: a test can substitute a fake, and index.html loads
+    // js/core/tls.js well before this file (C7 order).
+    function tls() {
+        if (root.PilotTls) return root.PilotTls;
+        return underNode ? require('../core/tls.js') : null;
+    }
+
+    // The TLS step sits between detect and ports because BOTH of the things it
+    // feeds only exist once the other two have run: the sslip tier needs the
+    // public IP that --detect reports, and the ports step must list 80/443 (and
+    // must NOT list 21114 as internet-facing) only when a tier was actually
+    // chosen. Visible for local and ssh alike — a localhost install needs TLS
+    // exactly as much as a remote one.
+    const STEP_IDS = ['target', 'hostkey', 'detect', 'tls', 'ports', 'execute', 'handover'];
     const STEP_TITLES = {
         target: 'Target',
         hostkey: 'Host key',
         detect: 'Detection & plan',
+        tls: 'TLS & domain',
         ports: 'Ports',
         execute: 'Execute',
         handover: 'Handover'
@@ -76,10 +96,22 @@
             choices: {
                 target: 'local', host: '', port: 22, user: 'root',
                 auth: 'agent', password: '', pem: '', remember: false,
-                tls: 'skip', domain: ''
+                // The TLS step's fields. tlsTier is one of PilotTls.TIERS
+                // verbatim — never a parallel vocabulary. duckdnsToken is a
+                // CREDENTIAL: it lives here for exactly as long as the wizard is
+                // open, travels to pilot-exec only inside the plan's secret
+                // write step (on stdin), and is never persisted, never recorded
+                // in <id>.json and never put in an argv.
+                tlsTier: 'none', domain: '', duckdnsSub: '', duckdnsToken: ''
             },
             hostkey: null,
             detection: null,
+            // The result of the spec §6.1 DNS pre-flight: resolve the chosen
+            // hostname and compare it to the target's public IP BEFORE ACME is
+            // invoked, so "DNS doesn't point here yet" is reported as itself
+            // instead of as an opaque ACME failure that also burnt a
+            // rate-limit attempt. null until a check has actually run.
+            preflight: null,
             plan: null,
             required: [],
             firewall: 'none',
@@ -143,6 +175,111 @@
             ? detail.step : null;
         if (id && visibleSteps(state).indexOf(id) !== -1) return id;
         return state && typeof state.step === 'string' ? state.step : STEP_IDS[0];
+    }
+
+    // ------------------------------------------------------------ step: tls
+    //
+    // Pure. Everything below hands js/core/tls.js its OWN choices shape and
+    // returns what it said; none of it re-decides anything tls.js decides.
+
+    // The C13 choices slice tls.js reads: { tlsTier, domain, duckdns }. Built
+    // from the wizard's flat fields so the wizard never has to store a nested
+    // object Alpine would have to bind through.
+    function tlsChoices(choices) {
+        const c = (choices && typeof choices === 'object') ? choices : {};
+        const tier = str(c.tlsTier) || 'none';
+        return {
+            tlsTier: tier,
+            domain: tier === 'own' ? str(c.domain) : null,
+            duckdns: tier === 'duckdns'
+                ? { subdomain: str(c.duckdnsSub), token: str(c.duckdnsToken) } : null
+        };
+    }
+
+    // The detection slice tls.js reads. Only the public IP matters to it.
+    function tlsDetection(detection) {
+        const d = (detection && typeof detection === 'object') ? detection : {};
+        return { public_ip: str(d.public_ip) };
+    }
+
+    // Pure. { ok, tier, host, message } straight from PilotTls.validate(), or a
+    // safe "the TLS module is not loaded" refusal — never an invented verdict.
+    // tier 'none' is always ok, which is what makes TLS opt-in rather than a
+    // wall in front of every install.
+    function validateTls(choices, detection) {
+        const T = tls();
+        if (!T || typeof T.validate !== 'function') {
+            return { ok: false, tier: '', host: '', kind: 'GENERIC',
+                message: 'The TLS module is not loaded, so a TLS tier cannot be validated. ' +
+                    'Choose "No TLS" to continue.' };
+        }
+        return T.validate(tlsChoices(choices), tlsDetection(detection));
+    }
+
+    // Pure. The hostname the chosen tier will certify, or '' — used to
+    // pre-flight DNS, to fill the ports step's advisory, and to record the
+    // domain on the server record after a successful run.
+    function tlsHostFor(choices, detection) {
+        const T = tls();
+        if (!T || typeof T.hostFor !== 'function') return '';
+        return str(T.hostFor(tlsChoices(choices), tlsDetection(detection)));
+    }
+
+    // Pure. The one-line caveat tls.js attaches to a tier (the sslip rate-limit
+    // bucket in particular), shown in the UI rather than buried (spec §6.1).
+    // The human label for each of PilotTls.TIERS. The ids are tls.js's own and
+    // are never renamed here; this is only what the <select> shows.
+    const TIER_LABELS = {
+        none: 'No TLS — the web client stays disabled',
+        own: "My own domain — Let's Encrypt issues the certificate",
+        sslip: "Automatic sslip.io hostname — no DNS setup, shared Let's Encrypt limit",
+        duckdns: 'DuckDNS — free subdomain, needs an account token'
+    };
+
+    function tlsTierLabel(id) {
+        const k = str(id);
+        return Object.prototype.hasOwnProperty.call(TIER_LABELS, k) ? TIER_LABELS[k] : k;
+    }
+
+    function tlsAdvisory(tier) {
+        const T = tls();
+        return (T && typeof T.advisory === 'function') ? str(T.advisory(tier)) : '';
+    }
+
+    // Pure. Turns a finished exec into an ACME verdict, or null when no TLS
+    // step failed. classifyAcmeFailure() is what maps the helper's own output
+    // onto a C6 kind (TLS_RATE_LIMITED / TLS_DNS_MISMATCH / TLS_ACME_FAILED) so
+    // the handover pane can say "Let's Encrypt rate-limited this name" instead
+    // of "step tls-reload exited 1".
+    const ACME_MESSAGE = {
+        TLS_RATE_LIMITED: "Let's Encrypt rate-limited this name, so no certificate was issued. " +
+            'Wait for the limit to reset, or use your own domain or DuckDNS, which have their ' +
+            'own rate-limit buckets.',
+        TLS_DNS_MISMATCH: 'The certificate could not be issued because DNS for this name does not ' +
+            'point at this server. Fix the record and run setup again.',
+        TLS_ACME_FAILED: 'The certificate could not be issued. The TLS step\'s output above has the ' +
+            'reason; everything else on this server was still provisioned.'
+    };
+
+    function acmeFailureFrom(exec) {
+        const T = tls();
+        const e = (exec && typeof exec === 'object') ? exec : blankExec();
+        const steps = Array.isArray(e.steps) ? e.steps : [];
+        for (let i = 0; i < steps.length; i++) {
+            const s = steps[i];
+            if (str(s.id).indexOf('tls-') !== 0 || s.status !== 'failed') continue;
+            const lines = Array.isArray(s.lines) ? s.lines : [];
+            const text = lines.map(function (l) { return str(l.text); }).join('\n');
+            const kind = (T && typeof T.classifyAcmeFailure === 'function')
+                ? T.classifyAcmeFailure(text) : 'TLS_ACME_FAILED';
+            return {
+                stepId: s.id,
+                kind: kind,
+                message: Object.prototype.hasOwnProperty.call(ACME_MESSAGE, kind)
+                    ? ACME_MESSAGE[kind] : ACME_MESSAGE.TLS_ACME_FAILED
+            };
+        }
+        return null;
     }
 
     // --------------------------------------------------- day-2 credential
@@ -285,20 +422,22 @@
     // Pure. Builds the exact object registerServer() hands to
     // PilotServers.write() — a PilotServers.normalizeRecord()-compatible
     // shape, never a secret (writeSshCredential() is the only thing that ever
-    // touches a credential, in a separate 0600 file). `existing` is the
-    // record already on disk under this same id, or null on a first
-    // provision. Re-provisioning the same target must UPDATE that record in
-    // place rather than create a duplicate (there is only ever one id per
-    // target, by construction of idForChoices()) while PRESERVING whatever
-    // this wizard does not itself collect: domain and tls are not gathered by
-    // any step of this wizard yet (see planChoicesFor()'s own comment — no
-    // domain/DuckDNS input exists to make TLS safe to default on), so an
-    // existing record's own values are carried forward untouched rather than
-    // being clobbered by a decision this run never actually made; a brand
-    // new record gets the same "off" defaults PilotServers.normalizeRecord()
-    // itself would apply. createdAt is likewise preserved across re-runs.
-    // `nowIso` is passed in (never read from the clock here) so this stays a
-    // pure function of its inputs.
+    // touches a credential, in a separate 0600 file; the DuckDNS token is
+    // never persisted at all — Caddy renews over HTTP-01, so nothing needs it
+    // after the record is pointed here). `existing` is the record already on
+    // disk under this same id, or null on a first provision. Re-provisioning
+    // the same target must UPDATE that record in place rather than create a
+    // duplicate (there is only ever one id per target, by construction of
+    // idForChoices()) while PRESERVING whatever this run did not itself
+    // decide. tls/domain ARE decided here now that the wizard has a TLS step:
+    // a run that chose a tier records tls:true and the exact hostname that
+    // tier certifies, which is what makes js/features/overview.js's web-client
+    // link become enabled. A run that chose 'none' carries an existing
+    // record's values forward untouched rather than clobbering them — Pilot
+    // does not tear down a TLS setup it merely skipped this time round.
+    // createdAt is likewise preserved across re-runs. `nowIso` is passed in
+    // (never read from the clock here) so this stays a pure function of its
+    // inputs.
     function recordForRegistration(state, existing, nowIso) {
         const s = (state && typeof state === 'object') ? state : {};
         const c = (s.choices && typeof s.choices === 'object') ? s.choices : {};
@@ -309,13 +448,19 @@
         const rawPort = c.port;
         const sshPort = (remote && typeof rawPort === 'number' && isFinite(rawPort) &&
             Math.floor(rawPort) === rawPort) ? Math.floor(rawPort) : 22;
+        // Gated on validate().ok, exactly like provision-plan.js's own TLS
+        // branch: a tier that was selected but never validated must not be
+        // recorded as working TLS.
+        const tlsOk = str(c.tlsTier) !== '' && str(c.tlsTier) !== 'none' &&
+            validateTls(c, s.detection).ok === true;
+        const tlsHost = tlsOk ? tlsHostFor(c, s.detection) : '';
         return {
             id: id,
             host: remote ? str(c.host) : 'localhost',
             sshPort: sshPort,
             apiPort: apiPortFrom(s),
-            tls: base ? base.tls === true : false,
-            domain: (base && base.domain) ? base.domain : null,
+            tls: tlsOk ? true : (base ? base.tls === true : false),
+            domain: tlsHost || ((base && base.domain) ? base.domain : null),
             hbbsKey: hbbs.hbbsKey !== null ? hbbs.hbbsKey : (base ? (base.hbbsKey || null) : null),
             hbbsPorts: hbbs.hbbsPorts.length ? hbbs.hbbsPorts
                 : (base && Array.isArray(base.hbbsPorts) ? base.hbbsPorts : []),
@@ -821,27 +966,32 @@
     }
 
     // PilotProvisionPlan.build()/PilotPorts.required() need an install/firewall/TLS
-    // policy shape (installHbbs, openFirewall, tlsTier, apiPort, sshPort) that the
-    // wizard's six steps (target, hostkey, detect, ports, execute, handover) never
-    // collect from the user — there is no "policy" step in the spec. Rather than
-    // invent one, or grow blankState()'s choices (owned by the pure half above this
-    // divider), this adapter fills safe, fixed defaults at the one call site that
-    // needs them: attempt an install when nothing is adopted, open the host
-    // firewall, and no TLS (the wizard collects no domain/DuckDNS input to make TLS
-    // safe to turn on by default). This is additive only — it never changes what
-    // blankState(), Plan.build() or Ports.required() themselves accept.
+    // policy shape (installHbbs, openFirewall, tlsTier, apiPort, sshPort). The
+    // install and firewall halves have no step of their own in the spec, so this
+    // adapter fills the same safe fixed defaults it always did: attempt an install
+    // when nothing is adopted, and open the host firewall.
+    //
+    // The TLS half is NOT a default any more — it is whatever the wizard's own TLS
+    // step collected, passed through verbatim. Hardcoding tlsTier:'none' here was
+    // what made every TLS path in js/core/tls.js and js/core/provision-plan.js
+    // unreachable from the UI: no plan could ever contain a tls-* step, and
+    // js/features/overview.js's web-client link could only ever be disabled. Note
+    // this is a pass-through, not a second gate: PilotTls.validate() inside
+    // Plan.build() remains the sole authority on whether a tier is usable, so a
+    // bare IP still cannot become a TLS target here.
     function planChoicesFor(choices) {
         const c = (choices && typeof choices === 'object') ? choices : {};
         const P = root ? root.PilotPorts : null;
         const target = str(c.target) === 'ssh' ? 'ssh' : 'local';
+        const t = tlsChoices(c);
         return {
             target: target,
             host: (target === 'ssh' && str(c.host) !== '') ? str(c.host) : null,
             installHbbs: true,
             openFirewall: true,
-            tlsTier: 'none',
-            domain: null,
-            duckdns: null,
+            tlsTier: t.tlsTier,
+            domain: t.domain,
+            duckdns: t.duckdns,
             apiPort: (P && typeof P.API_DEFAULT === 'number') ? P.API_DEFAULT : 21114,
             sshPort: (P && typeof P.SSH_DEFAULT === 'number') ? P.SSH_DEFAULT : 22
         };
@@ -874,6 +1024,12 @@
         }
         return out;
     }
+
+    // Every IPv4 literal in `getent ahostsv4` output. The command prints one
+    // "<address> <type> <name>" line per record; PilotTls.dnsPreflight() filters
+    // the list again with its own isBareIpv4(), so this deliberately over-matches
+    // rather than trying to be a second address parser.
+    const IPV4_RE = /(?:[0-9]{1,3}\.){3}[0-9]{1,3}/g;
 
     function hasSpawn() {
         return typeof cockpit !== 'undefined' && cockpit && typeof cockpit.spawn === 'function';
@@ -965,6 +1121,10 @@
             // changed the admin password is worse than one that says it cannot.
             passwordWriter: null,
 
+            // Set by start()/checkDns() only. tlsFailure carries
+            // acmeFailureFrom()'s classified verdict for a failed tls-* step.
+            tlsFailure: null,
+
             steps() { return visibleSteps(this); },
             stepTitle(id) {
                 return Object.prototype.hasOwnProperty.call(STEP_TITLES, str(id))
@@ -985,6 +1145,18 @@
             manualScript() { return manualFor(this.plan); },
             toggleStep(s) { s.open = !s.open; },
 
+            // ---- the TLS step, rendered by index.html's pane-tls -----------
+            tlsTiers() {
+                const T = tls();
+                return (T && Array.isArray(T.TIERS)) ? T.TIERS.slice() : ['none'];
+            },
+            tlsTierLabel(id) { return tlsTierLabel(id); },
+            tlsAdvisory() { return tlsAdvisory(this.choices.tlsTier); },
+            tlsCheck() { return validateTls(this.choices, this.detection); },
+            tlsHost() { return tlsHostFor(this.choices, this.detection); },
+            tlsOn() { return str(this.choices.tlsTier) !== 'none'; },
+            detectedIp() { return str(this.detection && this.detection.public_ip); },
+
             back() { this.step = prevStep(this); },
 
             next() {
@@ -998,8 +1170,30 @@
                     this.errors = { hostkey: 'Confirm the host key fingerprint before continuing.' };
                     return false;
                 }
+                if (this.step === 'tls') {
+                    // PilotTls.validate() is the authority (the same one
+                    // provision-plan.js's own gate calls), so a bare IP, an
+                    // unresolvable tier or a missing DuckDNS token stops here
+                    // with tls.js's own message rather than a second opinion.
+                    const v = validateTls(this.choices, this.detection);
+                    if (!v.ok) {
+                        this.errors = { tls: v.message };
+                        return false;
+                    }
+                    // The ports step is next and its content DEPENDS on the tier
+                    // (80/443 instead of an internet-facing 21114), so the plan
+                    // and the port list are rebuilt here rather than being left
+                    // as detect() built them before a tier existed.
+                    if (!this.rebuildPlan()) return false;
+                }
                 const from = this.step;
                 this.step = nextStep(this);
+                // Spec §6.1: resolve the chosen hostname and compare it to the
+                // server's public IP before ACME is ever invoked. Fire-and-forget
+                // for the same reason checkHostKey() is — next() stays
+                // synchronous and checkDns() owns its own error state — and
+                // start() re-runs it as the authoritative gate regardless.
+                if (from === 'tls' && this.tlsOn()) this.checkDns();
                 // Entering the host-key step for the first time (or re-entering
                 // it after Back — the host may have changed) has to actually run
                 // the check: nothing else in this component ever calls
@@ -1116,6 +1310,83 @@
                 }
             },
 
+            // Rebuilds the plan and the required-port list from the detection
+            // already on hand plus the CURRENT choices. Called when the TLS step
+            // is left, because both depend on the tier. Returns false (and shows
+            // the reason) rather than leaving a stale plan behind.
+            rebuildPlan() {
+                if (!this.detection) {
+                    this.error = describe(fail('GENERIC',
+                        'There is no detection result to rebuild the plan from. Run detection first.'));
+                    return false;
+                }
+                try {
+                    const pc = planChoicesFor(this.choices);
+                    this.plan = Plan.build(this.detection, pc);
+                    this.required = requiredPorts(pc);
+                    this.error = null;
+                    return true;
+                } catch (e) {
+                    this.plan = null;
+                    this.error = describe(e);
+                    return false;
+                }
+            },
+
+            // The resolver seam. `getent ahostsv4` asks NSS on the Cockpit host —
+            // the same vantage point the reachability probe uses, and the only
+            // one available under `connect-src 'self'` (a browser DNS query is
+            // not a thing, and cockpit.http belongs to js/core/api-io.js alone).
+            // Returns { resolved, resolvable }: `resolvable:false` means the
+            // lookup itself could not be performed and NOTHING may be concluded
+            // from it, which is deliberately different from "resolved to nothing"
+            // (getent's exit status 2, a real "this name has no A record").
+            async resolveHost(host) {
+                const name = str(host);
+                if (!name || !hasSpawn()) return { resolved: [], resolvable: false };
+                try {
+                    const out = str(await cockpit.spawn(['getent', 'ahostsv4', name],
+                        { err: 'message' }));
+                    return { resolved: out.match(IPV4_RE) || [], resolvable: true };
+                } catch (e) {
+                    if (e && e.exit_status === 2) return { resolved: [], resolvable: true };
+                    return { resolved: [], resolvable: false };
+                }
+            },
+
+            // Spec §6.1's DNS pre-flight. PilotTls.dnsPreflight() does the
+            // comparing; this only supplies the two facts it needs. A verdict of
+            // TLS_DNS_MISMATCH is the one that BLOCKS the run (start() below):
+            // issuing anyway would fail and burn a rate-limit attempt. Anything
+            // else — no public IP to compare against, or no resolver at all — is
+            // recorded as "not checked" and never blocks, because a pre-flight
+            // that could not run is not evidence of a problem.
+            async checkDns() {
+                const T = tls();
+                const host = this.tlsHost();
+                if (!this.tlsOn() || !host || !T || typeof T.dnsPreflight !== 'function') {
+                    this.preflight = null;
+                    return null;
+                }
+                const r = await this.resolveHost(host);
+                if (!r.resolvable) {
+                    this.preflight = {
+                        ok: false, checked: false, kind: 'GENERIC', host: host, resolved: [],
+                        message: 'Pilot could not look this name up from the Cockpit host, so DNS was ' +
+                            'not pre-flighted. The certificate request will be attempted anyway.'
+                    };
+                    return this.preflight;
+                }
+                const p = T.dnsPreflight({
+                    host: host,
+                    expected: str(this.detection && this.detection.public_ip),
+                    resolved: r.resolved
+                });
+                this.preflight = { ok: p.ok === true, checked: true, kind: p.kind, host: p.host,
+                    resolved: p.resolved, message: p.message };
+                return this.preflight;
+            },
+
             ingest(line, raw) {
                 const text = str(line);
                 if (text.trim() === '') return;
@@ -1137,8 +1408,23 @@
                 this.error = null;
                 this.copied = false;
                 this.transcriptSaved = false;
+                this.tlsFailure = null;
                 this.exec = blankExec();
                 this.runId = runIdFor(new Date());
+
+                // Spec §6.1: "before invoking ACME, Pilot resolves the chosen
+                // hostname and compares it to the server's public IP ... no
+                // rate-limit attempt is burnt". This is that gate, and it runs
+                // here rather than only on the TLS step because the DNS record
+                // can change (or the user can go Back) between the two.
+                if (this.tlsOn()) {
+                    const pf = await this.checkDns();
+                    if (pf && pf.kind === 'TLS_DNS_MISMATCH') {
+                        this.error = describe(fail('TLS_DNS_MISMATCH', pf.message));
+                        this.busy = false;
+                        return false;
+                    }
+                }
 
                 let envelope = null;
                 try {
@@ -1185,6 +1471,10 @@
                 await this.persist(this.runId, raw);
                 this.reach = reachFrom(this.exec);
                 this.handoverResult = handover(this.exec, this.reach);
+                // A failed tls-* step is classified into a C6 kind rather than
+                // left as "exit 1": a rate limit, a DNS mismatch and a generic
+                // ACME failure need three different next actions.
+                this.tlsFailure = acmeFailureFrom(this.exec);
                 // Task 34: register the server the moment the console is
                 // actually USABLE — that is "ok", or a warnings-only
                 // "partial" where nothing REQUIRED is still blocked (handover()
@@ -1228,9 +1518,9 @@
                 const id = idForChoices(this.choices);
                 if (!id) {
                     this.credentialSaved = false;
-                    this.credentialSaveError = fail('GENERIC',
+                    this.credentialSaveError = describe(fail('GENERIC',
                         'Could not derive a server id from "' + str(this.choices.host) +
-                        '" to store the credential under.');
+                        '" to store the credential under.'));
                     return false;
                 }
                 const Servers = servers();
@@ -1271,9 +1561,12 @@
                 const id = idForChoices(this.choices);
                 if (!id) {
                     this.registered = false;
-                    this.registrationError = fail('GENERIC',
+                    // describe() rather than the raw error: the handover pane
+                    // renders kind + message + PilotErrors remediation, and one
+                    // shape for every registrationError keeps that honest.
+                    this.registrationError = describe(fail('GENERIC',
                         'Could not derive a server id from "' + str(this.choices.host) +
-                        '" to register this server under.');
+                        '" to register this server under.'));
                     return false;
                 }
                 const Servers = servers();
@@ -1367,12 +1660,14 @@
     const PilotSetupUi = {
         STEP_IDS, STEP_TITLES, MAX_LINES, MAX_LINE_CHARS, MAX_NOISE,
         blankExec, blankState, visibleSteps, nextStep, prevStep, applyWizardStep,
+        tlsChoices, tlsDetection, validateTls, tlsHostFor, tlsAdvisory, tlsTierLabel,
+        acmeFailureFrom,
         credentialToRemember, slugForHost,
         idForChoices, hbbsInfoFrom, apiPortFrom, recordForRegistration,
         validateTarget, portRows, awsCommand,
         parseLine, reduce, progress, transcriptText, runPath,
         handover, passwordGate, manualFor,
-        runIdFor, splitStream, detectRequest, envelopeCtx, requiredPorts, reachFrom,
+        runIdFor, splitStream, detectRequest, envelopeCtx, planChoicesFor, requiredPorts, reachFrom,
         notifyServerChanged,
         pilotSetupUi
     };

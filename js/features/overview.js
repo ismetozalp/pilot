@@ -17,16 +17,23 @@
 
     const Errors = need('PilotErrors', '../core/errors.js');
     const Devices = need('PilotDevicesUi', './devices-ui.js');
+    // js/core/tls.js is THE definition of "is this a certifiable domain" and of
+    // how a hostname normalises. This screen used to carry its own second copy
+    // of both, which was a live divergence risk the moment the wizard could
+    // actually configure TLS (it now can) — the wizard would accept a name this
+    // screen then judged unusable, or vice versa.
+    const Tls = need('PilotTls', '../core/tls.js');
 
     const MOUNT_ID = 'pilot-overview';
     const WIZARD_EVENT = 'pilot:open-wizard';
     const SUMMARY_PAGE_SIZE = 200;
     const MAX_FIELD = 200;
 
-    // Escapes only — never a literal control character in a class.
-    const CONTROL = /[\x00-\x1f\x7f]/;
+    // Escapes only — never a literal control character in a class. The
+    // single-shot CONTROL and LABEL_RE that used to sit here belonged to this
+    // module's own duplicate domain validator, which now delegates to
+    // js/core/tls.js; only the field-cleaning pass still needs a regex.
     const CONTROL_G = /[\x00-\x1f\x7f]/g;
-    const LABEL_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 
     const TIERS = new Set(['none', 'own', 'sslip', 'duckdns']);
 
@@ -57,22 +64,17 @@
 
     // -------------------------------------------------------- web client
 
+    // Both delegate. Kept as named functions (and still exported) only so the
+    // call sites below and this module's own tests read the same as before —
+    // there is exactly ONE implementation, and it is js/core/tls.js's. With
+    // PilotTls somehow absent they fail CLOSED: no domain is valid, so the web
+    // client link is disabled with a reason rather than pointing somewhere.
     function validDomain(v) {
-        if (typeof v !== 'string' || CONTROL.test(v)) return false;
-        const d = v.trim().toLowerCase().replace(/\.$/, '');
-        if (!d || d.length > 253) return false;
-        if (/[\s/\\:@?#]/.test(d)) return false;
-        const labels = d.split('.');
-        if (labels.length < 2) return false;
-        for (const l of labels) if (!LABEL_RE.test(l)) return false;
-        // A dotted-quad is an address, not a name: no CA will certify it, and the
-        // RustDesk client gets no /ws/* path for it at all (C17).
-        if (/^\d+$/.test(labels[labels.length - 1])) return false;
-        return true;
+        return !!(Tls && typeof Tls.isValidDomain === 'function' && Tls.isValidDomain(v));
     }
 
     function normDomain(v) {
-        return str(v).trim().toLowerCase().replace(/\.$/, '');
+        return (Tls && typeof Tls.normalizeDomain === 'function') ? Tls.normalizeDomain(v) : '';
     }
 
     function pickDomain(server) {
@@ -102,7 +104,12 @@
         const raw = pickDomain(server);
         if (tier === 'none')
             return { enabled: false, url: null, reason: REASON.noTls, action: 'wizard-tls' };
-        if (!normDomain(raw))
+        // "Nothing was recorded" and "something was recorded but it is not a
+        // usable name" are different situations and get different sentences, so
+        // emptiness is judged on the RAW value: normDomain() answers '' for a
+        // hostile value too, which would otherwise report a recorded-but-broken
+        // domain as if no domain had ever been set.
+        if (!str(raw).trim())
             return { enabled: false, url: null, reason: REASON.noDomain, action: 'wizard-tls' };
         if (!validDomain(raw))
             return { enabled: false, url: null, reason: REASON.badDomain, action: 'wizard-tls' };
@@ -463,6 +470,12 @@
         '      <p class="h4 mb-0" data-test="offline" x-text="summary.offline"></p>',
         '    </div></div></div>',
         '  </div>',
+        // summaryLoading is set/cleared around the device-summary fetch alone
+        // (`loading` covers the whole refresh, registry read included), so it is
+        // what tells the user the three counters above are mid-flight rather
+        // than genuinely zero. It was write-only until now: no indicator rendered.
+        '  <p class="text-secondary small" data-test="summary-loading" x-show="summaryLoading">',
+        '    Counting devices…</p>',
         '  <div class="alert alert-warning" data-test="summary-error" x-show="summaryError">',
         '    <span x-text="errorText(summaryError)"></span>',
         '    <span class="fw-semibold ms-1" data-test="summary-error-remediation"',

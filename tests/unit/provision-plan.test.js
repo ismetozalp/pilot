@@ -411,17 +411,44 @@ test('RULE 2: sslip is gated on validate().ok, not on hostFor() emptiness', () =
     throwsKind(() => P.build(detAdopt({ public_ip: '192.168.1.10' }), choices({ tlsTier: 'sslip' })), 'TLS_DNS_MISMATCH');
 });
 
-test('duckdns updates the record in a secret step and never leaks the token elsewhere', () => {
+test('the DuckDNS token is in NO argv of any step — only in a 0600 root:root secret write', () => {
+    // /proc/<pid>/cmdline is world-readable, and the remote command line ssh
+    // builds is visible in `ps` on the target, so a token in argv is a leak on
+    // both transports. It travels in a secret write step's content instead —
+    // the same channel libexec/pilot-exec seeds its redactor from, so the bare
+    // token is also masked out of every transcript line.
+    const TOKEN = 'a1b2c3d4e5f6a7b8';
     const plan = P.build(detAdopt(), choices({ tlsTier: 'duckdns',
-        duckdns: { subdomain: 'pilotdemo', token: 'a1b2c3d4e5f6a7b8' } }));
-    const s = byId(plan, 'tls-duckdns');
-    assert.equal(s.secret, true);
-    assert.equal(s.sha256, null, 'not a download, so no checksum');
-    assert.ok(s.argv.join(' ').indexOf('a1b2c3d4e5f6a7b8') !== -1);
-    for (const other of plan.steps) {
-        if (other.id === 'tls-duckdns') continue;
-        assert.equal(JSON.stringify(other).indexOf('a1b2c3d4e5f6a7b8'), -1, 'token leaked into ' + other.id);
+        duckdns: { subdomain: 'pilotdemo', token: TOKEN } }));
+
+    const staged = byId(plan, 'tls-duckdns-token');
+    assert.ok(staged, 'the token must be staged by its own step');
+    assert.equal(staged.secret, true, 'the staging step must be marked secret');
+    assert.equal(staged.write.mode, '0600');
+    assert.equal(staged.write.owner, 'root:root');
+    assert.equal(staged.write.content, TOKEN + '\n',
+        'the content is the bare token, so pilot-exec redacts the token itself, not a longer line');
+    assert.deepEqual(staged.argv, [], 'a write step carries no argv at all');
+
+    for (const s of plan.steps) {
+        for (const a of s.argv)
+            assert.equal(String(a).indexOf(TOKEN), -1, 'token leaked into ' + s.id + "'s argv");
+        if (s.id === 'tls-duckdns-token') continue;
+        assert.equal(JSON.stringify(s).indexOf(TOKEN), -1, 'token leaked into ' + s.id);
     }
+
+    // The update step itself carries the subdomain and nothing secret, and
+    // deletes the staged token on every exit path.
+    const s = byId(plan, 'tls-duckdns');
+    assert.equal(s.secret, false, 'with no credential in its argv this step has nothing to suppress');
+    assert.equal(s.sha256, null, 'not a download, so no checksum');
+    assert.ok(s.argv.indexOf('pilotdemo') !== -1, 'the (non-secret) subdomain is a plain argument');
+    assert.ok(s.argv.join(' ').indexOf('-K') !== -1,
+        'curl must read the URL from a config file, never from its own argv');
+    assert.ok(s.argv.join(' ').indexOf('rm -f') !== -1, 'the staged token is removed again');
+    assert.ok(P.stepIds(plan).indexOf('tls-duckdns-token') < P.stepIds(plan).indexOf('tls-duckdns'),
+        'the token must be staged before the step that consumes it');
+
     assert.ok(byId(plan, 'tls-caddyfile').write.content.indexOf('https://pilotdemo.duckdns.org {') !== -1);
 });
 

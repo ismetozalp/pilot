@@ -37,6 +37,32 @@
     const ID_PORT = 21116;
     const RELAY_PORT = 21117;
 
+    // The DuckDNS account token is a credential, so it is handled exactly the way
+    // every other secret on this branch is: it NEVER appears in an argv (both
+    // /proc/<pid>/cmdline on the target and the remote command line ssh builds are
+    // readable by anyone who can list processes), only in a 0600 root:root file
+    // that is written by a secret write step and removed by the step that consumes
+    // it. libexec/pilot-exec seeds its redactor from every secret step's write
+    // content, so the bare token is masked out of every transcript line as well.
+    const DUCKDNS_TOKEN_PATH = '/run/pilot/duckdns.token';
+    // curl reads the URL from a config file (-K) rather than from argv, so the
+    // token is never a command-line argument of the curl process either. DuckDNS
+    // answers 200 with the body "KO" for a bad token, so `curl -fsS` alone would
+    // exit 0 on a rejected update and the failure would surface much later as an
+    // opaque ACME error: the body is checked explicitly instead.
+    const DUCKDNS_SCRIPT = [
+        'set -e',
+        'umask 077',
+        'conf=$(mktemp)',
+        'trap \'rm -f "$conf" ' + DUCKDNS_TOKEN_PATH + '\' EXIT',
+        '[ -s ' + DUCKDNS_TOKEN_PATH + ' ] || { echo "no staged DuckDNS token" >&2; exit 1; }',
+        'printf \'url = "https://www.duckdns.org/update?domains=%s&token=%s&ip="\\n\' ' +
+            '"$1" "$(cat ' + DUCKDNS_TOKEN_PATH + ')" > "$conf"',
+        'out=$(curl -fsS -K "$conf")',
+        'printf \'%s\\n\' "$out"',
+        '[ "$out" = OK ] || { echo "DuckDNS refused the update" >&2; exit 1; }'
+    ].join('\n');
+
     const CTRL_RE = /[\x00-\x1f\x7f]/;
     const RUN_ID_RE = /^[0-9]{8}T[0-9]{6}Z$/;
     const HOST_RE = /^[A-Za-z0-9._:\[\]-]{1,255}$/;
@@ -394,10 +420,18 @@
                 argv: pkgInstallArgv(det.family, 'caddy'),
                 check: { argv: ['sh', '-c', 'command -v caddy >/dev/null'], expect: 'zero' } }));
             if (ch.tlsTier === 'duckdns') {
+                steps.push(step({ id: 'tls-duckdns-token',
+                    title: 'Stage the DuckDNS token in a root-only file', mutating: true, secret: true,
+                    why: 'The token is a credential, so it travels in a 0600 root:root file that the next step ' +
+                        'reads and deletes — never in an argv, where /proc/<pid>/cmdline would expose it to ' +
+                        'every local user.',
+                    write: { path: DUCKDNS_TOKEN_PATH, mode: '0600', owner: 'root:root',
+                        content: str(ch.duckdns.token) + '\n' } }));
                 steps.push(step({ id: 'tls-duckdns', title: 'Point the DuckDNS record at this server', mutating: true,
-                    secret: true, why: 'ACME only succeeds once the name resolves here, so the record is updated before issuance.',
-                    argv: ['curl', '-fsS', 'https://www.duckdns.org/update?domains=' + ch.duckdns.subdomain +
-                        '&token=' + ch.duckdns.token + '&ip='] }));
+                    why: 'ACME only succeeds once the name resolves here, so the record is updated before issuance. ' +
+                        'curl reads the URL (and therefore the token) from a config file, and the staged token ' +
+                        'file is removed on every exit path.',
+                    argv: ['sh', '-c', DUCKDNS_SCRIPT, 'sh', str(ch.duckdns.subdomain)] }));
             }
             steps.push(step({ id: 'tls-caddyfile', title: 'Write ' + Tls.CADDYFILE_PATH, mutating: true,
                 why: 'One site block proxies the API and both websocket paths, so the web client reaches everything over 443.',
@@ -542,58 +576,41 @@
             return { preLines: [], commandLine: null, mustRunManually: false, outputSensitive: true };
         }
 
-        // DuckDNS: extract domain and token from URL, render as variables
-        if (step.id === 'tls-duckdns' && Array.isArray(step.argv)) {
-            // Find the URL argument (has token= in it)
-            let urlArg = '';
-            for (let i = 0; i < step.argv.length; i++) {
-                if (String(step.argv[i]).indexOf('token=') !== -1) {
-                    urlArg = String(step.argv[i]);
-                    break;
-                }
-            }
-            if (urlArg) {
-                // Extract domains=DOMAINS from URL
-                const domainsMatch = urlArg.match(/domains=([^&]+)/);
-                const domains = domainsMatch ? domainsMatch[1] : '';
-
-                if (domains) {
-                    // Render env var requirement (loud failure if unset)
-                    preLines.push(": \"${DUCKDNS_TOKEN:?set DUCKDNS_TOKEN to your DuckDNS token before running this script}\"");
-                    // Assign domain to variable with proper quoting (uses sq() for safety)
-                    preLines.push('PILOT_DUCKDNS_DOMAINS=' + sq(domains));
-
-                    // Render the curl command with double-quoted URL (so variables expand)
-                    const beforeUrl = [];
-                    const afterUrl = [];
-                    let foundUrl = false;
-                    for (let i = 0; i < step.argv.length; i++) {
-                        const arg = String(step.argv[i]);
-                        if (!foundUrl && arg.indexOf('token=') !== -1) {
-                            foundUrl = true;
-                            // Build URL with variable references (double-quoted)
-                            const baseUrl = 'https://www.duckdns.org/update?domains=${PILOT_DUCKDNS_DOMAINS}&token=${DUCKDNS_TOKEN}&ip=';
-                            continue; // Skip this arg, we'll add the double-quoted version
-                        }
-                        if (foundUrl) {
-                            afterUrl.push(arg);
-                        } else {
-                            beforeUrl.push(arg);
-                        }
-                    }
-
-                    // Build the command line: before-args, then double-quoted URL, then after-args
-                    let cmdLine = argvLine(beforeUrl) + ' "https://www.duckdns.org/update?domains=${PILOT_DUCKDNS_DOMAINS}&token=${DUCKDNS_TOKEN}&ip="';
-                    if (afterUrl.length > 0) cmdLine += ' ' + argvLine(afterUrl);
-
-                    return { preLines: preLines, commandLine: cmdLine, mustRunManually: false, outputSensitive: false };
-                }
-            }
-        }
-
-        // Fail closed: not on the explicit allow-path above and not the
-        // DuckDNS special case, so refuse to render it in cleartext.
+        // Fail closed: not on the explicit allow-path above, so refuse to render
+        // it in cleartext.
         return { preLines: [], commandLine: null, mustRunManually: true, outputSensitive: false };
+    }
+
+    // The write-step counterpart of ARGV_SAFE_STEPS, and the same shape of
+    // decision: a secret write step's CONTENT is a credential, so the heredoc
+    // the ordinary write path emits would print it in cleartext into an artifact
+    // whose whole purpose is to be pasted somewhere. Enrolment is per id and
+    // explicit; an unenrolled secret write step is suppressed, never guessed at.
+    //
+    // Each entry renders the file from an environment variable the operator sets
+    // themselves, so the script is safe to share and still does the real thing
+    // when run. `: "${VAR:?message}"` exits non-zero naming the variable when it
+    // is unset, so an unset token can never silently write an empty file.
+    const WRITE_SAFE_STEPS = {
+        'tls-duckdns-token': {
+            envVar: 'DUCKDNS_TOKEN',
+            hint: 'set DUCKDNS_TOKEN to your DuckDNS account token before running this script'
+        }
+    };
+
+    function renderSecretWrite(step) {
+        const spec = (step && step.write && Object.prototype.hasOwnProperty.call(WRITE_SAFE_STEPS, step.id))
+            ? WRITE_SAFE_STEPS[step.id] : null;
+        if (!spec) return null;
+        const path = step.write.path;
+        return [
+            ': "${' + spec.envVar + ':?' + spec.hint + '}"',
+            'install -d -m 0755 ' + q(dirOf(path)),
+            'umask 077',
+            'printf \'%s\\n\' "$' + spec.envVar + '" > ' + q(path),
+            'chmod ' + q(step.write.mode) + ' ' + q(path),
+            'chown ' + q(step.write.owner) + ' ' + q(path)
+        ];
     }
 
     // Find a collision-free heredoc delimiter by checking content for collisions.
@@ -645,13 +662,26 @@
             }
 
             if (s.write) {
-                out.push('install -d -m 0755 ' + q(dirOf(s.write.path)));
-                const delim = findDelimiter(s.write.content);
-                out.push('cat > ' + q(s.write.path) + " <<'" + delim + "'");
-                out.push(String(s.write.content).replace(/\n$/, ''));
-                out.push(delim);
-                out.push('chmod ' + q(s.write.mode) + ' ' + q(s.write.path));
-                out.push('chown ' + q(s.write.owner) + ' ' + q(s.write.path));
+                // A secret write step's content IS the credential, so it never
+                // reaches the heredoc below: it is either rendered from an
+                // environment variable (the explicit, enrolled allow-path) or
+                // suppressed entirely. Printing it is the one unacceptable option.
+                const safeWrite = s.secret ? renderSecretWrite(s) : null;
+                if (s.secret && !safeWrite) {
+                    out.push('# MANUAL STEP: This step writes a credential to ' + q(s.write.path) +
+                        ' and must be done by hand on the target.');
+                    out.push('# Do not include this step in a shareable script.');
+                } else if (safeWrite) {
+                    for (let j = 0; j < safeWrite.length; j++) out.push(safeWrite[j]);
+                } else {
+                    out.push('install -d -m 0755 ' + q(dirOf(s.write.path)));
+                    const delim = findDelimiter(s.write.content);
+                    out.push('cat > ' + q(s.write.path) + " <<'" + delim + "'");
+                    out.push(String(s.write.content).replace(/\n$/, ''));
+                    out.push(delim);
+                    out.push('chmod ' + q(s.write.mode) + ' ' + q(s.write.path));
+                    out.push('chown ' + q(s.write.owner) + ' ' + q(s.write.path));
+                }
             } else {
                 for (let j = 0; j < secretInfo.preLines.length; j++) out.push(secretInfo.preLines[j]);
                 if (secretInfo.mustRunManually) {
