@@ -667,8 +667,20 @@ class LocalTransport(Transport):
             if not os.path.isdir(directory):
                 os.makedirs(directory, mode=0o755, exist_ok=True)
             tmp = path + ".pilot-tmp"
-            with open(tmp, "w", encoding="utf-8") as handle:
+            # The builtin open() creates a new file at 0666 & ~umask — under a
+            # typical umask 022 that is 0644, wider than most requested modes
+            # (0600, 0640) — and a subsequent chmod only narrows it after the
+            # fact, leaving a window where a secret write step's content is
+            # briefly group/other-readable. Passing the target mode straight
+            # into the creating os.open() means the file never exists at a
+            # mode wider than requested, not even for one syscall.
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, int(mode, 8))
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 handle.write(content)
+            # umask can still narrow bits the caller actually wants (e.g. a
+            # mode with the group-write bit set under a umask that strips it),
+            # so pin the exact requested mode; this can only match or narrow
+            # what os.open() already produced, never widen it.
             os.chmod(tmp, int(mode, 8))
         except (IOError, OSError) as exc:
             return 1, "pilot-exec: cannot write " + path + ": " + str(exc)
@@ -848,24 +860,33 @@ class SshTransport(Transport):
 
     def start(self, emitter=None):
         status = hostkey_gate(self._ssh)
-        handle, self._kh_file = tempfile.mkstemp(prefix="pilot-kh-")
-        with os.fdopen(handle, "w") as fh:
-            fh.write(_kh_id(self._ssh["host"], self._ssh["port"]) + " " +
-                     status["keytype"] + " " + status["key"] + "\n")
-        os.chmod(self._kh_file, 0o600)
-        if self._ssh["auth"] == "pem":
-            pem = self._creds.get("pem")
-            if not pem:
-                raise Fail(EXIT_TRANSPORT, "SSH_AUTH_FAILED",
-                           "ssh.auth is 'pem' but credentials.pem is empty")
-            handle, self._pem_file = tempfile.mkstemp(prefix="pilot-pem-")
+        # tempfile.mkstemp/os.fdopen/os.chmod can fail for ordinary reasons
+        # (disk full, /tmp unwritable, out of file descriptors). Every other
+        # failure path in this file surfaces as a clean C4 `fatal` line via
+        # Fail; a bare OSError escaping here would instead crash as an
+        # uncaught traceback, so it is converted the same way.
+        try:
+            handle, self._kh_file = tempfile.mkstemp(prefix="pilot-kh-")
             with os.fdopen(handle, "w") as fh:
-                fh.write(pem if pem.endswith("\n") else pem + "\n")
-            os.chmod(self._pem_file, 0o600)
-        elif self._ssh["auth"] == "password":
-            if not self._creds.get("password"):
-                raise Fail(EXIT_TRANSPORT, "SSH_AUTH_FAILED",
-                           "ssh.auth is 'password' but credentials.password is empty")
+                fh.write(_kh_id(self._ssh["host"], self._ssh["port"]) + " " +
+                         status["keytype"] + " " + status["key"] + "\n")
+            os.chmod(self._kh_file, 0o600)
+            if self._ssh["auth"] == "pem":
+                pem = self._creds.get("pem")
+                if not pem:
+                    raise Fail(EXIT_TRANSPORT, "SSH_AUTH_FAILED",
+                               "ssh.auth is 'pem' but credentials.pem is empty")
+                handle, self._pem_file = tempfile.mkstemp(prefix="pilot-pem-")
+                with os.fdopen(handle, "w") as fh:
+                    fh.write(pem if pem.endswith("\n") else pem + "\n")
+                os.chmod(self._pem_file, 0o600)
+            elif self._ssh["auth"] == "password":
+                if not self._creds.get("password"):
+                    raise Fail(EXIT_TRANSPORT, "SSH_AUTH_FAILED",
+                               "ssh.auth is 'password' but credentials.password is empty")
+        except (IOError, OSError) as exc:
+            raise Fail(EXIT_TRANSPORT, "SSH_UNREACHABLE",
+                       "cannot prepare local SSH transport state: " + str(exc))
         return status
 
     def _base_argv(self):

@@ -53,6 +53,23 @@ function envelope(steps, over) {
     }, over || {});
 }
 
+// Loads pilot-exec as a Python module (main() is guarded by __name__) and
+// evaluates `body`, which must print one JSON document. Used to reach
+// internals (SshTransport directly, monkeypatched module functions) that are
+// not reachable through the --run CLI surface alone.
+function pyEval(body) {
+    const code = [
+        'import importlib.machinery, importlib.util, json, sys',
+        'loader = importlib.machinery.SourceFileLoader("pilot_exec", ' + JSON.stringify(HELPER) + ')',
+        'spec = importlib.util.spec_from_loader("pilot_exec", loader)',
+        'px = importlib.util.module_from_spec(spec)',
+        'loader.exec_module(px)'
+    ].concat(body).join('\n');
+    const r = spawnSync('python3', ['-c', code], { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
+    assert.equal(r.status, 0, 'python helper eval failed: ' + r.stderr);
+    return JSON.parse(r.stdout);
+}
+
 const ids = (lines, t) => lines.filter((l) => l.t === t).map((l) => l.id);
 
 // --- the C4 protocol ------------------------------------------------------
@@ -219,6 +236,72 @@ test('a write step honours its check and can be skipped', () => {
     assert.equal(r.code, 0, r.err);
     assert.equal(fs.readFileSync(target, 'utf8'), 'original\n');
     assert.equal(r.lines.find((l) => l.t === 'step-end').status, 'skipped');
+});
+
+// --- write_file never exposes a wider-than-requested mode -----------------
+
+test('LocalTransport.write_file creates its temp file at the target mode via os.open, never open()+chmod', () => {
+    // The race this guards against: builtin open(tmp, "w") creates a new file
+    // at 0666 & ~umask (0644 under a typical umask 022), and a subsequent
+    // os.chmod() only narrows it AFTER the fact — leaving a window, however
+    // short, where a secret write step's content sits at a wider mode than
+    // requested. That window is a handful of machine instructions inside a
+    // single function call and is not reliably observable by polling from a
+    // separate process, so this is asserted by source shape instead: the
+    // creating os.open() call must receive the target mode directly, and
+    // there must be no bare open(tmp, "w") anywhere in LocalTransport.
+    const src = fs.readFileSync(HELPER, 'utf8');
+    const classStart = src.indexOf('class LocalTransport(Transport):');
+    const classEnd = src.indexOf('\nclass SshTransport(Transport):');
+    assert.ok(classStart >= 0 && classEnd > classStart,
+        'could not locate LocalTransport in the helper source');
+    const body = src.slice(classStart, classEnd);
+    assert.match(body,
+        /os\.open\(\s*tmp,\s*os\.O_WRONLY\s*\|\s*os\.O_CREAT\s*\|\s*os\.O_TRUNC,\s*int\(mode,\s*8\)\s*\)/,
+        'write_file must pass the target mode straight into the os.open() call that creates the file');
+    assert.doesNotMatch(body, /open\(tmp,\s*["']w["']/,
+        'write_file must not create the temp file with a bare open() call');
+});
+
+test('a write step still lands at exactly its requested mode end to end (regression)', () => {
+    const dir = tmpdir('pilot-write3-');
+    const target = path.join(dir, 'secret.env');
+    const r = run(envelope([
+        step({
+            id: 'stash', argv: [], secret: true, mutating: true,
+            write: {
+                path: target, mode: '0600', content: 'TOKEN=abc\n',
+                owner: os.userInfo().username + ':' + os.userInfo().username
+            }
+        })
+    ]));
+    assert.equal(r.code, 0, r.err);
+    assert.equal(fs.statSync(target).mode & 0o777, 0o600);
+});
+
+// --- a local OSError during transport setup fails clean, not with a traceback
+
+test('SshTransport.start() converts a bare OSError from temp-file setup into Fail(SSH_UNREACHABLE), not an uncaught traceback', () => {
+    const doc = pyEval([
+        // Bypass the real network host-key scan: only the tempfile/os.fdopen/
+        // os.chmod path this fix touches is under test here.
+        'px.hostkey_gate = lambda ssh: {"fingerprint": "SHA256:' + 'A'.repeat(43) + '", "known": True, "kind": "OK", "keytype": "ssh-ed25519", "key": "AAAA"}',
+        'import tempfile',
+        'def broken_mkstemp(*a, **kw):',
+        '    raise OSError(28, "No space left on device")',
+        'tempfile.mkstemp = broken_mkstemp',
+        'ssh = {"host": "h", "port": 22, "user": "root", "auth": "agent", "accept_fingerprint": None}',
+        'transport = px.SshTransport(ssh, None)',
+        'try:',
+        '    transport.start()',
+        '    result = {"raised": False}',
+        'except px.Fail as exc:',
+        '    result = {"raised": True, "type": "Fail", "code": exc.code, "kind": exc.kind}',
+        'except Exception as exc:',
+        '    result = {"raised": True, "type": type(exc).__name__}',
+        'print(json.dumps(result))'
+    ]);
+    assert.deepEqual(doc, { raised: true, type: 'Fail', code: 7, kind: 'SSH_UNREACHABLE' });
 });
 
 // --- redaction at the emitter (C4) ---------------------------------------
