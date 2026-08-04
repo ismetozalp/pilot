@@ -46,8 +46,14 @@ function fakeCockpit(opts) {
             const p = new Promise((res, rej) => { resolveP = res; rejectP = rej; });
             p.input = function (data) { record.stdin = String(data); return p; };
             p.stream = function (cb) {
-                if (!o.noStream && typeof scripted === 'string')
-                    setTimeout(() => { cb(scripted); }, 0);
+                if (o.noStream) return p;
+                if (typeof scripted === 'string') setTimeout(() => { cb(scripted); }, 0);
+                // Models pilot-exec --check-hostkey on a CHANGED key: the JSON
+                // line is written to stdout (and so streamed) before the process
+                // exits non-zero and the promise rejects — {error:true, stream}
+                // scripts exactly that combination.
+                else if (scripted && typeof scripted === 'object' && typeof scripted.stream === 'string')
+                    setTimeout(() => { cb(scripted.stream); }, 0);
                 return p;
             };
             // Real cockpit.spawn() guarantees every stream() chunk is delivered
@@ -66,7 +72,7 @@ function fakeCockpit(opts) {
                     rejectP(e);
                 } else if (scripted && scripted.error) {
                     const e = new Error(scripted.message || 'stub failure');
-                    e.exit_status = 1;
+                    e.exit_status = scripted.exit_status === undefined ? 1 : scripted.exit_status;
                     rejectP(e);
                 } else {
                     resolveP(o.noStream ? scripted : '');
@@ -283,6 +289,120 @@ test('the wizard will not leave the host-key step until the fingerprint is confi
     c.acceptHostKey();
     assert.equal(c.next(), true);
     assert.equal(c.step, 'detect');
+});
+
+// ------------------------------------------------------------ checkHostKey / next() wiring
+//
+// The brief's own markup never called checkHostKey() anywhere, which left the
+// real remote flow permanently stuck on a blank fingerprint pane (caught only
+// by driving the actual page, not by any state-poking unit test). These tests
+// drive the wizard exactly the way a user does — next() is the only thing
+// called — and assert on the resulting spawn call and hostkey state, never by
+// setting c.hostkey by hand.
+
+test('advancing into the host-key step for a remote target actually spawns --check-hostkey', async () => {
+    const fp = 'SHA256:' + 'd'.repeat(43);
+    const fake = fakeCockpit({
+        spawn: { '--check-hostkey': JSON.stringify({ fingerprint: fp, known: false, kind: 'SSH_HOSTKEY_UNKNOWN' }) }
+    });
+    await withCockpit(fake, async () => {
+        const c = UI.pilotSetupUi();
+        c.choices = Object.assign(c.choices, { target: 'ssh', host: 'h', port: 22, user: 'root', auth: 'agent' });
+        assert.equal(c.next(), true, 'next() itself must stay synchronous');
+        assert.equal(c.step, 'hostkey');
+        assert.equal(c.hostkey, null, 'the request has not resolved yet');
+        // checkHostKey() was fired but not awaited by next() — wait for it here.
+        await new Promise((r) => setTimeout(r, 30));
+        const call = fake.calls.find((x) => x.argv.indexOf('--check-hostkey') >= 0);
+        assert.ok(call, '--check-hostkey was never spawned');
+        assert.equal(call.options.superuser, 'require');
+        assert.deepEqual(JSON.parse(call.stdin), { host: 'h', port: 22 });
+        assert.equal(c.hostkey.fingerprint, fp);
+        assert.equal(c.hostkey.known, false);
+        assert.equal(c.hostkey.changed, false);
+        assert.equal(c.hostkey.confirmed, false);
+        assert.equal(c.error, null);
+        // Now the real, populated fingerprint can actually be accepted.
+        assert.equal(c.acceptHostKey(), true);
+        assert.equal(c.next(), true);
+        assert.equal(c.step, 'detect');
+    });
+});
+
+test('a localhost target never spawns --check-hostkey', async () => {
+    const fake = fakeCockpit({ spawn: {} });
+    await withCockpit(fake, async () => {
+        const c = UI.pilotSetupUi();
+        c.choices.target = 'local';
+        assert.equal(c.next(), true);
+        assert.equal(c.step, 'detect');
+        await new Promise((r) => setTimeout(r, 30));
+        assert.equal(fake.calls.length, 0);
+    });
+});
+
+test('a CHANGED host key is recovered from streamed stdout even though the process exits non-zero', async () => {
+    const fp = 'SHA256:' + 'e'.repeat(43);
+    // Models the real contract exactly: pilot-exec writes the JSON line to
+    // stdout, THEN exits EXIT_HOSTKEY_CHANGED (non-zero) — a plain `await p`
+    // would reject and lose the line entirely.
+    const fake = fakeCockpit({
+        spawn: {
+            '--check-hostkey': {
+                error: true, exit_status: 5, message: 'exited 5',
+                stream: JSON.stringify({ fingerprint: fp, known: true, kind: 'SSH_HOSTKEY_CHANGED' })
+            }
+        }
+    });
+    await withCockpit(fake, async () => {
+        const c = UI.pilotSetupUi();
+        c.choices = Object.assign(c.choices, { target: 'ssh', host: 'h', port: 22, user: 'root', auth: 'agent' });
+        const ok = await c.checkHostKey();
+        assert.equal(ok, true, 'the result is still usable even though the spawn rejected');
+        assert.equal(c.hostkey.fingerprint, fp);
+        assert.equal(c.hostkey.known, true);
+        assert.equal(c.hostkey.changed, true);
+        // The hard stop is surfaced the moment it is known, not only on click.
+        assert.equal(c.error.kind, 'SSH_HOSTKEY_CHANGED');
+        // And it really cannot be clicked past.
+        assert.equal(c.acceptHostKey(), false);
+        assert.equal(c.hostkey.confirmed, false);
+    });
+});
+
+test('an unreachable host surfaces the real kind from the fatal envelope, not a raw JSON blob', async () => {
+    // pilot-exec's uncaught-Fail path writes {"t":"fatal","kind":...,"message":...}
+    // to stderr; with err:'message' cockpit hands that whole line back as
+    // e.message. describe() must unwrap it rather than showing it verbatim.
+    const fake = fakeCockpit({
+        spawn: {
+            '--check-hostkey': {
+                error: true,
+                message: JSON.stringify({ t: 'fatal', kind: 'SSH_UNREACHABLE', message: 'connection refused' })
+            }
+        }
+    });
+    await withCockpit(fake, async () => {
+        const c = UI.pilotSetupUi();
+        c.choices = Object.assign(c.choices, { target: 'ssh', host: 'h', port: 22, user: 'root', auth: 'agent' });
+        const ok = await c.checkHostKey();
+        assert.equal(ok, false);
+        assert.equal(c.hostkey, null);
+        assert.equal(c.error.kind, 'SSH_UNREACHABLE');
+        assert.equal(c.error.message, 'connection refused');
+    });
+});
+
+test('a helper that returns garbage from --check-hostkey leaves no stale fingerprint standing', async () => {
+    const fake = fakeCockpit({ spawn: { '--check-hostkey': 'not json at all' } });
+    await withCockpit(fake, async () => {
+        const c = UI.pilotSetupUi();
+        c.choices = Object.assign(c.choices, { target: 'ssh', host: 'h', port: 22, user: 'root', auth: 'agent' });
+        const ok = await c.checkHostKey();
+        assert.equal(ok, false);
+        assert.equal(c.hostkey, null);
+        assert.equal(typeof c.error.message, 'string');
+    });
 });
 
 test('detect sends a DetectRequest on stdin and builds the plan from the answer', async () => {

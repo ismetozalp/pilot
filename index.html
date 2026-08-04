@@ -69,15 +69,22 @@
 
           <div x-show="isStep('hostkey')" data-testid="pane-hostkey">
             <p>Confirm this host key fingerprint before Pilot connects.</p>
+            <p data-testid="hostkey-checking" x-show="busy">Checking the host key…</p>
             <pre class="border p-2" data-testid="fingerprint" x-text="hostkey ? hostkey.fingerprint : ''"></pre>
             <button class="btn btn-primary" data-testid="accept-hostkey" @click="acceptHostKey()">
               This fingerprint is correct</button>
+            <button class="btn btn-link" data-testid="retry-hostkey" @click="checkHostKey()">Retry</button>
             <p class="text-danger mb-0" data-testid="hostkey-error" x-text="errors.hostkey || ''"></p>
             <!-- C6 hard stop: a CHANGED host key is never auto-accepted, and is
                  surfaced here explicitly rather than folded into the generic
                  next()-validation message above. -->
             <p class="text-danger fw-bold" data-testid="hostkey-hardstop"
                x-show="error && error.kind === 'SSH_HOSTKEY_CHANGED'" x-text="error ? error.message : ''"></p>
+            <!-- Any OTHER failure to reach the helper (SSH_UNREACHABLE, etc.) —
+                 a blank fingerprint pane with no explanation is never acceptable. -->
+            <p class="text-danger mb-0" data-testid="hostkey-check-error"
+               x-show="error && error.kind !== 'SSH_HOSTKEY_CHANGED' && !hostkey"
+               x-text="error ? error.message : ''"></p>
           </div>
 
           <div x-show="isStep('detect')" data-testid="pane-detect">

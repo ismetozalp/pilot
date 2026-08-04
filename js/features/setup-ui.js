@@ -658,6 +658,22 @@
         return typeof cockpit !== 'undefined' && cockpit && typeof cockpit.spawn === 'function';
     }
 
+    // pilot-exec's uncaught Fail path (main()) writes exactly one JSON line to
+    // STDERR: {"t":"fatal","kind":"...","message":"..."}. With
+    // { err: 'message' }, cockpit hands that whole line back as the
+    // rejection's .message verbatim — so without unwrapping it here, every
+    // helper failure would surface as GENERIC with a raw JSON blob as its
+    // "message" instead of the kind pilot-exec actually reported.
+    function unwrapFatal(text) {
+        const s = str(text).trim();
+        if (s.charAt(0) !== '{') return null;
+        let obj = null;
+        try { obj = JSON.parse(s); } catch (e) { return null; }
+        if (!obj || typeof obj !== 'object' || obj.t !== 'fatal' || typeof obj.kind !== 'string')
+            return null;
+        return { kind: obj.kind, message: str(obj.message) || obj.kind };
+    }
+
     function describe(err) {
         if (err && typeof err === 'object' && typeof err.kind === 'string') {
             return {
@@ -665,6 +681,15 @@
                 message: str(err.message),
                 remediation: (Errors && typeof Errors.remediation === 'function')
                     ? Errors.remediation(err.kind) : null
+            };
+        }
+        const unwrapped = (err && typeof err === 'object') ? unwrapFatal(err.message) : null;
+        if (unwrapped) {
+            return {
+                kind: unwrapped.kind,
+                message: unwrapped.message,
+                remediation: (Errors && typeof Errors.remediation === 'function')
+                    ? Errors.remediation(unwrapped.kind) : null
             };
         }
         const e = (Errors && typeof Errors.create === 'function')
@@ -729,7 +754,18 @@
                     this.errors = { hostkey: 'Confirm the host key fingerprint before continuing.' };
                     return false;
                 }
+                const from = this.step;
                 this.step = nextStep(this);
+                // Entering the host-key step for the first time (or re-entering
+                // it after Back — the host may have changed) has to actually run
+                // the check: nothing else in this component ever calls
+                // checkHostKey(), and a wizard that lands on a blank fingerprint
+                // pane with no request in flight is stuck forever. next() itself
+                // stays synchronous (existing callers and tests depend on that);
+                // checkHostKey() manages its own busy/error state, so this is a
+                // deliberate fire-and-forget, not an unhandled-rejection risk —
+                // every throwing path inside checkHostKey() is already caught.
+                if (this.step === 'hostkey' && from !== 'hostkey' && !this.busy) this.checkHostKey();
                 return true;
             },
 
@@ -749,23 +785,61 @@
                 if (this.busy) return false;
                 this.busy = true;
                 this.error = null;
+                // pilot-exec exits non-zero (EXIT_HOSTKEY_CHANGED) exactly when
+                // the key changed — which is the ONE result this pane most needs
+                // to show. A plain `await p` would lose it: cockpit rejects the
+                // promise on a non-zero exit and the resolved value is never
+                // produced. Streaming (like --run) captures the JSON line
+                // regardless of how the process exits.
+                let raw = '';
                 try {
                     if (!hasSpawn()) throw fail('GENERIC', 'This page cannot reach the system helper.');
                     const p = cockpit.spawn([EXEC, '--check-hostkey'],
                         { superuser: 'require', err: 'message' });
                     if (typeof p.input === 'function')
                         p.input(JSON.stringify({ host: str(this.choices.host), port: this.choices.port }));
+                    if (typeof p.stream === 'function') p.stream((chunk) => { raw += str(chunk); });
                     const out = await p;
-                    const parsed = JSON.parse(str(out));
+                    if (raw.trim() === '') raw = str(out);
+                } catch (e) {
+                    if (raw.trim() === '') {
+                        // Nothing usable was ever written to stdout (e.g.
+                        // SSH_UNREACHABLE raised before the first line) — this is
+                        // a real failure, not a CHANGED key, so there is nothing
+                        // to fall through and parse.
+                        this.hostkey = null;
+                        this.error = describe(e);
+                        this.busy = false;
+                        return false;
+                    }
+                    // Fall through: a non-zero exit with a captured line is
+                    // exactly the CHANGED-key shape, and the line is still parsed
+                    // below like any other result.
+                }
+                try {
+                    // Real shape (pilot-exec --check-hostkey, C3): exactly
+                    // {fingerprint, known, kind}, kind one of
+                    // OK | SSH_HOSTKEY_UNKNOWN | SSH_HOSTKEY_CHANGED. There is no
+                    // `changed` field — CHANGED is this exact kind, nothing else.
+                    const parsed = JSON.parse(raw.trim());
+                    const kind = str(parsed.kind);
                     this.hostkey = {
                         fingerprint: clean(parsed.fingerprint),
                         known: parsed.known === true,
-                        changed: parsed.changed === true,
+                        changed: kind === 'SSH_HOSTKEY_CHANGED',
                         confirmed: false
                     };
+                    if (this.hostkey.changed) {
+                        // Surfaced immediately — never wait for the user to click
+                        // Accept to learn the connection is refused outright.
+                        this.error = describe(fail('SSH_HOSTKEY_CHANGED',
+                            'The host key for this server has changed. Pilot will not continue.'));
+                    }
                     return true;
                 } catch (e) {
-                    this.error = describe(e);
+                    this.hostkey = null;
+                    this.error = describe(fail('GENERIC',
+                        'The helper returned no usable host-key result.'));
                     return false;
                 } finally {
                     this.busy = false;
