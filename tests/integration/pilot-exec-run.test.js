@@ -570,9 +570,21 @@ const STUB_SSH_KEYSCAN = '#!/usr/bin/env python3\n' +
 // local shell, so a "remote" step actually runs locally under a stand-in
 // process — enough to prove the shared run_steps()/Emitter code path produces
 // an identical step sequence over both transports.
+// The stub runs the "remote" command locally. Both envelopes below declare
+// user: 'root', and SshTransport now probes `id -u` once at start() to decide
+// how it reaches root -- so a stub that answered with the LOCAL uid (1000) made
+// the transport correctly conclude "not root, no sudo" and refuse, which is the
+// right answer to the wrong question. Answering 0 is what the root remote these
+// tests simulate would actually say. The real behaviour, against a real sshd
+// and a genuinely unprivileged account, is covered by the escalation tests in
+// pilot-exec-live.test.js -- not here.
 const STUB_SSH = '#!/usr/bin/env python3\n' +
     'import sys, subprocess\n' +
-    'sys.exit(subprocess.call(["/bin/sh", "-c", sys.argv[-1]]))\n';
+    'cmd = sys.argv[-1]\n' +
+    'if cmd.strip() in ("id -u", "id -un"):\n' +
+    '    print("0" if cmd.strip() == "id -u" else "root")\n' +
+    '    sys.exit(0)\n' +
+    'sys.exit(subprocess.call(["/bin/sh", "-c", cmd]))\n';
 
 // sshpass -d <fd> reads the password from an inherited file descriptor and
 // never sees it in argv or the environment. This stub records exactly that —

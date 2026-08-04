@@ -619,14 +619,14 @@ class Transport:
     def run(self, argv, on_line, stdin_text=None, timeout=None):
         raise NotImplementedError
 
-    def capture(self, argv, stdin_text=None, timeout=None):
+    def capture(self, argv, stdin_text=None, timeout=None, escalate=True):
         out_lines = []
         err_lines = []
 
         def sink(stream, line):
             (out_lines if stream == "stdout" else err_lines).append(line)
 
-        rc = self.run(argv, sink, stdin_text, timeout)
+        rc = self.run(argv, sink, stdin_text, timeout, escalate)
         return rc, "\n".join(out_lines), "\n".join(err_lines)
 
     def write_file(self, path, content, mode, owner):
@@ -645,7 +645,10 @@ class LocalTransport(Transport):
     def __init__(self, timeout=None):
         self._timeout = DEFAULT_TIMEOUT if timeout is None else timeout
 
-    def run(self, argv, on_line, stdin_text=None, timeout=None):
+    def run(self, argv, on_line, stdin_text=None, timeout=None, escalate=True):
+        # `escalate` is accepted for transport parity and ignored: this helper
+        # already runs as root (cockpit.spawn superuser:'require'), so a local
+        # step has nothing to escalate TO.
         if not argv:
             on_line("stderr", "pilot-exec: empty argv")
             return 127
@@ -862,6 +865,9 @@ class SshTransport(Transport):
         self._timeout = DEFAULT_TIMEOUT if timeout is None else timeout
         self._pem_file = None
         self._kh_file = None
+        # Set once by _probe_privilege() in start(). [] means "already root".
+        self._sudo = []
+        self._sudo_password = None
 
     def start(self, emitter=None):
         status = hostkey_gate(self._ssh)
@@ -892,7 +898,65 @@ class SshTransport(Transport):
         except (IOError, OSError) as exc:
             raise Fail(EXIT_TRANSPORT, "SSH_UNREACHABLE",
                        "cannot prepare local SSH transport state: " + str(exc))
+        self._probe_privilege()
         return status
+
+    def _probe_privilege(self):
+        """Decides ONCE how remote commands reach root, or refuses to start.
+
+        Every step of a provisioning plan writes outside the login user's home:
+        /var/cache/pilot, /usr/local/bin, /etc/systemd/system, the firewall.
+        Nothing in this transport used to escalate at all, so a plan run against
+        the ordinary login account of any cloud image -- ubuntu@, ec2-user@,
+        admin@, debian@ -- failed on its very first step with "Permission
+        denied" and then kept going through the remaining 27. Connecting as root
+        is not a workaround either: most cloud images disable root SSH outright.
+
+        Three outcomes, decided here rather than discovered 1/28 steps in:
+          - already root          -> no prefix
+          - passwordless sudo     -> `sudo -n --`
+          - sudo wants a password -> `sudo -k -S -p "" --`, and only when a
+                                     password is actually available
+        Anything else is a hard refusal naming the command that fixes it. A plan
+        that cannot reach root cannot do ANY of its work, so starting it anyway
+        is strictly worse than saying so.
+        """
+        rc, out, err = self.capture(["id", "-u"], escalate=False)
+        if rc != 0:
+            raise Fail(EXIT_TRANSPORT, "SSH_UNREACHABLE",
+                       "cannot determine the remote user: " +
+                       (err.strip() or "id -u exited " + str(rc)))
+        uid = out.strip()
+        if uid == "0":
+            self._sudo = []
+            return
+
+        rc, _out, _err = self.capture(["sudo", "-n", "true"], escalate=False)
+        if rc == 0:
+            self._sudo = ["sudo", "-n", "--"]
+            return
+
+        password = self._creds.get("password")
+        if password:
+            # Verified BEFORE the plan runs: a password sudo will not accept
+            # must not surface as 28 identical authentication failures.
+            self._sudo = ["sudo", "-k", "-S", "-p", "", "--"]
+            self._sudo_password = password
+            rc, _out, err = self.capture(["true"])
+            if rc != 0:
+                self._sudo = []
+                self._sudo_password = None
+                raise Fail(EXIT_TRANSPORT, "SSH_AUTH_FAILED",
+                           "the SSH password was not accepted by sudo on the remote host: " +
+                           (err.strip() or "sudo exited " + str(rc)))
+            return
+
+        raise Fail(EXIT_TRANSPORT, "SSH_AUTH_FAILED",
+                   "the remote account (uid " + uid + ") is not root and cannot use sudo without a "
+                   "password, so Pilot cannot install anything. Either grant it passwordless sudo "
+                   "(echo '" + self._ssh["user"] + " ALL=(ALL) NOPASSWD:ALL' | sudo tee "
+                   "/etc/sudoers.d/pilot) or connect with an account that can.")
+
 
     def _base_argv(self):
         argv = ["ssh", "-p", str(int(self._ssh["port"])),
@@ -912,7 +976,15 @@ class SshTransport(Transport):
         argv.append(self._ssh["user"] + "@" + self._ssh["host"])
         return argv
 
-    def _wrap(self, argv):
+    def _sudo_prefix(self):
+        """The escalation prefix for one remote command, as argv items.
+
+        Empty when the remote account is already root. Determined ONCE by
+        _probe_privilege() during start(), never guessed per command.
+        """
+        return list(self._sudo)
+
+    def _wrap(self, argv, escalate=True):
         """Builds the full local argv for one remote command, plus any file
         descriptors that must survive exec into the child.
 
@@ -924,7 +996,8 @@ class SshTransport(Transport):
         descriptor NUMBER appears in argv — never the secret itself — and the
         descriptor is closed on our side the moment the child has it.
         """
-        remote = " ".join(shlex.quote(item) for item in argv)
+        full_argv = (self._sudo_prefix() + list(argv)) if escalate else list(argv)
+        remote = " ".join(shlex.quote(item) for item in full_argv)
         base = self._base_argv() + [remote]
         if self._ssh["auth"] != "password":
             return base, ()
@@ -933,11 +1006,21 @@ class SshTransport(Transport):
         os.close(write_fd)
         return ["sshpass", "-d", str(read_fd)] + base, (read_fd,)
 
-    def run(self, argv, on_line, stdin_text=None, timeout=None):
+    def run(self, argv, on_line, stdin_text=None, timeout=None, escalate=True):
         if not argv:
             on_line("stderr", "pilot-exec: empty argv")
             return 127
-        full, extra_fds = self._wrap(argv)
+        # `sudo -k -S -p ""` reads the password as the FIRST LINE of stdin and
+        # consumes exactly that one line -- deterministically, because -k drops
+        # any cached timestamp so sudo always prompts. Without -k a cached
+        # timestamp would make sudo consume nothing and the password line would
+        # fall through into the command's own stdin, corrupting it (write_file's
+        # base64 payload is exactly that case). The password reaches the remote
+        # host inside the encrypted ssh stream and never touches argv or the
+        # environment, both of which are world-readable through /proc.
+        if escalate and self._sudo_password is not None and self._sudo:
+            stdin_text = self._sudo_password + "\n" + (stdin_text or "")
+        full, extra_fds = self._wrap(argv, escalate)
         try:
             try:
                 proc = subprocess.Popen(

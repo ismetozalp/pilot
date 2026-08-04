@@ -42,7 +42,7 @@ let unavailable = MISSING.length ? 'not on PATH: ' + MISSING.join(', ') : false;
 const CONTAINERFILE = [
     'FROM docker.io/library/debian:12-slim',
     'RUN apt-get update && apt-get install -y --no-install-recommends \\',
-    '      openssh-server python3 procps coreutils ca-certificates \\',
+    '      openssh-server python3 procps coreutils ca-certificates sudo \\',
     '    && rm -rf /var/lib/apt/lists/*',
     'RUN mkdir -p /run/sshd && ssh-keygen -A \\',
     "    && sed -i 's/^#*PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config",
@@ -77,14 +77,23 @@ const started = [];
 
 function startContainer(name, publishSsh) {
     sh('podman', ['rm', '-f', name]);
-    const args = ['run', '-d', '--name', name];
     let port = 0;
-    if (publishSsh) {
-        port = 21000 + Math.floor(Math.random() * 15000);
-        args.push('-p', '127.0.0.1:' + port + ':22');
+    let created = null;
+    // A random port collides often enough to have failed a real run ("Failed to
+    // bind port ... Address already in use"), which reads as a product failure
+    // rather than the harness clash it is. Retry on a fresh port instead.
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+        const args = ['run', '-d', '--name', name];
+        if (publishSsh) {
+            port = 21000 + Math.floor(Math.random() * 15000);
+            args.push('-p', '127.0.0.1:' + port + ':22');
+        }
+        args.push(TAG);
+        created = sh('podman', args);
+        if (created.status === 0) break;
+        if (!publishSsh || !/address already in use/i.test(String(created.stderr))) break;
+        sh('podman', ['rm', '-f', name]);
     }
-    args.push(TAG);
-    const created = sh('podman', args);
     assert.equal(created.status, 0, 'podman run failed: ' + created.stderr);
     started.push(name);
     assert.equal(sh('podman', ['cp', HELPER, name + ':/usr/local/bin/pilot-exec']).status, 0);
@@ -764,3 +773,170 @@ test('the ssh PEM temp file is 0600 in flight and gone after, on success and on 
         assert.deepEqual(failed.remaining, [],
             'the pem temp file was not removed after a failed run');
     });
+
+// --- remote privilege escalation ------------------------------------------
+//
+// Found by hand against a real EC2 host. SshTransport escalated NOTHING: every
+// remote command ran as the login user. A plan against the ordinary account of
+// any cloud image -- ubuntu@, ec2-user@, admin@, debian@ -- therefore failed on
+// its first step with "Permission denied" and kept going through the remaining
+// 27. Connecting as root is not a workaround: most cloud images disable root
+// SSH outright, and the user's own server is ubuntu@.
+//
+// Every other tier authorised root, which is precisely why nothing caught it.
+// These tests create a genuinely unprivileged remote account and prove the
+// three outcomes against a real sshd.
+
+function makeUser(name, user, sudoers) {
+    assert.equal(sh('podman', ['exec', name, 'useradd', '-m', '-s', '/bin/sh', user]).status, 0);
+    assert.equal(sh('podman', ['exec', name, 'mkdir', '-p', '-m', '0700',
+        '/home/' + user + '/.ssh']).status, 0);
+    if (sudoers !== null) {
+        const w = sh('podman', ['exec', '-i', name, 'sh', '-c',
+            'cat > /etc/sudoers.d/pilot-test && chmod 0440 /etc/sudoers.d/pilot-test'],
+            { input: sudoers + '\n' });
+        assert.equal(w.status, 0, w.stderr);
+    }
+}
+
+function authoriseKeyFor(name, user, publicKey) {
+    const home = user === 'root' ? '/root' : '/home/' + user;
+    const w = sh('podman', ['exec', '-i', name, 'sh', '-c',
+        'cat > ' + home + '/.ssh/authorized_keys && chmod 0600 ' + home + '/.ssh/authorized_keys' +
+        ' && chown -R ' + user + ':' + user + ' ' + home + '/.ssh'], { input: publicKey });
+    assert.equal(w.status, 0, w.stderr);
+}
+
+// The exact step that failed for the user, plus proof of WHO ran it.
+function rootOnlySteps() {
+    return [
+        step({ id: 'whoami', title: 'Who is running this', mutating: false,
+            why: 'proves the escalation', argv: ['id', '-un'] }),
+        step({ id: 'cache-dir', title: 'Create the Pilot download cache', mutating: true,
+            why: 'the step that failed in the field',
+            argv: ['install', '-d', '-m', '0755', '/var/cache/pilot'],
+            check: { argv: ['test', '-d', '/var/cache/pilot'], expect: 'zero' } })
+    ];
+}
+
+function sshEnvelope(port, user, keys, steps, fingerprint) {
+    return envelope(steps, {
+        transport: 'ssh', run_id: '20260804T120000Z',
+        ssh: { host: '127.0.0.1', port: port, user: user, auth: 'pem',
+            accept_fingerprint: fingerprint },
+        credentials: { password: null, pem: keys.pem }
+    });
+}
+
+function hostEnvFor(dir) {
+    return { PILOT_RUNS_DIR: path.join(dir, 'runs'), PILOT_KNOWN_HOSTS: path.join(dir, 'known_hosts') };
+}
+
+// Same shape as the parity test above: probe once, then hand the fingerprint
+// to the run envelope as an explicit confirmation.
+function hostFingerprint(port, env) {
+    const probe = runOnHost({ host: '127.0.0.1', port: port }, env, '--check-hostkey');
+    assert.equal(probe.code, 0, probe.err);
+    return probe.lines[0].fingerprint;
+}
+
+test('ssh: a non-root account with passwordless sudo really reaches root',
+    { skip: SKIP }, (t) => {
+    t.after(destroyAll);
+    const name = 'pilot-sudo-nopasswd';
+    const port = startContainer(name, true);
+    makeUser(name, 'pilot', 'pilot ALL=(ALL) NOPASSWD:ALL');
+    const keys = makeKeypair();
+    authoriseKeyFor(name, 'pilot', keys.pub);
+    assert.equal(waitForSshd(port), true, 'sshd never came up');
+
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pilot-sudo-'));
+    const env = hostEnvFor(dir);
+    const fp = hostFingerprint(port, env);
+
+    const run = runOnHost(sshEnvelope(port, 'pilot', keys, rootOnlySteps(), fp), env);
+    assert.equal(run.code, 0, 'the plan must succeed as an unprivileged user: ' + run.err);
+    assert.deepEqual(outcomes(run.lines), ['whoami:ok', 'cache-dir:ok'],
+        'this is the exact step that failed in the field');
+
+    // Not merely "exit 0" -- the command genuinely ran as root.
+    const who = run.lines.filter((l) => l.t === 'output' && l.id === 'whoami').map((l) => l.line);
+    assert.deepEqual(who, ['root'],
+        'the remote command must run as root, not as the login user');
+
+    // And the directory really exists, owned by root, on the remote host.
+    const stat = sh('podman', ['exec', name, 'stat', '-c', '%U:%G %a', '/var/cache/pilot']);
+    assert.equal(stat.status, 0, 'the directory was never created');
+    assert.match(String(stat.stdout).trim(), /^root:root 755$/);
+});
+
+test('ssh: a non-root account with NO sudo refuses before running a single step',
+    { skip: SKIP }, (t) => {
+    t.after(destroyAll);
+    const name = 'pilot-sudo-none';
+    const port = startContainer(name, true);
+    makeUser(name, 'pilot', null);   // no sudoers entry at all
+    const keys = makeKeypair();
+    authoriseKeyFor(name, 'pilot', keys.pub);
+    assert.equal(waitForSshd(port), true, 'sshd never came up');
+
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pilot-nosudo-'));
+    const env = hostEnvFor(dir);
+    const fp = hostFingerprint(port, env);
+
+    const run = runOnHost(sshEnvelope(port, 'pilot', keys, rootOnlySteps(), fp), env);
+    assert.notEqual(run.code, 0, 'it must not report success');
+    assert.deepEqual(outcomes(run.lines), [],
+        'NOT ONE step may run: a plan that cannot reach root cannot do any of its work, ' +
+        'and 28 identical permission failures is worse than one honest refusal');
+
+    const fatal = JSON.parse(String(run.err).trim().split('\n').pop());
+    assert.equal(fatal.t, 'fatal');
+    assert.equal(fatal.kind, 'SSH_AUTH_FAILED');
+    assert.match(fatal.message, /not root and cannot use sudo/i);
+    assert.match(fatal.message, /NOPASSWD/, 'the refusal must name the command that fixes it');
+    assert.match(fatal.message, /pilot ALL=/, 'and name the actual account');
+
+    // Nothing was touched on the remote host.
+    assert.notEqual(sh('podman', ['exec', name, 'test', '-d', '/var/cache/pilot']).status, 0);
+});
+
+test('ssh: sudo that demands a password uses it, and it never reaches argv',
+    { skip: SKIP }, (t) => {
+    t.after(destroyAll);
+    const name = 'pilot-sudo-password';
+    const port = startContainer(name, true);
+    const SECRET = 'sudo-Passw0rd-canary';
+    makeUser(name, 'pilot', 'pilot ALL=(ALL) ALL');   // password REQUIRED
+    assert.equal(sh('podman', ['exec', '-i', name, 'chpasswd'],
+        { input: 'pilot:' + SECRET + '\n' }).status, 0);
+    const keys = makeKeypair();
+    authoriseKeyFor(name, 'pilot', keys.pub);
+    assert.equal(waitForSshd(port), true, 'sshd never came up');
+
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pilot-sudopw-'));
+    const env = hostEnvFor(dir);
+    const fp = hostFingerprint(port, env);
+
+    // SSH auth is by KEY here, deliberately: it isolates the thing under test
+    // (sudo -k -S consuming exactly one stdin line) from sshpass, which this
+    // machine may not have and which is already covered elsewhere. The password
+    // in credentials is what sudo needs, not what ssh needs -- and that is the
+    // realistic shape anyway for a PEM login whose account has ordinary sudo.
+    const run = runOnHost(envelope(rootOnlySteps(), {
+        transport: 'ssh', run_id: '20260804T130000Z',
+        ssh: { host: '127.0.0.1', port: port, user: 'pilot', auth: 'pem',
+            accept_fingerprint: fp },
+        credentials: { password: SECRET, pem: keys.pem }
+    }), env);
+
+    assert.equal(run.code, 0, 'password sudo must work: ' + run.err);
+    const who = run.lines.filter((l) => l.t === 'output' && l.id === 'whoami').map((l) => l.line);
+    assert.deepEqual(who, ['root']);
+
+    // The password travels down the ssh stdin stream. It must appear in no
+    // emitted line at all -- /proc/<pid>/cmdline is world-readable, and a
+    // transcript is something users paste into bug reports.
+    assert.ok(!run.raw.includes(SECRET), 'the sudo password leaked into the transcript');
+    assert.ok(!run.err.includes(SECRET), 'the sudo password leaked into stderr');
+});

@@ -1849,3 +1849,133 @@ test('index.html hides the bar, the copy button and the transcript until a run e
     assert.match(pane, /data-testid="execute-idle"[\s\S]{0,80}x-show="!hasRun\(\)"/);
     assert.match(pane, /Nothing has run yet/);
 });
+
+// ---------------------------------- the headline must not throw away the reason
+
+test('firstFailure/failureMessage: the banner names the step and quotes its own words', () => {
+    // THE DEFECT, from a real remote run: the banner read "Unknown failure"
+    // while the transcript directly beneath it said exactly what happened.
+    const exec = { steps: [
+        { id: 'ok-1', title: 'Detect the OS', status: 'ok', exit: 0, lines: [] },
+        { id: 'cache-dir', title: 'Create the Pilot download cache', status: 'failed', exit: 1, lines: [
+            { stream: 'stdout', text: '$ install -d -m 0755 /var/cache/pilot' },
+            { stream: 'stderr', text: "install: cannot create directory '/var/cache/pilot': Permission denied" }
+        ] },
+        { id: 'later', title: 'Later step', status: 'failed', exit: 9, lines: [] }
+    ] };
+    const f = UI.firstFailure(exec);
+    assert.equal(f.id, 'cache-dir', 'the FIRST failure is the cause; later ones are consequences');
+    assert.equal(f.exit, 1);
+    assert.match(f.reason, /Permission denied/);
+    const msg = UI.failureMessage(f);
+    assert.match(msg, /Create the Pilot download cache/);
+    assert.match(msg, /exit 1/);
+    assert.match(msg, /Permission denied/);
+    assert.ok(!/Unknown failure/.test(msg), 'the generic last resort must not survive: ' + msg);
+});
+
+test('firstFailure: stderr wins over stdout, and stdout is used when there is no stderr', () => {
+    const withBoth = { steps: [{ id: 'a', title: 'A', status: 'failed', exit: 2, lines: [
+        { stream: 'stdout', text: 'chatty progress' }, { stream: 'stderr', text: 'the real reason' }] }] };
+    assert.equal(UI.firstFailure(withBoth).reason, 'the real reason');
+    const stdoutOnly = { steps: [{ id: 'a', title: 'A', status: 'failed', exit: 2, lines: [
+        { stream: 'stdout', text: 'only this' }] }] };
+    assert.equal(UI.firstFailure(stdoutOnly).reason, 'only this');
+    // A silent failure still names the step rather than saying nothing.
+    const silent = { steps: [{ id: 'a', title: 'Quiet step', status: 'failed', exit: 3, lines: [] }] };
+    assert.equal(UI.failureMessage(UI.firstFailure(silent)), 'Quiet step failed (exit 3)');
+});
+
+test('firstFailure: no failure, and hostile shapes, yield null and never throw', () => {
+    assert.equal(UI.firstFailure({ steps: [{ id: 'a', title: 'A', status: 'ok', exit: 0, lines: [] }] }), null);
+    for (const bad of [null, undefined, {}, { steps: null }, { steps: 'no' }, { steps: [null] },
+        { steps: [{ status: 'failed' }] }, 7, [], 'x'])
+        assert.doesNotThrow(() => UI.firstFailure(bad), JSON.stringify(bad));
+    assert.equal(UI.failureMessage(null), '');
+    assert.equal(UI.failureMessage(undefined), '');
+    assert.equal(UI.failureMessage({}), 'A step failed');
+});
+
+test('start(): a failed run reports the transcript reason, NOT "Unknown failure"', async () => {
+    // The helpers above are pure and were tested in isolation -- which proves
+    // nothing about whether start() uses them. Mutation showed exactly that:
+    // stubbing firstFailure() out left every other test green. This drives the
+    // real start() and asserts on what the banner would actually say.
+    const TRANSCRIPT = [
+        '{"t":"run-start","run_id":"20260804T000000Z","transport":"ssh","steps":2}',
+        '{"t":"step-start","id":"cache-dir","title":"Create the Pilot download cache",' +
+            '"cmd":"install -d -m 0755 /var/cache/pilot"}',
+        '{"t":"output","id":"cache-dir","stream":"stderr",' +
+            '"line":"install: cannot create directory \'/var/cache/pilot\': Permission denied"}',
+        '{"t":"step-end","id":"cache-dir","status":"failed","exit":1,"ms":12}',
+        '{"t":"run-end","status":"failed","kind":null}'
+    ].join('\n') + '\n';
+
+    // cockpit rejects the spawn on a non-zero exit, and the rejection carries
+    // no message of its own because the helper's real output is the C4 JSON on
+    // stdout. That is precisely how "Unknown failure" was produced.
+    const c = await withFakeCockpit({
+        spawn() {
+            let onChunk = null;
+            const p = Promise.resolve().then(() => {
+                if (onChunk) onChunk(TRANSCRIPT);
+                throw Object.assign(new Error(''), { exit_status: 1, problem: null });
+            });
+            p.input = () => p;
+            p.stream = (fn) => { onChunk = fn; return p; };
+            return p;
+        },
+        file() { return { read: () => Promise.resolve(null), replace: () => Promise.resolve(), close() {} }; }
+    }, async () => {
+        const ui = UI.pilotSetupUi();
+        ui.choices.target = 'local';
+        ui.plan = { target: 'local', host: null,
+            steps: [{ id: 'cache-dir', title: 'Create the Pilot download cache',
+                argv: ['install', '-d', '/var/cache/pilot'] }] };
+        await ui.start();
+        return ui;
+    });
+
+    assert.ok(c.error, 'a failed run must produce a banner');
+    assert.ok(!/Unknown failure/.test(c.error.message),
+        'the generic last resort must not be what the user reads: ' + c.error.message);
+    assert.match(c.error.message, /Create the Pilot download cache/,
+        'the banner must name the step that failed');
+    assert.match(c.error.message, /Permission denied/,
+        'and quote the reason that is already sitting in the transcript below it');
+});
+
+test('start(): a classified kind survives -- the step text never overwrites it', async () => {
+    // A hard stop (CHECKSUM_MISMATCH) or a TLS classification is more specific
+    // than any step's last line, and must not be downgraded to GENERIC.
+    const TRANSCRIPT = [
+        '{"t":"run-start","run_id":"20260804T000000Z","transport":"local","steps":1}',
+        '{"t":"step-start","id":"verify","title":"Verify the download","cmd":"sha256sum"}',
+        '{"t":"output","id":"verify","stream":"stderr","line":"digest mismatch"}',
+        '{"t":"step-end","id":"verify","status":"failed","exit":6,"ms":3}',
+        '{"t":"run-end","status":"failed","kind":"CHECKSUM_MISMATCH"}'
+    ].join('\n') + '\n';
+    const c = await withFakeCockpit({
+        spawn() {
+            let onChunk = null;
+            const p = Promise.resolve().then(() => {
+                if (onChunk) onChunk(TRANSCRIPT);
+                throw Object.assign(new Error('CHECKSUM_MISMATCH: the downloaded file does not match'),
+                    { name: 'PilotError', kind: 'CHECKSUM_MISMATCH' });
+            });
+            p.input = () => p;
+            p.stream = (fn) => { onChunk = fn; return p; };
+            return p;
+        },
+        file() { return { read: () => Promise.resolve(null), replace: () => Promise.resolve(), close() {} }; }
+    }, async () => {
+        const ui = UI.pilotSetupUi();
+        ui.choices.target = 'local';
+        ui.plan = { target: 'local', host: null,
+            steps: [{ id: 'verify', title: 'Verify the download', argv: ['sha256sum', '-c'] }] };
+        await ui.start();
+        return ui;
+    });
+    assert.equal(c.error.kind, 'CHECKSUM_MISMATCH', 'a hard stop must not be downgraded to GENERIC');
+    assert.match(c.error.message, /does not match/);
+});

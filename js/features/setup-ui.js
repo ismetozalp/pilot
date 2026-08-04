@@ -761,6 +761,43 @@
         return next;
     }
 
+    // The banner over a failed run said "Unknown failure" while the transcript
+    // directly beneath it read
+    //   Create the Pilot download cache -- failed (exit 1)
+    //   install: cannot create directory '/var/cache/pilot': Permission denied
+    // -- the reason was already on screen, and the headline threw it away.
+    // cockpit rejects the spawn on a non-zero exit with no message of its own
+    // (the helper's real output is the C4 JSON on stdout, not stderr), so
+    // describe()'s last resort produced that string. The transcript is the
+    // better source and it is already parsed: name the step that failed and
+    // quote its own last words.
+    function firstFailure(exec) {
+        const e = (exec && typeof exec === 'object') ? exec : blankExec();
+        const steps = Array.isArray(e.steps) ? e.steps : [];
+        for (let i = 0; i < steps.length; i++) {
+            if (!steps[i] || steps[i].status !== 'failed') continue;
+            const lines = Array.isArray(steps[i].lines) ? steps[i].lines : [];
+            let reason = '';
+            // stderr first -- that is where a tool explains itself.
+            for (let j = lines.length - 1; j >= 0 && reason === ''; j--)
+                if (lines[j] && lines[j].stream === 'stderr' && str(lines[j].text).trim() !== '')
+                    reason = str(lines[j].text).trim();
+            for (let j = lines.length - 1; j >= 0 && reason === ''; j--)
+                if (lines[j] && str(lines[j].text).trim() !== '')
+                    reason = str(lines[j].text).trim();
+            const exit = (steps[i].exit === null || steps[i].exit === undefined) ? null : steps[i].exit;
+            return { id: str(steps[i].id), title: str(steps[i].title), exit: exit, reason: reason };
+        }
+        return null;
+    }
+
+    function failureMessage(f) {
+        if (!f || typeof f !== 'object') return '';
+        const head = (str(f.title) || str(f.id) || 'A step') + ' failed' +
+            (f.exit === null || f.exit === undefined ? '' : ' (exit ' + f.exit + ')');
+        return str(f.reason) ? head + ': ' + str(f.reason) : head;
+    }
+
     function progress(exec) {
         const e = (exec && typeof exec === 'object') ? exec : blankExec();
         const steps = Array.isArray(e.steps) ? e.steps : [];
@@ -1560,6 +1597,18 @@
                     this.error = describe(e);
                 }
 
+                // Prefer the transcript's own account of what went wrong over
+                // whatever the process exit produced. Only GENERIC/UNKNOWN is
+                // replaced: a classified kind (CHECKSUM_MISMATCH, a TLS
+                // failure, a hard stop) is more specific than any step text and
+                // must survive. A run that "succeeded" at the process level
+                // while a step failed had no banner at all -- that is what the
+                // !this.error arm covers.
+                const failed = firstFailure(this.exec);
+                if (failed && (!this.error || this.error.kind === 'GENERIC' ||
+                        this.error.kind === 'UNKNOWN'))
+                    this.error = describe(fail('GENERIC', failureMessage(failed)));
+
                 await this.persist(this.runId, raw);
                 this.reach = reachFrom(this.exec);
                 this.handoverResult = handover(this.exec, this.reach);
@@ -1758,6 +1807,7 @@
         idForChoices, hbbsInfoFrom, apiPortFrom, recordForRegistration,
         validateTarget, portRows, awsCommand,
         parseLine, reduce, progress, transcriptText, runPath,
+        firstFailure, failureMessage,
         handover, passwordGate, manualFor,
         runIdFor, splitStream, detectRequest, envelopeCtx, planChoicesFor, requiredPorts, reachFrom,
         notifyServerChanged,
