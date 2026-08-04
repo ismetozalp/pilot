@@ -14,14 +14,16 @@
 // (serverOpsUi()) below the divider touches the bridge, and every access to
 // `cockpit` there is guarded.
 //
-// A design gap this task inherited rather than invented: no earlier task ever
-// writes a day-2 SSH credential (PilotServers.writeSecret(id, 'ssh', ...) has
-// no caller anywhere in this codebase yet), and no server record carries an
-// ssh `user` or `auth` field. This file therefore treats the mere PRESENCE of
-// /etc/pilot/servers/<id>.ssh as `hasCredential`, and — if a remote op is ever
-// actually run — sends the stored secret verbatim as the SSH password with
-// user "root". That is a real limitation (no PEM-based day-2 credential is
-// modelled), called out in the task report, not silently assumed away.
+// GAP C (task 33) fixed the two halves of a design gap this task originally
+// inherited rather than invented: js/features/setup-ui.js now persists the
+// credential via PilotServers.writeSshCredential() when "remember for day-2
+// operations" is checked and provisioning succeeds, tagged with its real
+// auth type (password | pem); this file reads it back with
+// PilotServers.readSecret() + decodeSshCredential() and sends it to
+// pilot-exec as whichever of ssh.auth/credentials.{password,pem} that tag
+// says, never assuming "password" unconditionally. It still treats the mere
+// PRESENCE of /etc/pilot/servers/<id>.ssh as `hasCredential`, and no server
+// record carries an ssh `user` field (the day-2 user is always "root").
 'use strict';
 (function (root) {
     function need(name, path) {
@@ -469,18 +471,31 @@
     // js/core/provision-plan.js's toEnvelope() produces, but hand-assembled
     // here since there is no provisioning PLAN behind a day-2 op, only one
     // ad hoc command.
+    //
+    // `credential` is js/core/servers.js's decodeSshCredential() shape,
+    // {authType, secret} | null — GAP C (task 33): this used to unconditionally
+    // hardcode auth:'password' and send the raw stored string as the SSH
+    // password no matter what it actually was, because writeSecret() had no
+    // caller and the stored secret carried no auth-type tag at all. A stored
+    // PEM would have been sent to pilot-exec AS A PASSWORD (a clean
+    // SSH_AUTH_FAILED, but with no way to explain the real cause).
     function envelopeFor(opId, server, credential) {
         const op = findOp(opId);
         const remote = server && server.transport === 'ssh';
+        const authType = (credential && typeof credential.authType === 'string') ? credential.authType : 'password';
+        const secret = (credential && typeof credential.secret === 'string') ? credential.secret : '';
         return {
             version: 1,
             run_id: runIdFor(),
             transport: remote ? 'ssh' : 'local',
             ssh: remote ? {
                 host: str(server.host), port: (typeof server.sshPort === 'number' ? server.sshPort : 22),
-                user: 'root', auth: 'password', accept_fingerprint: null
+                user: 'root', auth: authType, accept_fingerprint: null
             } : null,
-            credentials: remote ? { password: str(credential), pem: null } : null,
+            credentials: remote ? {
+                password: authType === 'password' ? secret : null,
+                pem: authType === 'pem' ? secret : null
+            } : null,
             steps: [{ id: op.id, title: op.label, mutating: !!op.danger, why: op.why, argv: opArgv(opId, server) }]
         };
     }
@@ -648,8 +663,18 @@
                 self.opAlerts[opId] = null;
 
                 const Servers = servers();
+                // decodeSshCredential() turns the raw stored string into
+                // {authType, secret} | null (GAP C, task 33) — falls back to
+                // null (never a bare string) if an older Servers object
+                // without it is ever installed, which envelopeFor() already
+                // treats as "no credential" rather than misreading raw JSON
+                // as a password.
                 const credP = (server.transport === 'ssh' && Servers && typeof Servers.readSecret === 'function')
-                    ? Promise.resolve(Servers.readSecret(server.id, 'ssh')).catch(function () { return null; })
+                    ? Promise.resolve(Servers.readSecret(server.id, 'ssh'))
+                        .then(function (raw) {
+                            return (typeof Servers.decodeSshCredential === 'function')
+                                ? Servers.decodeSshCredential(raw) : null;
+                        }, function () { return null; })
                     : Promise.resolve(null);
 
                 return credP.then(function (credential) {

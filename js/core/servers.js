@@ -365,6 +365,68 @@
         });
     }
 
+    // ---------------------------------------------- SSH day-2 credentials ---
+    //
+    // GAP C (task 33): writeSecret() had NO callers anywhere in the repo, so
+    // the wizard's "remember for day-2 operations" checkbox persisted
+    // nothing, and — separately — the .ssh secret carried no auth-type
+    // discriminator at all: js/features/server-ops-ui.js's envelopeFor()
+    // unconditionally assumed `auth: 'password'`, so a stored PEM would later
+    // be sent to pilot-exec as an SSH PASSWORD (a clean SSH_AUTH_FAILED, but
+    // with no way to explain the real cause). These wrap the EXISTING,
+    // UNCHANGED writeSecret/readSecret ('ssh' kind) rather than replacing
+    // them, so every existing guarantee (0600 root:root, never in argv, never
+    // logged) is inherited rather than re-implemented, and no caller of the
+    // generic pair (there are none in production, but the unit suite exists)
+    // is affected.
+    const SSH_AUTH_TYPES = ['password', 'pem', 'agent'];
+
+    // Pure. The on-disk shape is a small JSON envelope so a day-2 operation
+    // can choose the right auth mechanism instead of guessing "password"
+    // unconditionally. An authType outside the closed vocabulary degrades to
+    // 'password' rather than throwing — the same fail-safe spirit as
+    // js/core/errors.js's normalize(): a corrupt or forward-incompatible tag
+    // must not crash Server Ops, only fall back to the ORIGINAL (and only
+    // ever previously possible) behaviour.
+    function encodeSshCredential(authType, secret) {
+        if (typeof secret !== 'string' || secret === '') {
+            throw fail('GENERIC', 'a secret must be a non-empty string', { type: typeof secret });
+        }
+        const at = SSH_AUTH_TYPES.indexOf(authType) !== -1 ? authType : 'password';
+        return JSON.stringify({ v: 1, authType: at, secret: secret });
+    }
+
+    // Pure. Backward compatible by construction: writeSecret(id, 'ssh', ...)
+    // had no caller before this fix, so the ONLY thing that could ever be
+    // sitting in an existing .ssh file is either nothing at all (null/empty —
+    // never written) or a bare string (this repo's only prior assumption,
+    // baked into server-ops-ui.js's envelopeFor() as `auth: 'password'`
+    // unconditionally) — never anything that needs an actual migration.
+    // Anything that is not OUR OWN JSON envelope is therefore treated as
+    // exactly that legacy bare-string password, not a decode failure.
+    function decodeSshCredential(raw) {
+        if (typeof raw !== 'string' || raw === '') return null;
+        try {
+            const parsed = JSON.parse(raw);
+            if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) &&
+                typeof parsed.secret === 'string' && parsed.secret !== '') {
+                const at = SSH_AUTH_TYPES.indexOf(parsed.authType) !== -1 ? parsed.authType : 'password';
+                return { authType: at, secret: parsed.secret };
+            }
+        } catch (e) { /* fall through: legacy bare-string password */ }
+        return { authType: 'password', secret: raw };
+    }
+
+    function writeSshCredential(id, authType, secret) {
+        return writeSecret(id, 'ssh', encodeSshCredential(authType, secret));
+    }
+
+    function readSshCredential(id) {
+        return readSecret(id, 'ssh').then(function (raw) {
+            return raw === null || raw === undefined ? null : decodeSshCredential(raw);
+        });
+    }
+
     function removeSecret(id, kind) {
         return guard('removeSecret', function (ck) {
             const p = secretPath(id, kind);
@@ -506,6 +568,11 @@
         readSecret: readSecret,
         writeSecret: writeSecret,
         removeSecret: removeSecret,
+        SSH_AUTH_TYPES: SSH_AUTH_TYPES,
+        encodeSshCredential: encodeSshCredential,
+        decodeSshCredential: decodeSshCredential,
+        writeSshCredential: writeSshCredential,
+        readSshCredential: readSshCredential,
         active: active,
         setActive: setActive,
         probeCompatibility: probeCompatibility

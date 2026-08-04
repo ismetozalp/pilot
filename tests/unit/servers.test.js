@@ -463,6 +463,84 @@ test('readSecret: strips exactly one trailing newline', async (t) => {
     assert.equal(await S.readSecret('prod', 'token'), 'T0KEN');
 });
 
+// --- GAP C (task 33): writeSecret() had zero callers, so the "remember for  ---
+// --- day-2 operations" checkbox persisted nothing, and the stored secret   ---
+// --- had no auth-type discriminator (a PEM would later be sent as a       ---
+// --- password). encodeSshCredential/decodeSshCredential and the           ---
+// --- writeSshCredential/readSshCredential wrappers built on the existing, ---
+// --- UNCHANGED writeSecret/readSecret are the fix.
+
+test('encodeSshCredential/decodeSshCredential round-trip password and pem, tagged', () => {
+    for (const authType of ['password', 'pem', 'agent']) {
+        const raw = S.encodeSshCredential(authType, 'S3CR3T');
+        assert.equal(typeof raw, 'string');
+        assert.equal(raw.indexOf('S3CR3T') >= 0, true);
+        const decoded = S.decodeSshCredential(raw);
+        assert.deepEqual(decoded, { authType, secret: 'S3CR3T' });
+    }
+});
+
+test('decodeSshCredential: an unrecognised auth type in stored JSON degrades to password, not a throw', () => {
+    const raw = JSON.stringify({ v: 1, authType: 'nonesuch', secret: 'x' });
+    assert.deepEqual(S.decodeSshCredential(raw), { authType: 'password', secret: 'x' });
+});
+
+test('decodeSshCredential: a legacy bare-string secret (the only shape that could ever ' +
+    'have existed before this fix — writeSecret() had no caller) decodes as a password, ' +
+    'exactly what server-ops-ui.js\'s envelopeFor() unconditionally assumed', () => {
+    assert.deepEqual(S.decodeSshCredential('s3cr3tpassword'), { authType: 'password', secret: 's3cr3tpassword' });
+});
+
+test('decodeSshCredential: null/undefined/empty is null, not a failure', () => {
+    assert.equal(S.decodeSshCredential(null), null);
+    assert.equal(S.decodeSshCredential(undefined), null);
+    assert.equal(S.decodeSshCredential(''), null);
+});
+
+test('encodeSshCredential: refuses an empty or non-string secret, same guarantee as writeSecret', () => {
+    for (const v of ['', null, undefined, 42, {}, []]) {
+        assert.throws(() => S.encodeSshCredential('password', v), (e) => e.name === 'PilotError');
+    }
+});
+
+test('writeSshCredential: writes 0600 root:root, tags the auth type, and the ' +
+    'secret never reaches argv', async (t) => {
+    const calls = fakeCockpit({});
+    t.after(dropCockpit);
+    const p = await S.writeSshCredential('prod', 'pem', 'BEGIN PEM DATA');
+    assert.equal(p, '/etc/pilot/servers/prod.ssh');
+    assert.equal(calls.replace.length, 1);
+    assert.equal(calls.replace[0].value.indexOf('BEGIN PEM DATA') >= 0, true, 'the secret is in the FILE');
+    calls.spawn.forEach((c) =>
+        assert.equal(JSON.stringify(c.argv).indexOf('BEGIN PEM DATA'), -1, 'the secret reached argv'));
+    assert.deepEqual(calls.spawn[1].argv, ['chmod', '0600', p]);
+    assert.deepEqual(calls.spawn[2].argv, ['chown', 'root:root', p]);
+    // What actually landed on disk (fakeCockpit's write side does not mutate
+    // its own read-side `files` map — see readSshCredential's own test below
+    // for the read half) decodes back to exactly what was written.
+    assert.deepEqual(S.decodeSshCredential(calls.replace[0].value), { authType: 'pem', secret: 'BEGIN PEM DATA' });
+});
+
+test('readSshCredential: reads back a stored, auth-type-tagged credential', async (t) => {
+    fakeCockpit({
+        files: { '/etc/pilot/servers/prod.ssh': S.encodeSshCredential('pem', 'BEGIN PEM DATA') }
+    });
+    t.after(dropCockpit);
+    assert.deepEqual(await S.readSshCredential('prod'), { authType: 'pem', secret: 'BEGIN PEM DATA' });
+});
+
+test('readSshCredential: no stored secret is null, not a failure (hasCredential must read as false)', async (t) => {
+    fakeCockpit({ files: {} });
+    t.after(dropCockpit);
+    assert.equal(await S.readSshCredential('prod'), null);
+});
+
+test('readSshCredential: a legacy bare-string secret (pre-dating this fix) still reads back, as password', async (t) => {
+    fakeCockpit({ files: { '/etc/pilot/servers/prod.ssh': 's3cr3tpassword' } });
+    t.after(dropCockpit);
+    assert.deepEqual(await S.readSshCredential('prod'), { authType: 'password', secret: 's3cr3tpassword' });
+});
+
 test('remove: unlinks the record and both secrets', async (t) => {
     const calls = fakeCockpit({});
     t.after(dropCockpit);

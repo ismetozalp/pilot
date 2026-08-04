@@ -776,5 +776,221 @@ test('a blank state starts on the target step with localhost preselected', () =>
     assert.equal(s.plan, null);
     assert.equal(s.manual, false);
     assert.equal(s.exec.status, 'idle');
+    assert.equal(s.credentialSaved, false);
+    assert.equal(s.credentialSaveError, null);
     assert.notEqual(UI.blankState().choices, s.choices);
+});
+
+// ------------------------------------------------------ credentialToRemember
+
+// GAP C (task 33): PilotServers.writeSecret() had NO caller anywhere in the
+// repo, so the "remember for day-2 operations" checkbox rendered, bound and
+// persisted nothing. credentialToRemember is the pure decision of WHAT (if
+// anything) should be persisted, given the wizard's own choices.
+
+test('credentialToRemember: nothing is remembered unless the box is checked', () => {
+    const c = { remember: false, target: 'ssh', auth: 'password', password: 'x' };
+    assert.equal(UI.credentialToRemember(c), null);
+});
+
+test('credentialToRemember: a local target needs no SSH credential at all, ' +
+    'even with remember checked (mirrors server-ops-ui.js treating id "local" as hasCredential:true unconditionally)', () => {
+    const c = { remember: true, target: 'local', auth: 'password', password: 'x' };
+    assert.equal(UI.credentialToRemember(c), null);
+});
+
+test('credentialToRemember: agent auth has no secret value to store -- a no-op, not a bug', () => {
+    const c = { remember: true, target: 'ssh', auth: 'agent', password: '', pem: '' };
+    assert.equal(UI.credentialToRemember(c), null);
+});
+
+test('credentialToRemember: a password auth with a real password is tagged "password"', () => {
+    const c = { remember: true, target: 'ssh', auth: 'password', password: 'S3cr3t!' };
+    assert.deepEqual(UI.credentialToRemember(c), { authType: 'password', secret: 'S3cr3t!' });
+});
+
+test('credentialToRemember: a pem auth with real key material is tagged "pem", never sent as a password', () => {
+    const c = { remember: true, target: 'ssh', auth: 'pem', pem: '-----BEGIN KEY-----\nX\n-----END KEY-----' };
+    assert.deepEqual(UI.credentialToRemember(c),
+        { authType: 'pem', secret: '-----BEGIN KEY-----\nX\n-----END KEY-----' });
+});
+
+test('credentialToRemember: an empty password/pem field is nothing to remember, not an empty-string secret', () => {
+    assert.equal(UI.credentialToRemember({ remember: true, target: 'ssh', auth: 'password', password: '' }), null);
+    assert.equal(UI.credentialToRemember({ remember: true, target: 'ssh', auth: 'pem', pem: '' }), null);
+});
+
+test('credentialToRemember: a hostile or missing choices object never throws', () => {
+    for (const bad of [null, undefined, 42, 'x', []]) {
+        assert.doesNotThrow(() => UI.credentialToRemember(bad));
+        assert.equal(UI.credentialToRemember(bad), null);
+    }
+});
+
+// -------------------------------------------------------------- slugForHost
+
+test('slugForHost: lowercases and dashes a normal hostname into a validateId()-safe slug', () => {
+    assert.equal(UI.slugForHost('rd.Example.COM'), 'rd-example-com');
+});
+
+test('slugForHost: strips leading/trailing dashes and caps at 64 characters', () => {
+    assert.equal(UI.slugForHost('-.-host.-.-'), 'host');
+    assert.equal(UI.slugForHost('a'.repeat(100)), 'a'.repeat(64));
+});
+
+test('slugForHost: an unusable host (empty, or nothing but separators) yields null, never an empty or bad id', () => {
+    for (const bad of ['', '...', null, undefined, '   ']) {
+        assert.equal(UI.slugForHost(bad), null);
+    }
+});
+
+// ------------------------------------------------------------ persistCredential
+//
+// GAP C (task 33): the Alpine-facing half. Only touches PilotServers directly
+// — never cockpit.spawn — so the credential structurally cannot reach argv
+// from this method; that is proven here by asserting the fake receives it as
+// a plain function argument, and separately (end to end, in a real browser)
+// by tests/e2e/setup.e2e.mjs's own GAP C scenario.
+
+function withFakeServers(fake, fn) {
+    const had = Object.prototype.hasOwnProperty.call(globalThis, 'PilotServers');
+    const prev = globalThis.PilotServers;
+    globalThis.PilotServers = fake;
+    try { return fn(); } finally {
+        if (had) globalThis.PilotServers = prev; else delete globalThis.PilotServers;
+    }
+}
+
+test('persistCredential: does nothing (and never touches PilotServers) when there is nothing to remember', async () => {
+    const calls = [];
+    await withFakeServers({ writeSshCredential(...args) { calls.push(args); return Promise.resolve(); } },
+        async () => {
+            const c = UI.pilotSetupUi();
+            c.choices.target = 'local';
+            c.choices.remember = true;
+            c.choices.auth = 'password';
+            c.choices.password = 'x';
+            c.choices.host = 'rd.example.com';
+            const ok = await c.persistCredential();
+            assert.equal(ok, false);
+            assert.equal(calls.length, 0);
+            assert.equal(c.credentialSaved, false);
+        });
+});
+
+test('persistCredential: a real password on an ssh target calls writeSshCredential with plain ' +
+    'arguments (never spawn/argv) and reports success', async () => {
+    const calls = [];
+    await withFakeServers({ writeSshCredential(...args) { calls.push(args); return Promise.resolve('/etc/pilot/servers/rd-example-com.ssh'); } },
+        async () => {
+            const c = UI.pilotSetupUi();
+            c.choices.target = 'ssh';
+            c.choices.host = 'rd.Example.com';
+            c.choices.auth = 'password';
+            c.choices.password = 'S3cr3t!';
+            c.choices.remember = true;
+            const ok = await c.persistCredential();
+            assert.equal(ok, true);
+            assert.equal(c.credentialSaved, true);
+            assert.equal(c.credentialSaveError, null);
+            assert.deepEqual(calls, [['rd-example-com', 'password', 'S3cr3t!']]);
+        });
+});
+
+test('persistCredential: a pem credential is stored tagged "pem", never as a password', async () => {
+    const calls = [];
+    await withFakeServers({ writeSshCredential(...args) { calls.push(args); return Promise.resolve(); } },
+        async () => {
+            const c = UI.pilotSetupUi();
+            c.choices.target = 'ssh';
+            c.choices.host = 'edge1.example.com';
+            c.choices.auth = 'pem';
+            c.choices.pem = '-----BEGIN KEY-----\nZ\n-----END KEY-----';
+            c.choices.remember = true;
+            await c.persistCredential();
+            assert.deepEqual(calls, [['edge1-example-com', 'pem', '-----BEGIN KEY-----\nZ\n-----END KEY-----']]);
+        });
+});
+
+test('persistCredential: a writeSshCredential rejection is recorded, never thrown, and reports failure', async () => {
+    await withFakeServers({
+        writeSshCredential() { return Promise.reject(Object.assign(new Error('disk full'), { name: 'PilotError', kind: 'GENERIC' })); }
+    }, async () => {
+        const c = UI.pilotSetupUi();
+        c.choices.target = 'ssh';
+        c.choices.host = 'rd.example.com';
+        c.choices.auth = 'password';
+        c.choices.password = 'x';
+        c.choices.remember = true;
+        const ok = await c.persistCredential();
+        assert.equal(ok, false);
+        assert.equal(c.credentialSaved, false);
+        assert.ok(c.credentialSaveError);
+        assert.match(c.credentialSaveError.message, /disk full/);
+    });
+});
+
+test('persistCredential: an unusable host never calls PilotServers at all and records why', async () => {
+    const calls = [];
+    await withFakeServers({ writeSshCredential(...args) { calls.push(args); return Promise.resolve(); } },
+        async () => {
+            const c = UI.pilotSetupUi();
+            c.choices.target = 'ssh';
+            c.choices.host = '...';
+            c.choices.auth = 'password';
+            c.choices.password = 'x';
+            c.choices.remember = true;
+            const ok = await c.persistCredential();
+            assert.equal(ok, false);
+            assert.equal(calls.length, 0);
+            assert.ok(c.credentialSaveError);
+        });
+});
+
+// GAP C's "provisioning succeeds" gate: start() only calls persistCredential()
+// once handoverResult.status is 'ok' — a partial or failed run must never
+// persist a credential for a server that turned out not to be usable, even
+// with the box checked and a real password entered. Drives the actual
+// component's start() against a minimal fake cockpit.spawn (a one-step,
+// failing transcript), the same shape RUN_STATUS_OK/FAIL_RUN use elsewhere,
+// rather than re-deriving handover()'s rules against a hand-built exec state.
+function fakeFailingSpawnCockpit() {
+    const FAIL_RUN = [
+        '{"t":"run-start","run_id":"20260804T000000Z","transport":"ssh","steps":1}',
+        '{"t":"step-start","id":"fetch-api","title":"Download API server","cmd":"curl"}',
+        '{"t":"step-end","id":"fetch-api","status":"failed","exit":7,"ms":10}',
+        '{"t":"run-end","status":"failed","kind":"GENERIC"}'
+    ].join('\n') + '\n';
+    return {
+        spawn() {
+            const p = Promise.resolve(FAIL_RUN);
+            p.input = () => p;
+            p.stream = () => p;
+            return p;
+        },
+        file() { return { read: () => Promise.resolve(null), replace: () => Promise.resolve(), close() {} }; }
+    };
+}
+
+test('start(): a failed run never persists a credential, even with remember checked ' +
+    'and a real password entered', async () => {
+    const calls = [];
+    const had = Object.prototype.hasOwnProperty.call(globalThis, 'cockpit');
+    const prevCockpit = globalThis.cockpit;
+    globalThis.cockpit = fakeFailingSpawnCockpit();
+    await withFakeServers({ writeSshCredential(...args) { calls.push(args); return Promise.resolve(); } },
+        async () => {
+            const c = UI.pilotSetupUi();
+            c.choices.target = 'ssh';
+            c.choices.host = 'rd.example.com';
+            c.choices.auth = 'password';
+            c.choices.password = 'S3cr3t!';
+            c.choices.remember = true;
+            c.plan = { steps: [{ id: 'fetch-api', title: 'Download API server', argv: ['curl'] }] };
+            const ok = await c.start();
+            assert.equal(ok, false, 'a failed run must not report success');
+            assert.equal(calls.length, 0, 'a failed run must never persist the credential');
+            assert.equal(c.credentialSaved, false);
+        });
+    if (had) globalThis.cockpit = prevCockpit; else delete globalThis.cockpit;
 });

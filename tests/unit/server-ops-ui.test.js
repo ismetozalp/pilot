@@ -10,6 +10,10 @@ const path = require('node:path');
 require('../../js/core/errors.js');
 require('../../js/core/console-view.js');
 require('../../js/features/setup-ui.js');
+// Real, not reimplemented: fakeServers() below delegates decodeSshCredential
+// to the actual js/core/servers.js so this test file cannot silently drift
+// from what a real Servers object does (GAP C, task 33).
+const RealServers = require('../../js/core/servers.js');
 const S = require('../../js/features/server-ops-ui.js');
 
 const ROOT = path.resolve(__dirname, '../..');
@@ -493,7 +497,8 @@ function fakeServers(recs, secrets) {
         readSecret(id, kind) {
             const key = id + '.' + kind;
             return Promise.resolve(Object.prototype.hasOwnProperty.call(secrets, key) ? secrets[key] : null);
-        }
+        },
+        decodeSshCredential(raw) { return RealServers.decodeSshCredential(raw); }
     };
 }
 
@@ -726,7 +731,48 @@ test('a remote op sends the stored credential on stdin only, never in argv', asy
             const envelope = JSON.parse(call.stdin);
             assert.equal(envelope.transport, 'ssh');
             assert.equal(envelope.credentials.password, 's3cr3tpassword');
+            assert.equal(envelope.ssh.auth, 'password');
+            assert.equal(envelope.credentials.pem, null, 'a password credential must never also carry a pem field');
             assert.equal(envelope.ssh.host, REMOTE_WITH_CRED.host);
+        });
+    });
+});
+
+// GAP C (task 33): before this fix, envelopeFor() unconditionally hardcoded
+// `auth: 'password'` and put the raw stored secret into credentials.password
+// no matter what it actually was — a stored PEM would be sent to pilot-exec
+// AS AN SSH PASSWORD (a clean SSH_AUTH_FAILED, but with no way to explain the
+// real cause). It must now route on the credential's own auth-type tag.
+test('a remote op with a stored PEM credential sends it as pem, never as a password', async () => {
+    const pemBody = '-----BEGIN OPENSSH PRIVATE KEY-----\nZZZZ\n-----END OPENSSH PRIVATE KEY-----';
+    await withServers(fakeServers({}, { 'edge1.ssh': RealServers.encodeSshCredential('pem', pemBody) }), async () => {
+        const fake = fakeCockpit({ spawn: { '--run': RUN_STATUS_OK } });
+        await withCockpit(fake, async () => {
+            const c = S.serverOpsUi();
+            c.server = REMOTE_WITH_CRED;
+            await c.execute('status');
+            const call = fake.calls.find((x) => x.argv.indexOf('--run') >= 0);
+            assert.equal(call.argv.join(' ').indexOf('BEGIN OPENSSH'), -1, 'the pem must never reach argv');
+            const envelope = JSON.parse(call.stdin);
+            assert.equal(envelope.ssh.auth, 'pem');
+            assert.equal(envelope.credentials.pem, pemBody);
+            assert.equal(envelope.credentials.password, null, 'a pem credential must never also carry a password field');
+        });
+    });
+});
+
+test('a remote op with a legacy bare-string secret (pre-dating GAP C) still sends it as a password, ' +
+    'the only thing it could ever have been before an auth-type tag existed', async () => {
+    await withServers(fakeServers({}, { 'edge1.ssh': 's3cr3tpassword' }), async () => {
+        const fake = fakeCockpit({ spawn: { '--run': RUN_STATUS_OK } });
+        await withCockpit(fake, async () => {
+            const c = S.serverOpsUi();
+            c.server = REMOTE_WITH_CRED;
+            await c.execute('status');
+            const call = fake.calls.find((x) => x.argv.indexOf('--run') >= 0);
+            const envelope = JSON.parse(call.stdin);
+            assert.equal(envelope.ssh.auth, 'password');
+            assert.equal(envelope.credentials.password, 's3cr3tpassword');
         });
     });
 });

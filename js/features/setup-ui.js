@@ -15,6 +15,17 @@
 (function (root) {
     const underNode = (typeof module !== 'undefined' && module.exports);
     const Plan = underNode ? require('../core/provision-plan.js') : root.PilotProvisionPlan;
+    // GAP C (task 33): PilotServers.writeSshCredential() is what persistCredential()
+    // below calls once "remember for day-2 operations" is honoured. A live lookup
+    // (not a const captured once at load) so a test can substitute a fake
+    // PilotServers — the same shape js/features/server-ops-ui.js's own servers()
+    // already uses for exactly this reason. index.html loads js/core/servers.js
+    // well before this file (C7 order), so root.PilotServers is already set in
+    // the browser by the time this ever runs.
+    function servers() {
+        if (root.PilotServers) return root.PilotServers;
+        return underNode ? require('../core/servers.js') : null;
+    }
 
     const STEP_IDS = ['target', 'hostkey', 'detect', 'ports', 'execute', 'handover'];
     const STEP_TITLES = {
@@ -76,7 +87,13 @@
             exec: blankExec(),
             reach: [],
             manual: false,
-            errors: {}
+            errors: {},
+            // GAP C (task 33): whether persistCredential() (below) actually
+            // stored a day-2 credential after this run, and why not if it
+            // did not. Both start false/null on a fresh wizard and are only
+            // ever touched by persistCredential() itself.
+            credentialSaved: false,
+            credentialSaveError: null
         };
     }
 
@@ -120,6 +137,44 @@
             ? detail.step : null;
         if (id && visibleSteps(state).indexOf(id) !== -1) return id;
         return state && typeof state.step === 'string' ? state.step : STEP_IDS[0];
+    }
+
+    // --------------------------------------------------- day-2 credential
+    //
+    // GAP C (task 33): PilotServers.writeSecret() had NO caller anywhere in
+    // the repo, so the "remember for day-2 operations" checkbox (visible
+    // only for choices.target === 'ssh' — index.html:56-71) rendered, bound,
+    // and persisted nothing: js/features/server-ops-ui.js's hasCredential
+    // was permanently false. Only meaningful for an SSH target: a local
+    // install needs no SSH credential at all (server-ops-ui.js's own
+    // loadServer() already treats id 'local' as hasCredential:true
+    // unconditionally), and 'agent' auth has no secret VALUE to store in the
+    // first place — remembering it is correctly a no-op, not a bug, since
+    // day-2 ops over an already-trusted agent connection need nothing
+    // stored. Pure, so the decision of WHAT to persist is unit-testable
+    // with no DOM and no cockpit.
+    function credentialToRemember(choices) {
+        if (!choices || choices.remember !== true || choices.target !== 'ssh') return null;
+        if (choices.auth === 'password') {
+            const v = str(choices.password);
+            return v ? { authType: 'password', secret: v } : null;
+        }
+        if (choices.auth === 'pem') {
+            const v = str(choices.pem);
+            return v ? { authType: 'pem', secret: v } : null;
+        }
+        return null;
+    }
+
+    // Pure. Derives a PilotServers.validateId()-safe id from the target
+    // host. The wizard's "target" step never asks the user to NAME the
+    // server being provisioned — no task has built a "register this server"
+    // step — so the host is the best identifier available for keying a
+    // day-2 credential today. Returns null when nothing usable survives
+    // sanitisation, rather than writing under an empty or wrong id.
+    function slugForHost(host) {
+        const dashed = str(host).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+        return dashed ? dashed.slice(0, 64) : null;
     }
 
     // ----------------------------------------------------------- step 1
@@ -965,8 +1020,51 @@
                 await this.persist(this.runId, raw);
                 this.reach = reachFrom(this.exec);
                 this.handoverResult = handover(this.exec, this.reach);
+                // GAP C (task 33): only once provisioning actually SUCCEEDED —
+                // a partial or failed run must never persist a credential for
+                // a server that turned out not to be usable.
+                if (this.handoverResult.status === 'ok') await this.persistCredential();
                 this.busy = false;
                 return this.handoverResult.status === 'ok';
+            },
+
+            // GAP C (task 33): the "remember for day-2 operations" half of
+            // start()'s success path. credentialToRemember() already refuses
+            // anything but a real, non-empty password/pem on an ssh target,
+            // so a false return here just means there was nothing TO store
+            // (local target, agent auth, or the box was left unchecked) —
+            // never a silent failure. A real failure (no PilotServers, a
+            // bad host, or writeSshCredential() itself rejecting) is recorded
+            // in credentialSaveError so the handover pane can say so, but
+            // never blocks finish() — a stored password is a convenience,
+            // not a precondition for calling the install itself done.
+            async persistCredential() {
+                const cred = credentialToRemember(this.choices);
+                if (!cred) return false;
+                const id = slugForHost(this.choices.host);
+                if (!id) {
+                    this.credentialSaved = false;
+                    this.credentialSaveError = fail('GENERIC',
+                        'Could not derive a server id from "' + str(this.choices.host) +
+                        '" to store the credential under.');
+                    return false;
+                }
+                const Servers = servers();
+                if (!Servers || typeof Servers.writeSshCredential !== 'function') {
+                    this.credentialSaved = false;
+                    this.credentialSaveError = null;
+                    return false;
+                }
+                try {
+                    await Servers.writeSshCredential(id, cred.authType, cred.secret);
+                    this.credentialSaved = true;
+                    this.credentialSaveError = null;
+                    return true;
+                } catch (e) {
+                    this.credentialSaved = false;
+                    this.credentialSaveError = describe(e);
+                    return false;
+                }
             },
 
             // Persisted so a failed setup can be diagnosed after the page is gone.
@@ -1031,6 +1129,7 @@
     const PilotSetupUi = {
         STEP_IDS, STEP_TITLES, MAX_LINES, MAX_LINE_CHARS, MAX_NOISE,
         blankExec, blankState, visibleSteps, nextStep, prevStep, applyWizardStep,
+        credentialToRemember, slugForHost,
         validateTarget, portRows, awsCommand,
         parseLine, reduce, progress, transcriptText, runPath,
         handover, passwordGate, manualFor,

@@ -431,6 +431,106 @@ async function runBody(ctx) {
             assertOk(call.input.indexOf('RunSecret99') >= 0, 'the password must reach the helper on stdin');
         });
     });
+
+    // GAP C (task 33): PilotServers.writeSecret() had NO caller anywhere in
+    // the repo, so checking "remember for day-2 operations" persisted
+    // nothing and Server Ops' credential-gated controls could never become
+    // enabled. This drives a REAL successful ssh install with the checkbox
+    // on, then switches to Server Ops IN THE SAME PAGE (same underlying
+    // cockpit-stub.js `files` store, not the unit tier's throwaway fixture)
+    // and proves the previously-disabled control becomes enabled — the
+    // credential must round-trip through the real writeSshCredential() /
+    // readSecret()+decodeSshCredential() pair, not merely be claimed saved.
+    await check('GAP C: "remember for day-2 operations" persists a real credential -- ' +
+        'proven by Server Ops reading it back after a real run, never via argv or the transcript', async () => {
+        const SERVER_ID = 'rd-example-com';
+        const fp = 'SHA256:' + 'd'.repeat(43);
+        const stub = {
+            spawn: {
+                'pilot-exec --detect': DETECTION, 'pilot-exec --run': RUN_OK,
+                'pilot-exec --check-hostkey': HOSTKEY_UNKNOWN(fp),
+                // writeSshCredential() (js/core/servers.js's writeSecret())
+                // chmods and chowns the secret file after writing it — no
+                // earlier e2e scenario ever exercised that path since it had
+                // no caller before this fix.
+                chmod: '', chown: ''
+            },
+            files: {
+                '/etc/pilot/config.json': JSON.stringify({ activeServer: SERVER_ID }),
+                ['/etc/pilot/servers/' + SERVER_ID + '.json']: JSON.stringify({
+                    id: SERVER_ID, host: 'rd.example.com', sshPort: 22, apiPort: 21114, tls: false,
+                    domain: null, hbbsKey: null, hbbsPorts: [], installDir: '/opt/rustdesk-api', createdAt: null
+                })
+            }
+        };
+        const page = await ctx.open(ctx.browser, stub);
+        page.setDefaultTimeout(WAIT);
+        try {
+            // Before: the pre-seeded record has no .ssh secret at all yet, so
+            // a credential-needing op must be disabled with a clear reason.
+            await page.click('[data-tab="server-ops"]');
+            await wait(page, '[data-testid="op-status"]');
+            assertOk(await page.locator('[data-testid="op-status"]').isDisabled(),
+                'a credentialled op must be disabled before any secret is stored');
+            const reasonBefore = await page.locator('[data-testid="op-status-reason"]').innerText();
+            assertOk(/credential/i.test(reasonBefore), 'the reason must say why, not just disable silently');
+
+            await page.click('[data-tab="setup"]');
+            await page.selectOption('[data-testid="target"]', 'ssh');
+            await page.fill('[data-testid="host"]', 'rd.example.com');
+            await page.selectOption('[data-testid="auth"]', 'password');
+            await page.fill('[data-testid="password"]', 'RememberedSecret42');
+            await page.check('[data-testid="remember"]');
+            assertOk(await page.isChecked('[data-testid="remember"]'), 'the checkbox must actually bind');
+            await page.click('[data-testid="next"]');
+            await waitForText(page, '[data-testid="fingerprint"]', (t) => t === fp, 'fingerprint');
+            await page.click('[data-testid="accept-hostkey"]');
+            await page.click('[data-testid="next"]');
+            await page.click('[data-testid="run-detect"]');
+            await wait(page, '[data-plan-step]');
+            await page.click('[data-testid="next"]');
+            await page.click('[data-testid="next"]');
+            await page.click('[data-testid="run-start"]');
+            await wait(page, '[data-step-id="reachability"]');
+
+            assertEqual(await credentialLeaked(page, 'RememberedSecret42'), false,
+                'the SSH password must not leak into the DOM, storage, another input, or the transcript');
+            const calls = await page.evaluate(() => window.__pilotStub.calls);
+            for (const c of calls) {
+                if (c.kind === 'spawn')
+                    assertOk(c.argv.join(' ').indexOf('RememberedSecret42') < 0,
+                        'the credential must never appear in any spawned argv, including the ' +
+                        'writeSshCredential chmod/chown calls: ' + JSON.stringify(c.argv));
+            }
+            const runCall = calls.filter((c) => c.kind === 'spawn').find((c) => c.argv.indexOf('--run') >= 0);
+            assertOk(runCall.input.indexOf('RememberedSecret42') >= 0,
+                'the provisioning envelope itself legitimately carries it on stdin');
+
+            // The actual proof: switch to Server Ops IN THIS SAME PAGE and
+            // confirm the credential-gated op is now enabled — this can only
+            // be true if persistCredential() really called
+            // PilotServers.writeSshCredential() and server-ops-ui.js really
+            // read it back via readSecret()+decodeSshCredential(). Server Ops
+            // does not poll or refresh merely because its tab becomes
+            // visible again (x-show toggles the same live component, it does
+            // not remount) — it reloads on 'pilot:server-changed', the same
+            // event a real reconnect/server-switch fires, so this dispatches
+            // that event for the SAME server id to trigger exactly that.
+            await page.click('[data-tab="server-ops"]');
+            await page.evaluate((id) => {
+                document.dispatchEvent(new CustomEvent('pilot:server-changed', { detail: { id }, bubbles: true }));
+            }, SERVER_ID);
+            await page.waitForFunction(() => {
+                const el = document.querySelector('[data-testid="op-status"]');
+                return !!el && !el.disabled;
+            }, null, { timeout: WAIT });
+            const reasonGone = await page.locator('[data-testid="op-status-reason"]').innerText().catch(() => '');
+            assertEqual(reasonGone, '', 'the "no stored credential" reason must be gone now that one is stored');
+            await shot(page, 'setup-remember-credential-persisted');
+        } finally {
+            await page.ctx.close();
+        }
+    });
 }
 
 export default async function run(ctx) {
