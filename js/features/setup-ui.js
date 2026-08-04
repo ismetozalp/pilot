@@ -103,6 +103,25 @@
         return i > 0 ? v[i - 1] : v[0];
     }
 
+    // GAP B (task 33): the 'pilot:open-wizard' event js/features/overview.js's
+    // "Set up TLS" CTA dispatches carries {step:'tls', serverId} — but 'tls' is
+    // not one of this wizard's steps and never has been: TLS choice is a field
+    // on the FIRST step (blankState().choices.tls), not a step of its own, and
+    // no task has ever added a "reconfigure TLS on an existing server" mode to
+    // this wizard. js/features/server-ops-ui.js's "Run setup" CTA dispatches
+    // the same event with no step at all ({}). Only a step id that is a member
+    // of THIS state's own visibleSteps() is honoured — jumping to an id this
+    // wizard does not recognise, or one that exists but is hidden for the
+    // current target (hostkey on localhost), would leave every pane's
+    // isStep(id) false and the wizard body blank, which is worse than simply
+    // not moving. Pure, so the mapping is unit-testable with no DOM.
+    function applyWizardStep(state, detail) {
+        const id = (detail && typeof detail === 'object' && typeof detail.step === 'string')
+            ? detail.step : null;
+        if (id && visibleSteps(state).indexOf(id) !== -1) return id;
+        return state && typeof state.step === 'string' ? state.step : STEP_IDS[0];
+    }
+
     // ----------------------------------------------------------- step 1
 
     const USER_RE = /^[a-z_][a-z0-9_-]{0,31}$/;
@@ -732,6 +751,11 @@
                     ? STEP_TITLES[str(id)] : str(id);
             },
             isStep(id) { return this.step === id; },
+            // Wired in index.html: @pilot:open-wizard.document="onOpenWizard($event.detail)"
+            // on #pilot-setup itself (a separate x-data scope from the outer
+            // shell's tab switch in js/app.js's openWizard() — this is the
+            // half of GAP B's fix that only this component can do).
+            onOpenWizard(detail) { this.step = applyWizardStep(this, detail); return this.step; },
             progress() { return progress(this.exec); },
             transcript() { return transcriptText(this.exec); },
             hostPorts() { return portRows(this.required, this.firewall).host; },
@@ -1006,7 +1030,7 @@
 
     const PilotSetupUi = {
         STEP_IDS, STEP_TITLES, MAX_LINES, MAX_LINE_CHARS, MAX_NOISE,
-        blankExec, blankState, visibleSteps, nextStep, prevStep,
+        blankExec, blankState, visibleSteps, nextStep, prevStep, applyWizardStep,
         validateTarget, portRows, awsCommand,
         parseLine, reduce, progress, transcriptText, runPath,
         handover, passwordGate, manualFor,

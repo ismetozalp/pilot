@@ -73,6 +73,27 @@
             // that be told apart from "no token was ever set" after the fact.
             tokenError: null,
 
+            // GAP B (task 33): js/features/server-ops-ui.js's "Run setup" and
+            // js/features/overview.js's "Set up TLS" both dispatch
+            // 'pilot:open-wizard' ({} and {step:'tls', serverId} respectively)
+            // but nothing outside a test harness ever listened, so both
+            // buttons were dead — #pilot-setup stayed hidden and the tab
+            // never changed. index.html wires this exactly like its existing
+            // 'pilot:server-changed' listener: @pilot:open-wizard.document=
+            // "openWizard($event.detail)" on .pilot-shell. Unlike that
+            // listener (whose wireApi() -> notifyServerChanged() ->
+            // switchServer() cycle needs the "already active" re-entrancy
+            // guard), this one never dispatches 'pilot:open-wizard' itself,
+            // so there is no loop to guard against — it only ever changes
+            // `tab`. Taking the wizard to a SPECIFIC step (detail.step) is
+            // handled independently by js/features/setup-ui.js's own
+            // onOpenWizard() listener on #pilot-setup, a separate x-data
+            // scope this component cannot reach into directly.
+            openWizard(detail) {
+                this.tab = 'setup';
+                return this.tab;
+            },
+
             failSurface(id, err) {
                 if (!Object.prototype.hasOwnProperty.call(this.errors, id)) return null;
                 this.errors[id] = err || null;

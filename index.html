@@ -16,9 +16,17 @@
      switchServer() and must stay unit-testable with no DOM/Alpine at all) --
      this listener is what actually closes the loop and re-wires PilotApi's
      transport to the newly active server. switchServer() itself guards against
-     the resulting re-entrant dispatch (see js/app.js). -->
+     the resulting re-entrant dispatch (see js/app.js).
+
+     'pilot:open-wizard' is GAP B's fix (task 33): js/features/server-ops-ui.js's
+     "Run setup" and js/features/overview.js's "Set up TLS" CTAs both dispatch it
+     ({} and {step:'tls', serverId} respectively), but had zero production
+     listeners until now. This switches the tab; #pilot-setup below has its own
+     listener for the same event to take the wizard to a specific step, since
+     that is a separate x-data scope this one cannot reach into. -->
 <div class="pilot-shell" x-data="pilotApp()" x-cloak
-     @pilot:server-changed.document="switchServer($event.detail.id)">
+     @pilot:server-changed.document="switchServer($event.detail.id)"
+     @pilot:open-wizard.document="openWizard($event.detail)">
 
     <div class="pilot-header d-flex align-items-center gap-3">
         <strong class="me-2">Pilot</strong>
@@ -39,7 +47,8 @@
         <!-- One mount per surface. Each surface reports its own failure into
              errors[<tab>]; there is deliberately no global error banner (spec §7.2). -->
         <div x-show="tab === 'overview'"    id="pilot-overview"></div>
-        <div x-show="tab === 'setup'" id="pilot-setup" x-data="pilotSetupUi()">
+        <div x-show="tab === 'setup'" id="pilot-setup" x-data="pilotSetupUi()"
+             @pilot:open-wizard.document="onOpenWizard($event.detail)">
           <ol class="nav nav-pills mb-3" data-testid="setup-steps">
             <template x-for="id in steps()" :key="id">
               <li class="nav-item"><span class="nav-link" :class="{ active: isStep(id) }"

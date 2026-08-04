@@ -77,6 +77,54 @@ test('back from detect returns to host key only for a remote target', () => {
     assert.equal(UI.prevStep(s), 'target');
 });
 
+// ------------------------------------------------------------ applyWizardStep
+
+// GAP B (task 33): js/features/overview.js's "Set up TLS" CTA dispatches
+// 'pilot:open-wizard' with {step:'tls', serverId}; js/features/server-ops-ui.js's
+// "Run setup" CTA dispatches it with {} (no step at all). applyWizardStep is the
+// pure mapping the wizard's own event listener uses to decide whether to jump.
+test('applyWizardStep jumps to a step that is currently visible', () => {
+    const s = UI.blankState();
+    s.choices.target = 'ssh';
+    s.step = 'target';
+    assert.equal(UI.applyWizardStep(s, { step: 'ports' }), 'ports');
+});
+
+test('applyWizardStep never jumps to a step this wizard does not recognise ' +
+    '(there is no "tls" step -- TLS is a field on the target step\'s own choices, ' +
+    'not a step of its own) -- it leaves the current step untouched rather than ' +
+    'landing on a pane nothing renders', () => {
+    const s = UI.blankState();
+    s.step = 'target';
+    assert.equal(UI.applyWizardStep(s, { step: 'tls' }), 'target');
+});
+
+test('applyWizardStep never jumps to a step that exists but is not currently visible ' +
+    '(hostkey is hidden on a localhost target)', () => {
+    const s = UI.blankState();
+    s.choices.target = 'local';
+    s.step = 'target';
+    assert.equal(UI.applyWizardStep(s, { step: 'hostkey' }), 'target');
+});
+
+test('applyWizardStep with no step (server-ops-ui.js\'s "Run setup" sends {}) ' +
+    'leaves the current step untouched', () => {
+    const s = UI.blankState();
+    s.step = 'detect';
+    assert.equal(UI.applyWizardStep(s, {}), 'detect');
+    assert.equal(UI.applyWizardStep(s, null), 'detect');
+    assert.equal(UI.applyWizardStep(s, undefined), 'detect');
+});
+
+test('applyWizardStep never throws on a hostile detail', () => {
+    const s = UI.blankState();
+    s.step = 'target';
+    for (const bad of [42, 'x', [], { step: 123 }, { step: null }, { step: '' },
+        { step: '__proto__' }, { step: 'constructor' }]) {
+        assert.equal(UI.applyWizardStep(s, bad), 'target');
+    }
+});
+
 // ------------------------------------------------------------ validateTarget
 
 test('localhost needs no credentials at all', () => {

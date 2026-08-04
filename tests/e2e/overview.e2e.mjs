@@ -240,6 +240,18 @@ export default async function run(ctx) {
             const detail = await page.evaluate(() => window.__wizard[0]);
             assertEqual(detail.step, 'tls', 'it opens the TLS step');
             assertEqual(detail.serverId, 'beta', 'for the server the user is looking at');
+
+            // GAP B (task 33): window.__wizard above only proves the event was
+            // DISPATCHED -- that was already true before this fix, via a
+            // test-harness-only listener installed by installFixtures(). The
+            // production defect was that NOTHING else reacted to it: clicking
+            // "Set up TLS" left #pilot-setup hidden and the tab unchanged.
+            // This is the real, mutation-verified assertion: js/app.js's
+            // openWizard() (wired in index.html on .pilot-shell) must actually
+            // switch the tab.
+            await page.waitForSelector('[data-tab="setup"].active', { timeout: WAIT });
+            await page.waitForSelector('#pilot-setup', { state: 'visible', timeout: WAIT });
+            assertOk(true, 'clicking "Set up TLS" must genuinely navigate to the Setup tab, not just dispatch an event');
             await shot(page, 'overview-no-tls');
         } finally {
             await page.ctx.close();

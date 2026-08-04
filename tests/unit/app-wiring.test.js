@@ -313,3 +313,53 @@ test('switchServer: dispatches pilot:server-changed again for the newly active s
     assert.deepEqual(events[0].detail, { id: 'prod' });
     assert.deepEqual(events[1].detail, { id: 'staging' });
 });
+
+// --- GAP B (task 33): 'pilot:open-wizard' had zero production listeners ---
+// js/features/server-ops-ui.js's "Run setup" and js/features/overview.js's
+// "Set up TLS" both dispatch this event, and until now nothing outside a test
+// harness ever listened — clicking either button left #pilot-setup hidden and
+// the tab unchanged. index.html wires @pilot:open-wizard.document="openWizard(...)"
+// on .pilot-shell, exactly the same shape as its existing pilot:server-changed
+// listener.
+
+test('openWizard: switches to the Setup tab', () => {
+    const c = App.pilotApp();
+    c.tab = 'overview';
+    c.openWizard({});
+    assert.equal(c.tab, 'setup');
+});
+
+test('openWizard: switches to the Setup tab even with a step-carrying detail ' +
+    '(overview.js sends {step:"tls", serverId})', () => {
+    const c = App.pilotApp();
+    c.tab = 'overview';
+    c.openWizard({ step: 'tls', serverId: 'prod' });
+    assert.equal(c.tab, 'setup');
+});
+
+// Unlike switchServer()'s re-entrancy guard against notifyServerChanged()
+// re-dispatching the very event its own listener reacts to, openWizard()
+// never dispatches 'pilot:open-wizard' itself — there is no cycle to guard
+// against, only a plain state change. This proves it stays that way.
+test('openWizard: never dispatches pilot:open-wizard itself (no re-entrancy loop to build a guard for)', () => {
+    const c = App.pilotApp();
+    const events = [];
+    const fakeDoc = { dispatchEvent(ev) { events.push(ev); return true; } };
+    const realDoc = typeof globalThis.document !== 'undefined' ? globalThis.document : undefined;
+    globalThis.document = fakeDoc;
+    try {
+        c.openWizard({});
+    } finally {
+        if (realDoc === undefined) delete globalThis.document; else globalThis.document = realDoc;
+    }
+    assert.equal(events.length, 0);
+});
+
+test('openWizard: a malformed or missing detail never throws', () => {
+    const c = App.pilotApp();
+    for (const bad of [null, undefined, 'x', 42, []]) {
+        c.tab = 'overview';
+        assert.doesNotThrow(() => c.openWizard(bad));
+        assert.equal(c.tab, 'setup');
+    }
+});

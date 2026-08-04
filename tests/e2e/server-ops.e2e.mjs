@@ -104,6 +104,21 @@ export default async function run(ctx) {
         } finally { await page.ctx.close(); }
     });
 
+    // GAP B (task 33): this CTA dispatches 'pilot:open-wizard' ({}, no step —
+    // js/features/overview.js's "Set up TLS" is the one that carries a step).
+    // Before this fix nothing outside a test harness listened for it at all:
+    // clicking "Run setup" left #pilot-setup hidden and the tab unchanged.
+    await check('server-ops: the empty state\'s "Run setup" CTA genuinely navigates to Setup, not just dispatches an event', async () => {
+        const page = await openTab(ctx, {});
+        try {
+            await visible(page, '#pilot-server-ops [data-testid="server-ops-empty-action"]');
+            await page.click('#pilot-server-ops [data-testid="server-ops-empty-action"]');
+            await page.waitForSelector('[data-tab="setup"].active', { timeout: WAIT });
+            assertOk(await visible(page, '#pilot-setup'),
+                '"Run setup" must genuinely switch to the Setup tab');
+        } finally { await page.ctx.close(); }
+    });
+
     await check('server-ops: a server with no stored credential disables every credentialled op with a visible reason', async () => {
         const page = await openTab(ctx, {
             files: {
