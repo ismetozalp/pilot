@@ -19,6 +19,12 @@
 // scenario is only about restyling: the DOM attribute and a real computed style,
 // per theme, with a screenshot.
 //
+// Task 31 taught cockpit-stub.js's user() to merge a scenario-supplied `home`
+// (tests/e2e/cockpit-stub.js), so the last check below opens the page with
+// { user: { home: '/root' } } and asserts the OTHER half: that choosing a theme
+// really round-trips through js/core/settings.js's home()/write()/read(), not
+// just through the in-memory Alpine component.
+//
 // Every wait carries an explicit, short timeout: a selector that never appears
 // is a bug to report in seconds, not a hang.
 //
@@ -160,6 +166,57 @@ export default async function run(ctx) {
             const attrs = await domAttrs(page);
             assertOk(attrs.bs === 'light' || attrs.bs === 'dark',
                 'data-bs-theme after returning to System must resolve to light or dark');
+        } finally {
+            await page.ctx.close();
+        }
+    });
+
+    await check('theme: choosing a theme persists through the real js/core/settings.js, not just in memory', async () => {
+        // A scripted home is what makes this checkable at all -- see the note at
+        // the top of this file and the anchored fix in cockpit-stub.js's user().
+        const SETTINGS_PATH = '/root/.config/cockpit/pilot/settings.json';
+        const page = await ctx.open(ctx.browser, { user: { home: '/root' } });
+        page.setDefaultTimeout(WAIT);
+        try {
+            await page.waitForFunction(
+                () => !!window.PilotThemeUi && !!window.PilotThemes && !!window.PilotSettings,
+                null, { timeout: WAIT });
+            await page.waitForFunction(
+                () => document.documentElement.hasAttribute('data-bs-theme'),
+                null, { timeout: WAIT });
+            await page.click('[title="Change the colour theme"]');
+            await page.waitForSelector('#pilot-theme', { state: 'visible', timeout: WAIT });
+            const nordBtn = page.locator('#pilot-theme button', { hasText: 'Nord' });
+            await nordBtn.waitFor({ state: 'visible', timeout: WAIT });
+            await nordBtn.click();
+            await page.waitForFunction(
+                () => document.documentElement.getAttribute('data-pl-theme') === 'nord',
+                null, { timeout: WAIT });
+            // setTheme() awaits the store write before Alpine settles, but wait on
+            // the stub's own file table -- the fact actually being asserted --
+            // rather than an arbitrary tick.
+            await page.waitForFunction(
+                (path) => {
+                    const raw = window.__pilotStub && window.__pilotStub.files &&
+                        window.__pilotStub.files[path];
+                    return typeof raw === 'string' && raw.indexOf('"nord"') !== -1;
+                },
+                SETTINGS_PATH, { timeout: WAIT });
+
+            const persisted = await page.evaluate((path) => {
+                const raw = window.__pilotStub.files[path];
+                return window.PilotSettings.parse(raw);
+            }, SETTINGS_PATH);
+            assertEqual(persisted.ui.theme, 'nord',
+                `the real settings file at ${SETTINGS_PATH} must contain the chosen theme`);
+
+            // The round trip: read it back through the real read()/home() path
+            // (a fresh call, not the in-memory `theme` field) and confirm it
+            // resolves the same value that was written.
+            const reread = await page.evaluate(() => window.PilotSettings.read());
+            assertEqual(reread.ui.theme, 'nord',
+                'PilotSettings.read() must resolve the theme that was just persisted');
+            await shot(page, 'theme-persist-roundtrip');
         } finally {
             await page.ctx.close();
         }

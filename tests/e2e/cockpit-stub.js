@@ -335,7 +335,12 @@
             variant: function (t, v) { return { t: t, v: v }; },
             location: { href: '', path: [], options: {}, go: function () {}, replace: function () {} },
             transport: { host: 'localhost', csrf_token: 'stub-csrf', origin: 'stub' },
-            user: function () { return Promise.resolve({ name: 'root', id: 0 }); },
+            // Merges a scenario-supplied cfg.user (e.g. { home: '/root' }) onto the
+            // default shape so a scenario can opt into a home directory without
+            // every other scenario's default identity changing underneath it.
+            user: function () {
+                return Promise.resolve(Object.assign({ name: 'root', id: 0 }, cfg.user || {}));
+            },
             jump: function () {},
             addEventListener: function () {},
             removeEventListener: function () {}

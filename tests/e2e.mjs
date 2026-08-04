@@ -178,7 +178,7 @@ export const DEFAULT_STUB = {
 export function mergeStub(stub) {
     const s = (stub && typeof stub === 'object' && !Array.isArray(stub)) ? stub : {};
     const obj = (v) => (v && typeof v === 'object' && !Array.isArray(v)) ? v : {};
-    return {
+    const merged = {
         spawn: Object.assign({}, DEFAULT_STUB.spawn, obj(s.spawn)),
         files: Object.assign({}, DEFAULT_STUB.files, obj(s.files)),
         http: Object.assign({}, DEFAULT_STUB.http, obj(s.http)),
@@ -187,6 +187,12 @@ export function mergeStub(stub) {
         calls: [],
         errors: []
     };
+    // Added ONLY when a scenario supplies a plain object (e.g. { home: '/root' })
+    // -- the key is otherwise absent entirely, not present-with-undefined, so
+    // the merged shape for every existing scenario is byte-for-byte unchanged.
+    // cockpit-stub.js's user() does `Object.assign({name:'root',id:0}, cfg.user || {})`.
+    if (s.user && typeof s.user === 'object' && !Array.isArray(s.user)) merged.user = s.user;
+    return merged;
 }
 
 // C15: open() navigates. A scenario never calls page.goto.
