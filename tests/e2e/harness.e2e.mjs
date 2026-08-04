@@ -88,7 +88,19 @@ export default async function run(ctx) {
             const before = await f.read();
             await f.replace('rewritten');
             const after = await f.read();
-            const wrote = window.__pilotStub.calls.filter((c) => c.kind === 'replace');
+            // Filtered to THIS path alone (task 34): with no active server
+            // configured, js/app.js's switchServer('local') now genuinely
+            // proceeds past its re-entrancy guard once (rather than being an
+            // unconditional no-op) so a server registered for the first time
+            // under "local" actually gets wired -- and, on a page with
+            // nothing configured at all, that harmlessly persists
+            // /etc/pilot/config.json with {activeServer:"local"} once too.
+            // That is a real, separate replace() call on a DIFFERENT path;
+            // counting every replace() call regardless of path was already
+            // an unrelated-to-this-file assumption this check should not
+            // have made.
+            const wrote = window.__pilotStub.calls.filter(
+                (c) => c.kind === 'replace' && c.path === '/etc/pilot/harness-marker');
             return { before, after, wrote: wrote.length, content: wrote[0].content };
         });
         ctx.assertEqual(r.before, 'present');

@@ -531,6 +531,160 @@ async function runBody(ctx) {
             await page.ctx.close();
         }
     });
+
+    // ========================================================= TASK 34 =====
+    //
+    // THE DEFECT: PilotServers.write() had ZERO callers anywhere in js/ -- no
+    // shipped code path ever registered a server, so a user could run this
+    // wizard to a successful finish and Overview/Devices/Address
+    // Book/Users/Audit/Server Ops stayed permanently at their empty states.
+    // The GAP C scenario above only ever passes because it PRE-SEEDS
+    // /etc/pilot/servers/rd-example-com.json into the stub's own file map --
+    // hard-coding the exact record no shipped code could create. This
+    // scenario is the actual proof: it drives the wizard to a successful
+    // LOCAL finish with NOTHING pre-seeded in `files` at all, then proves
+    // the server that appears is the REAL one registerServer() wrote --
+    // never the synthetic FALLBACK_SERVER js/features/overview.js shows for
+    // an empty registry (name "This server") -- by asserting the switcher
+    // option's own text is "localhost", the real record's `host` field,
+    // which nothing but a genuine registry read can produce. It then proves
+    // Devices really queries that server: a live /admin/peer request must
+    // reach the stub with the address the record carries, driven through
+    // the real js/app.js wireApi()/switchServer() wiring (never
+    // ctx.useTransport(), which replaces PilotApi.setTransport wholesale and
+    // would hide the very defect this guards against -- see
+    // tests/e2e/servers.e2e.mjs's and tests/e2e/devices.e2e.mjs's own
+    // comments on exactly this point).
+    const PROBE_OK = { code: 0, message: '', data: {} };
+    const REGISTERED_DEVICE = { id: '999999999', alias: 'Freshly Registered Pi', online: true,
+        last_online: 1754222400, ip: '10.0.0.42', platform: 'Linux', version: '1.3.7' };
+
+    function listOk(list) {
+        return { status: 200, body: { code: 0, message: '', data:
+            { list, page: 1, total: list.length, page_size: 50 } } };
+    }
+
+    async function installAlpineHelper(page) {
+        await page.evaluate(() => {
+            window.alpineData = function () {
+                const el = document.querySelector('.pilot-shell');
+                if (!el || !window.Alpine) return null;
+                return window.Alpine.$data(el);
+            };
+        });
+    }
+
+    // The stub for THIS scenario alone: deliberately no `files` entry for
+    // /etc/pilot/config.json or any /etc/pilot/servers/*.json -- the whole
+    // point is that nothing pre-seeds the registry. The `find` line is the
+    // one concession the stub's own design requires: cockpit-stub.js's spawn
+    // responses are static text, not a live view of `files`, so it cannot
+    // itself notice a file registerServer() writes mid-scenario -- the
+    // static answer below simply states what a real `find` WOULD report
+    // once that write lands. The JSON CONTENT itself is never hard-coded
+    // here; PilotServers.read('local') still returns exactly whatever
+    // Servers.write() really put in `files['/etc/pilot/servers/local.json']`.
+    const REGISTERS_STUB = {
+        spawn: {
+            'pilot-exec --detect': DETECTION,
+            'pilot-exec --run': RUN_OK,
+            'find /etc/pilot/servers -maxdepth 1 -type f -name *.json':
+                '/etc/pilot/servers/local.json\n'
+        },
+        files: {},
+        http: {
+            'GET /admin/swagger/doc.json': { status: 404, body: '404 page not found' },
+            'GET /api/currentUser2': PROBE_OK,
+            'GET /admin/peer': listOk([REGISTERED_DEVICE]),
+            'GET /api/ab/shared/profiles': PROBE_OK,
+            'GET /api/ab/peers': PROBE_OK,
+            'GET /admin/user': PROBE_OK,
+            'GET /admin/group': PROBE_OK,
+            'GET /admin/audit_conn': PROBE_OK,
+            'GET /admin/audit_file': PROBE_OK,
+            'GET /admin/login_log': PROBE_OK
+        }
+    };
+
+    await check('TASK 34: a successful local install registers "local" for real, with NOTHING ' +
+        'pre-seeded in the registry -- Overview\'s switcher shows the REAL record and Devices ' +
+        'genuinely queries it', async () => {
+        const page = await ctx.open(ctx.browser, REGISTERS_STUB);
+        page.setDefaultTimeout(WAIT);
+        try {
+            await installAlpineHelper(page);
+            await page.click('[data-tab="setup"]');
+            await page.selectOption('[data-testid="target"]', 'local');
+            await page.click('[data-testid="next"]');
+            await page.click('[data-testid="run-detect"]');
+            await wait(page, '[data-plan-step]');
+            await page.click('[data-testid="next"]');
+            await page.click('[data-testid="next"]');
+            await page.click('[data-testid="run-start"]');
+            await wait(page, '[data-step-id="reachability"][data-status="ok"]');
+            await page.click('[data-testid="next"]');
+            assertEqual(await page.getAttribute('[data-testid="handover-status"]', 'data-status'),
+                'ok', 'this proof needs a clean success, not a partial');
+
+            // PROOF 1: the registry itself really has a "local" record now --
+            // read straight through the same PilotServers module every
+            // surface uses, no UI involved yet.
+            const record = await page.evaluate(() => window.PilotServers.read('local'));
+            assertOk(record, 'PilotServers.read("local") found nothing -- registerServer() never wrote it');
+            assertEqual(record.host, 'localhost');
+            assertOk(!Object.prototype.hasOwnProperty.call(record, 'password'),
+                'a server record must never carry a secret');
+
+            // PROOF 2: js/app.js's real activeServerId flips to "local" --
+            // proving registerServer() actually called setActive() and
+            // dispatched 'pilot:server-changed', not merely written a file
+            // nothing else ever looks at.
+            await page.waitForFunction(
+                () => window.alpineData() && window.alpineData().activeServerId === 'local',
+                null, { timeout: WAIT });
+            await page.waitForFunction(
+                () => window.alpineData() && window.alpineData().apiReady === true,
+                null, { timeout: WAIT });
+
+            // PROOF 3: Overview's switcher shows the REAL record, not the
+            // synthetic FALLBACK_SERVER js/features/overview.js renders for
+            // an empty registry -- distinguished by the visible option TEXT:
+            // the fallback reads "This server", a genuine record with no
+            // `name` field falls back to its `host`, "localhost". Refresh is
+            // a real click on Overview's own control (loadServers() is
+            // fetched once at mount, before this run ever happened, so
+            // picking up the file registerServer() just wrote needs the same
+            // Refresh a real user would reach for).
+            await page.click('[data-tab="overview"]');
+            await page.click('#pilot-overview [data-test="refresh"]');
+            await page.waitForFunction(() => {
+                const opt = document.querySelector('#pilot-overview [data-test="switcher"] option[value="local"]');
+                return !!opt && opt.textContent.trim() === 'localhost';
+            }, null, { timeout: WAIT });
+
+            // PROOF 4: Devices genuinely queries this server -- a REAL
+            // /admin/peer request reaches the stub, and the row it renders
+            // is the one this scenario's own stub attached to that route
+            // (never a coincidental leftover from some other server's cache).
+            await page.click('[data-tab="devices"]');
+            await page.click('#pilot-devices [data-test="refresh"]');
+            await page.waitForFunction(
+                () => document.querySelectorAll('#pilot-devices [data-test="row"]').length === 1,
+                null, { timeout: WAIT });
+            const peerCalls = (await page.evaluate(() => window.__pilotStub.calls))
+                .filter((c) => c.kind === 'http' && c.path.indexOf('/admin/peer') === 0);
+            assertOk(peerCalls.length >= 1,
+                'Devices never actually queried the newly registered server');
+            const names = await page.$$eval('#pilot-devices [data-test="name"] span[x-text]',
+                (els) => els.map((e) => e.textContent.trim()));
+            assertOk(names.includes('Freshly Registered Pi'),
+                'the rendered row is not the device this scenario\'s own stub attached to /admin/peer');
+
+            await shot(page, 'setup-registers-server-e2e');
+        } finally {
+            await page.ctx.close();
+        }
+    });
 }
 
 export default async function run(ctx) {

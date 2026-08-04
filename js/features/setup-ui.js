@@ -93,7 +93,13 @@
             // did not. Both start false/null on a fresh wizard and are only
             // ever touched by persistCredential() itself.
             credentialSaved: false,
-            credentialSaveError: null
+            credentialSaveError: null,
+            // Task 34: whether registerServer() (below) actually wrote/updated
+            // this run's server record, the id it registered under, and why
+            // not if it did not. Only ever touched by registerServer() itself.
+            registered: false,
+            registrationError: null,
+            registeredServerId: null
         };
     }
 
@@ -175,6 +181,147 @@
     function slugForHost(host) {
         const dashed = str(host).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
         return dashed ? dashed.slice(0, 64) : null;
+    }
+
+    // ------------------------------------------------------- registration
+    //
+    // Task 34: PilotServers.write() had NO callers anywhere in the repo, so no
+    // shipped code path ever registered a server — the wizard could finish
+    // "successfully" and every management surface (Overview, Devices,
+    // Address Book, Users, Audit, Server Ops) stayed permanently empty. These
+    // functions decide WHAT gets registered and under WHICH id; registerServer()
+    // (below the cockpit I/O divider) is the only caller.
+
+    // Pure. The id a provisioned target is registered — and its day-2
+    // credential stored — under. 'local' for a localhost target, matching
+    // FALLBACK_SERVER/server-ops-ui.js's own hard-coded 'local' id elsewhere.
+    // For ssh, slugForHost(host) alone (the id persistCredential() used before
+    // this task) would let two targets that differ ONLY by port collide on
+    // the same record — flagged as a Minor in the task 33 review and closed
+    // HERE, because registerServer() is what actually makes that collision
+    // bite (one provisioned server silently overwriting another's record).
+    // The port is therefore folded into the id whenever it is not the SSH
+    // default (22), capped so the combined id still satisfies
+    // PilotServers.ID_RE / MAX_ID_LEN. persistCredential() below is switched
+    // to call this SAME function, so a stored credential is always keyed
+    // under the exact id its server record is registered under.
+    function idForChoices(choices) {
+        const c = (choices && typeof choices === 'object') ? choices : {};
+        if (str(c.target) !== 'ssh') return 'local';
+        const base = slugForHost(c.host);
+        if (!base) return null;
+        const raw = c.port;
+        const port = (typeof raw === 'number' && isFinite(raw) && Math.floor(raw) === raw)
+            ? Math.floor(raw) : 22;
+        if (port === 22 || port < 1 || port > 65535) return base;
+        const suffix = '-' + port;
+        return (base.length + suffix.length <= 64 ? base : base.slice(0, 64 - suffix.length)) + suffix;
+    }
+
+    // Pure. The hbbs public key and port set to record, "as detected" rather
+    // than assumed. Two cases, decided by detection alone (the same signal
+    // provision-plan.js's own build() uses to choose adopt vs install):
+    //   - Adopted (detection.hbbs is non-null): hbbs already existed before
+    //     this run and pilot-exec never reinstalls or restarts it, so
+    //     detection.hbbs.{pubkey,ports} — captured by --detect BEFORE the run
+    //     — describe the real, unchanged server.
+    //   - Freshly installed (detection.hbbs is null): hbbs writes its own
+    //     keypair on first start, so the only place the new public key exists
+    //     is the 'hbbs-key' step's captured stdout (provision-plan.js's own
+    //     step of that id `cat`s exactly that file). The port set actually
+    //     required for this configuration comes from `required` (this.required,
+    //     populated by requiredPorts() from the very same choices this run
+    //     used) rather than being re-guessed here.
+    function hbbsInfoFrom(state) {
+        const s = (state && typeof state === 'object') ? state : {};
+        const det = s.detection;
+        if (det && typeof det === 'object' && det.hbbs && typeof det.hbbs === 'object') {
+            const ports = Array.isArray(det.hbbs.ports)
+                ? det.hbbs.ports.filter((p) => typeof p === 'number' && isFinite(p)) : [];
+            const key = (typeof det.hbbs.pubkey === 'string' && det.hbbs.pubkey.trim())
+                ? det.hbbs.pubkey.trim() : null;
+            return { hbbsKey: key, hbbsPorts: ports };
+        }
+        const exec = s.exec;
+        const steps = (exec && Array.isArray(exec.steps)) ? exec.steps : [];
+        let key = null;
+        for (let i = 0; i < steps.length; i++) {
+            if (steps[i].id !== 'hbbs-key') continue;
+            const lines = Array.isArray(steps[i].lines) ? steps[i].lines : [];
+            for (let j = lines.length - 1; j >= 0; j--) {
+                const t = str(lines[j].text).trim();
+                if (t) { key = t; break; }
+            }
+        }
+        const req = Array.isArray(s.required) ? s.required : [];
+        const seen = {};
+        const ports = [];
+        for (let i = 0; i < req.length; i++) {
+            const r = req[i];
+            if (!r || (r.component !== 'hbbs' && r.component !== 'hbbr')) continue;
+            if (typeof r.port !== 'number' || seen[r.port]) continue;
+            seen[r.port] = true;
+            ports.push(r.port);
+        }
+        ports.sort((a, b) => a - b);
+        return { hbbsKey: key, hbbsPorts: ports };
+    }
+
+    // Pure. The API port actually in effect: the port an ADOPTED server is
+    // really listening on (detection.api.port) when there is one, otherwise
+    // the same fixed default a fresh install uses (planChoicesFor()'s own
+    // apiPort). Mirrors provision-plan.js's build() precedence exactly
+    // (det.api ? det.api.port : ch.apiPort) — never re-derived independently.
+    function apiPortFrom(state) {
+        const det = state && state.detection;
+        if (det && det.api && typeof det.api === 'object' &&
+            typeof det.api.port === 'number' && isFinite(det.api.port)) {
+            return Math.floor(det.api.port);
+        }
+        const P = root ? root.PilotPorts : null;
+        return (P && typeof P.API_DEFAULT === 'number') ? P.API_DEFAULT : 21114;
+    }
+
+    // Pure. Builds the exact object registerServer() hands to
+    // PilotServers.write() — a PilotServers.normalizeRecord()-compatible
+    // shape, never a secret (writeSshCredential() is the only thing that ever
+    // touches a credential, in a separate 0600 file). `existing` is the
+    // record already on disk under this same id, or null on a first
+    // provision. Re-provisioning the same target must UPDATE that record in
+    // place rather than create a duplicate (there is only ever one id per
+    // target, by construction of idForChoices()) while PRESERVING whatever
+    // this wizard does not itself collect: domain and tls are not gathered by
+    // any step of this wizard yet (see planChoicesFor()'s own comment — no
+    // domain/DuckDNS input exists to make TLS safe to default on), so an
+    // existing record's own values are carried forward untouched rather than
+    // being clobbered by a decision this run never actually made; a brand
+    // new record gets the same "off" defaults PilotServers.normalizeRecord()
+    // itself would apply. createdAt is likewise preserved across re-runs.
+    // `nowIso` is passed in (never read from the clock here) so this stays a
+    // pure function of its inputs.
+    function recordForRegistration(state, existing, nowIso) {
+        const s = (state && typeof state === 'object') ? state : {};
+        const c = (s.choices && typeof s.choices === 'object') ? s.choices : {};
+        const id = idForChoices(c);
+        const remote = str(c.target) === 'ssh';
+        const base = (existing && typeof existing === 'object') ? existing : null;
+        const hbbs = hbbsInfoFrom(s);
+        const rawPort = c.port;
+        const sshPort = (remote && typeof rawPort === 'number' && isFinite(rawPort) &&
+            Math.floor(rawPort) === rawPort) ? Math.floor(rawPort) : 22;
+        return {
+            id: id,
+            host: remote ? str(c.host) : 'localhost',
+            sshPort: sshPort,
+            apiPort: apiPortFrom(s),
+            tls: base ? base.tls === true : false,
+            domain: (base && base.domain) ? base.domain : null,
+            hbbsKey: hbbs.hbbsKey !== null ? hbbs.hbbsKey : (base ? (base.hbbsKey || null) : null),
+            hbbsPorts: hbbs.hbbsPorts.length ? hbbs.hbbsPorts
+                : (base && Array.isArray(base.hbbsPorts) ? base.hbbsPorts : []),
+            installDir: base ? base.installDir : undefined,
+            createdAt: (base && base.createdAt) ? base.createdAt : nowIso
+        };
     }
 
     // ----------------------------------------------------------- step 1
@@ -783,6 +930,24 @@
             : Object.assign(new Error(message), { kind: kind });
     }
 
+    // Task 34: registerServer()'s own notification, mirroring js/app.js's
+    // module-private notifyServerChanged() and js/features/devices-ui.js's
+    // emitServerChanged() exactly — same event name, same {id} detail shape,
+    // same guarded/optional access to document and CustomEvent so this stays
+    // safe to call from a node:test run with no DOM at all. A separate,
+    // local copy rather than a cross-feature require(): overview.js's own
+    // openWizardTls() dispatch is the same pattern, and setup-ui.js already
+    // has no dependency on any other js/features/*.js module.
+    function notifyServerChanged(id, target) {
+        const t = target || (root && root.document) || null;
+        if (!t || typeof t.dispatchEvent !== 'function') return false;
+        const CE = root && root.CustomEvent;
+        if (typeof CE !== 'function') return false;
+        const value = (typeof id === 'string' && id.trim()) ? id.trim() : 'local';
+        t.dispatchEvent(new CE('pilot:server-changed', { detail: { id: value }, bubbles: true }));
+        return true;
+    }
+
     function pilotSetupUi() {
         return Object.assign(blankState(), {
             busy: false,
@@ -1020,6 +1185,17 @@
                 await this.persist(this.runId, raw);
                 this.reach = reachFrom(this.exec);
                 this.handoverResult = handover(this.exec, this.reach);
+                // Task 34: register the server the moment the console is
+                // actually USABLE — that is "ok", or a warnings-only
+                // "partial" where nothing REQUIRED is still blocked (handover()
+                // only ever sets blocked.length > 0 for a required port, kind
+                // PORT_BLOCKED — an optional-only warning leaves blocked
+                // empty). A hard failure, or a partial that IS blocked on a
+                // required port, must never create or update a record for a
+                // server nobody can actually reach yet.
+                const usable = this.handoverResult.status !== 'failed' &&
+                    this.handoverResult.blocked.length === 0;
+                if (usable) await this.registerServer();
                 // GAP C (task 33): only once provisioning actually SUCCEEDED —
                 // a partial or failed run must never persist a credential for
                 // a server that turned out not to be usable.
@@ -1038,10 +1214,18 @@
             // in credentialSaveError so the handover pane can say so, but
             // never blocks finish() — a stored password is a convenience,
             // not a precondition for calling the install itself done.
+            //
+            // Task 34: uses idForChoices(), the SAME id registerServer() below
+            // registers the record under (previously slugForHost(host) alone,
+            // which — unlike idForChoices() — ignored a non-default port).
+            // Keeping both call sites on one function means a stored
+            // credential is always keyed under the exact id its server
+            // record actually gets, so server-ops-ui.js's readSecret(id,
+            // 'ssh') for the now-active server can always find it.
             async persistCredential() {
                 const cred = credentialToRemember(this.choices);
                 if (!cred) return false;
-                const id = slugForHost(this.choices.host);
+                const id = idForChoices(this.choices);
                 if (!id) {
                     this.credentialSaved = false;
                     this.credentialSaveError = fail('GENERIC',
@@ -1065,6 +1249,60 @@
                     this.credentialSaveError = describe(e);
                     return false;
                 }
+            },
+
+            // Task 34: THE fix. PilotServers.write() had no caller anywhere in
+            // the repo, so no shipped code path ever registered a server —
+            // this is the one that now does. Reads any EXISTING record under
+            // this same id first so re-provisioning the same target updates
+            // it in place (recordForRegistration() preserves what the wizard
+            // itself never collects) rather than creating a duplicate. Once
+            // written, makes the server active and dispatches
+            // 'pilot:server-changed' — the exact event index.html's shell
+            // listens for to call switchServer(), the same event
+            // js/features/overview.js's own switcher dispatches — so every
+            // surface re-fetches against a console that is actually usable,
+            // rather than leaving the user to discover the switcher
+            // themselves. Never blocks finish(): a registration failure is
+            // recorded in registrationError, exactly like persistCredential()
+            // treats a credential failure as a convenience that did not land,
+            // not a reason to fail the whole run.
+            async registerServer() {
+                const id = idForChoices(this.choices);
+                if (!id) {
+                    this.registered = false;
+                    this.registrationError = fail('GENERIC',
+                        'Could not derive a server id from "' + str(this.choices.host) +
+                        '" to register this server under.');
+                    return false;
+                }
+                const Servers = servers();
+                if (!Servers || typeof Servers.write !== 'function') {
+                    this.registered = false;
+                    this.registrationError = null;
+                    return false;
+                }
+                let existing = null;
+                try { existing = await Servers.read(id); } catch (e) { existing = null; }
+                const rec = recordForRegistration(this, existing, new Date().toISOString());
+                try {
+                    await Servers.write(rec);
+                } catch (e) {
+                    this.registered = false;
+                    this.registrationError = describe(e);
+                    return false;
+                }
+                this.registeredServerId = id;
+                this.registered = true;
+                this.registrationError = null;
+                // Best-effort: the record is already safely written even if
+                // either of these two steps fails, so a failure here is
+                // recorded but never undoes the registration itself.
+                if (typeof Servers.setActive === 'function') {
+                    try { await Servers.setActive(id); } catch (e) { this.registrationError = describe(e); }
+                }
+                notifyServerChanged(id);
+                return true;
             },
 
             // Persisted so a failed setup can be diagnosed after the page is gone.
@@ -1130,10 +1368,12 @@
         STEP_IDS, STEP_TITLES, MAX_LINES, MAX_LINE_CHARS, MAX_NOISE,
         blankExec, blankState, visibleSteps, nextStep, prevStep, applyWizardStep,
         credentialToRemember, slugForHost,
+        idForChoices, hbbsInfoFrom, apiPortFrom, recordForRegistration,
         validateTarget, portRows, awsCommand,
         parseLine, reduce, progress, transcriptText, runPath,
         handover, passwordGate, manualFor,
         runIdFor, splitStream, detectRequest, envelopeCtx, requiredPorts, reachFrom,
+        notifyServerChanged,
         pilotSetupUi
     };
 

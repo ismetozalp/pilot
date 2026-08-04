@@ -175,7 +175,20 @@ test('switchServer: a request for the server that is ALREADY active is a no-op (
     assert.equal(setActiveCalls, 0, 'the registry was not written to again for a no-op switch');
 });
 
-test('switchServer: "local" is recognised as already-active when nothing is configured', async (t) => {
+// Task 34: this USED to assert switchServer('local') was a flat no-op here
+// (the guard compared against `this.activeServerId || 'local'`, so "nothing
+// configured" and "local already active" looked identical). That fallback is
+// gone now: js/features/setup-ui.js's registerServer() can create a REAL
+// /etc/pilot/servers/local.json for the very first time mid-session, and the
+// shell's switchServer('local') -- fired by wireApi()'s own initial
+// notifyServerChanged(null) fallback -- has to be able to notice that once it
+// exists (see the NEXT test). Here nothing was ever registered, so the
+// outcome is unchanged in the one way that matters (no transport gets wired
+// to a server with no record) -- it is simply reached by genuinely trying
+// and failing safe (wireApi()'s own read() catch), not by a guard refusing
+// to try at all.
+test('switchServer: "local" with nothing configured genuinely tries to wire it and fails safe ' +
+    '(no record exists yet -- there is simply nothing TO wire)', async (t) => {
     fakeCockpit({ '/etc/pilot/config.json': '{}' });
     t.after(dropCockpit);
     const seen = spyOnSetTransport(t);
@@ -184,12 +197,67 @@ test('switchServer: "local" is recognised as already-active when nothing is conf
     await c.wireApi();                 // no active server -> activeServerId stays null, event carries 'local'
     await c.switchServer('local');     // the shell listener re-dispatching that same 'local' id
 
-    assert.equal(c.activeServerId, null);
-    // wireApi() itself never calls setTransport when there is no active server
-    // at all (it returns early) -- the guard's job here is simply to confirm
-    // switchServer('local') does not try to proceed past that early return a
-    // second, pointless time either.
-    assert.equal(seen.length, 0, 'no setTransport call for the "nothing configured" case, either time');
+    assert.equal(c.activeServerId, null, 'no transport was ever successfully wired to "local"');
+    assert.equal(seen.length, 0, 'no setTransport call -- there is still no local.json to wire it from');
+    assert.ok(c.compatError, 'the failed read (no such record) is recorded, not silently dropped');
+});
+
+// The scenario the fix above exists for: once a real record for "local"
+// shows up (exactly what registerServer() does), the SAME re-dispatch that
+// used to be swallowed as "already active" must now really wire it.
+test('switchServer: "local" DOES get wired once a real record for it appears mid-session', async (t) => {
+    const LOCAL_REC = Object.assign({}, REC, { id: 'local', host: 'localhost' });
+    fakeCockpit({
+        '/etc/pilot/config.json': '{}',
+        '/etc/pilot/servers/local.json': JSON.stringify(LOCAL_REC)
+    });
+    t.after(dropCockpit);
+    const seen = spyOnSetTransport(t);
+
+    const c = App.pilotApp();
+    await c.wireApi();                 // nothing configured yet -> activeServerId stays null
+    assert.equal(seen.length, 0, 'nothing to wire on the very first attempt');
+
+    await c.switchServer('local');     // the exact re-dispatch registerServer() triggers after writing the record
+
+    assert.equal(c.activeServerId, 'local', 'the newly-registered server must actually become active');
+    assert.equal(c.apiReady, true);
+    assert.equal(seen.length, 1, 'the transport must actually get wired now that a record exists');
+});
+
+// The real live-Cockpit regression this task's own live tier caught: with no
+// try/catch, a PilotServers.setActive() rejection (e.g. /etc/pilot not yet
+// writable in this session) was an UNHANDLED exception on every ordinary page
+// load with nothing configured, not merely a failed switch -- because the
+// old guard's blanket no-op meant this line was, in practice, never reached
+// before.
+test('switchServer: a setActive() rejection is recorded, never thrown, and wireApi() still runs', async (t) => {
+    fakeCockpit({ '/etc/pilot/config.json': '{}' });
+    t.after(dropCockpit);
+    spyOnSetTransport(t);
+    const realSetActive = globalThis.PilotServers.setActive;
+    globalThis.PilotServers.setActive = function () {
+        return Promise.reject(Object.assign(new Error('could not setActive /etc/pilot/config.json'),
+            { name: 'PilotError', kind: 'GENERIC' }));
+    };
+    t.after(() => { globalThis.PilotServers.setActive = realSetActive; });
+
+    const c = App.pilotApp();
+    await c.wireApi();
+    await assert.doesNotReject(c.switchServer('local'));
+
+    assert.ok(c.switchError, 'the rejection must be recorded somewhere the shell can see');
+    assert.match(c.switchError.message, /could not setActive/);
+});
+
+test('switchServer: a hostile id still rejects loudly, even with the setActive() try/catch in place', async (t) => {
+    fakeCockpit();
+    t.after(dropCockpit);
+    spyOnSetTransport(t);
+
+    const c = App.pilotApp();
+    await c.wireApi();
+    await assert.rejects(c.switchServer('../../etc'));
 });
 
 test('wireApi: no token file at all is ordinary — tokenError stays null', async (t) => {

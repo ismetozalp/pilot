@@ -852,13 +852,26 @@ test('slugForHost: an unusable host (empty, or nothing but separators) yields nu
 // a plain function argument, and separately (end to end, in a real browser)
 // by tests/e2e/setup.e2e.mjs's own GAP C scenario.
 
+// Task 34: made properly promise-aware. The original `try { return fn(); }
+// finally { restore }` restores globalThis.PilotServers the instant fn()
+// (an async function) returns its FIRST pending promise -- i.e. synchronously,
+// before any of fn()'s own internal awaits actually run. That went unnoticed
+// as long as every caller's own first `await` was on the very fake this
+// installs (persistCredential() looks up servers() before its own first
+// internal await, so the reference was already captured). start()'s success
+// path awaits cockpit.spawn()'s result BEFORE it ever reaches
+// registerServer()'s own servers() lookup, so by then the old version had
+// already put the REAL PilotServers module back — registerServer() would
+// silently call through to it instead of the fake. Awaiting fn() before
+// restoring (mirroring withFakeCockpit/withFakeDocument below) fixes that for
+// every caller, including the pre-existing ones above this comment.
 function withFakeServers(fake, fn) {
     const had = Object.prototype.hasOwnProperty.call(globalThis, 'PilotServers');
     const prev = globalThis.PilotServers;
     globalThis.PilotServers = fake;
-    try { return fn(); } finally {
+    return Promise.resolve().then(fn).finally(() => {
         if (had) globalThis.PilotServers = prev; else delete globalThis.PilotServers;
-    }
+    });
 }
 
 test('persistCredential: does nothing (and never touches PilotServers) when there is nothing to remember', async () => {
@@ -993,4 +1006,463 @@ test('start(): a failed run never persists a credential, even with remember chec
             assert.equal(c.credentialSaved, false);
         });
     if (had) globalThis.cockpit = prevCockpit; else delete globalThis.cockpit;
+});
+
+// ============================================================= TASK 34 =====
+//
+// THE DEFECT: PilotServers.write() had ZERO callers anywhere in js/ — no
+// shipped code path ever registered a server, local or remote, so a user
+// could run this wizard to a successful finish and every management surface
+// (Overview, Devices, Address Book, Users, Audit, Server Ops) stayed
+// permanently at its empty state. These tests drive the pure decision
+// functions directly, then registerServer()/start() against a fake
+// PilotServers exactly the way the existing GAP C tests above drive
+// persistCredential()/start() — the same shape, so a reviewer can compare
+// the two side by side.
+
+function withFakeCockpit(fake, fn) {
+    const had = Object.prototype.hasOwnProperty.call(globalThis, 'cockpit');
+    const prev = globalThis.cockpit;
+    globalThis.cockpit = fake;
+    return Promise.resolve().then(fn).finally(() => {
+        if (had) globalThis.cockpit = prev; else delete globalThis.cockpit;
+    });
+}
+
+function withFakeDocument(fn) {
+    const events = [];
+    const had = Object.prototype.hasOwnProperty.call(globalThis, 'document');
+    const prev = globalThis.document;
+    globalThis.document = { dispatchEvent(ev) { events.push(ev); return true; } };
+    return Promise.resolve().then(() => fn(events)).finally(() => {
+        if (had) globalThis.document = prev; else delete globalThis.document;
+    });
+}
+
+// A transcript whose 'hbbs-key' step really did print a key, and ends 'ok'
+// with no reachability step at all — reach() therefore reports no blocked
+// port, exactly the shape a plain local install produces.
+const RUN_OK_LOCAL_HBBS_KEY = [
+    '{"t":"run-start","run_id":"20260804T000000Z","transport":"local","steps":1}',
+    '{"t":"step-start","id":"hbbs-key","title":"Read the public key","cmd":"cat x"}',
+    '{"t":"output","id":"hbbs-key","stream":"stdout","line":"AAAAC3NzaC1lZDI1NTE5AAAAIFakeKeyForTest"}',
+    '{"t":"step-end","id":"hbbs-key","status":"ok","exit":0,"ms":5}',
+    '{"t":"run-end","status":"ok","kind":null}'
+].join('\n') + '\n';
+
+// Same run, but the helper itself reported "partial" with no required port
+// blocked (e.g. an optional warning) — handover()'s "finished with warnings"
+// branch, which the console can still be reached through.
+const RUN_PARTIAL_NO_BLOCK = RUN_OK_LOCAL_HBBS_KEY
+    .replace('"t":"run-end","status":"ok","kind":null', '"t":"run-end","status":"partial","kind":"GENERIC"');
+
+// A required port left blocked: handover()'s PORT_BLOCKED branch.
+const RUN_PARTIAL_BLOCKED = [
+    '{"t":"run-start","run_id":"20260804T000000Z","transport":"local","steps":2}',
+    '{"t":"step-start","id":"hbbs-key","title":"Read the public key","cmd":"cat x"}',
+    '{"t":"output","id":"hbbs-key","stream":"stdout","line":"AAAAC3NzaC1lZDI1NTE5AAAAIFakeKeyForTest"}',
+    '{"t":"step-end","id":"hbbs-key","status":"ok","exit":0,"ms":5}',
+    '{"t":"step-start","id":"reachability","title":"Probe required ports","cmd":"pilot probe"}',
+    '{"t":"output","id":"reachability","stream":"stdout","line":"21116/udp blocked"}',
+    '{"t":"step-end","id":"reachability","status":"failed","exit":1,"ms":900}',
+    '{"t":"run-end","status":"partial","kind":"PORT_BLOCKED"}'
+].join('\n') + '\n';
+
+function fakeSpawnCockpit(transcript) {
+    return {
+        spawn() {
+            const p = Promise.resolve(transcript);
+            p.input = () => p;
+            p.stream = () => p;
+            return p;
+        },
+        file() { return { read: () => Promise.resolve(null), replace: () => Promise.resolve(), close() {} }; }
+    };
+}
+
+function fakeServersRecorder(extra) {
+    const calls = { write: [], read: [], setActive: [] };
+    const fake = Object.assign({
+        write(rec) { calls.write.push(rec); return Promise.resolve(rec); },
+        read(id) { calls.read.push(id); return Promise.reject(new Error('no record: ' + id)); },
+        setActive(id) { calls.setActive.push(id); return Promise.resolve(id); }
+    }, extra || {});
+    return { fake, calls };
+}
+
+// --------------------------------------------------------------- idForChoices
+
+test('idForChoices: a local target is always "local", regardless of choices.host', () => {
+    assert.equal(UI.idForChoices({ target: 'local', host: 'whatever' }), 'local');
+    assert.equal(UI.idForChoices({ target: 'local' }), 'local');
+});
+
+test('idForChoices: an ssh target on the default port 22 is the bare host slug', () => {
+    assert.equal(UI.idForChoices({ target: 'ssh', host: 'rd.Example.com', port: 22 }), 'rd-example-com');
+    assert.equal(UI.idForChoices({ target: 'ssh', host: 'rd.example.com' }), 'rd-example-com',
+        'a missing port must default to 22, exactly like sshBlock() does');
+});
+
+test('idForChoices: a non-default ssh port is folded into the id -- ' +
+    'closes the Minor from the task 33 review (two targets differing only by port would collide)', () => {
+    assert.equal(UI.idForChoices({ target: 'ssh', host: 'rd.example.com', port: 2222 }), 'rd-example-com-2222');
+    const a = UI.idForChoices({ target: 'ssh', host: 'rd.example.com', port: 22 });
+    const b = UI.idForChoices({ target: 'ssh', host: 'rd.example.com', port: 2222 });
+    assert.notEqual(a, b, 'two targets differing only by port must never collide on the same id');
+});
+
+test('idForChoices: an out-of-range or non-numeric port is treated as the default, not appended', () => {
+    assert.equal(UI.idForChoices({ target: 'ssh', host: 'rd.example.com', port: 0 }), 'rd-example-com');
+    assert.equal(UI.idForChoices({ target: 'ssh', host: 'rd.example.com', port: 99999 }), 'rd-example-com');
+    assert.equal(UI.idForChoices({ target: 'ssh', host: 'rd.example.com', port: 'x' }), 'rd-example-com');
+    assert.equal(UI.idForChoices({ target: 'ssh', host: 'rd.example.com', port: NaN }), 'rd-example-com');
+});
+
+test('idForChoices: an unusable host yields null, even with a port', () => {
+    assert.equal(UI.idForChoices({ target: 'ssh', host: '...', port: 2222 }), null);
+});
+
+test('idForChoices: a maximal host plus a port suffix is still PilotServers.ID_RE-safe and <= 64 chars', () => {
+    const id = UI.idForChoices({ target: 'ssh', host: 'a'.repeat(100), port: 65000 });
+    assert.ok(id.length <= 64, 'must respect PilotServers.MAX_ID_LEN');
+    assert.match(id, /^[a-z0-9][a-z0-9-]{0,63}$/, 'must respect PilotServers.ID_RE');
+    assert.ok(id.endsWith('-65000'), 'the port suffix must survive truncation, not be cut off');
+});
+
+test('idForChoices: a hostile or missing choices object never throws', () => {
+    for (const bad of [null, undefined, 42, 'x', []]) {
+        assert.doesNotThrow(() => UI.idForChoices(bad));
+        assert.equal(UI.idForChoices(bad), 'local');
+    }
+});
+
+// -------------------------------------------------------------- hbbsInfoFrom
+
+test('hbbsInfoFrom: an adopted hbbs (detection.hbbs present) reports the ALREADY-running server, ' +
+    'never the freshly-installed transcript', () => {
+    const state = {
+        detection: { hbbs: { pubkey: 'existingPubKey', ports: [21115, 21116, 21117] } },
+        exec: { steps: [] }, required: []
+    };
+    assert.deepEqual(UI.hbbsInfoFrom(state), { hbbsKey: 'existingPubKey', hbbsPorts: [21115, 21116, 21117] });
+});
+
+test('hbbsInfoFrom: a fresh install (no detection.hbbs) reads the key from the ' +
+    "'hbbs-key' step's own captured stdout", () => {
+    const state = {
+        detection: null,
+        exec: {
+            steps: [
+                { id: 'fetch-api', lines: [{ stream: 'stdout', text: 'noise' }] },
+                { id: 'hbbs-key', lines: [{ stream: 'stdout', text: 'FreshPubKey123' }] }
+            ]
+        },
+        required: [
+            { port: 21115, proto: 'tcp', component: 'hbbs' },
+            { port: 21116, proto: 'tcp', component: 'hbbs' },
+            { port: 21116, proto: 'udp', component: 'hbbs' },
+            { port: 21117, proto: 'tcp', component: 'hbbr' },
+            { port: 21114, proto: 'tcp', component: 'api' }
+        ]
+    };
+    assert.deepEqual(UI.hbbsInfoFrom(state),
+        { hbbsKey: 'FreshPubKey123', hbbsPorts: [21115, 21116, 21117] });
+});
+
+test('hbbsInfoFrom: takes the last non-empty line, ignoring trailing blank lines', () => {
+    const state = {
+        detection: null,
+        exec: { steps: [{ id: 'hbbs-key', lines: [
+            { stream: 'stdout', text: 'RealKey' },
+            { stream: 'stdout', text: '' }
+        ] }] },
+        required: []
+    };
+    assert.equal(UI.hbbsInfoFrom(state).hbbsKey, 'RealKey');
+});
+
+test('hbbsInfoFrom: no hbbs-key step and no detection ever throws, reports nothing', () => {
+    assert.deepEqual(UI.hbbsInfoFrom({}), { hbbsKey: null, hbbsPorts: [] });
+    assert.deepEqual(UI.hbbsInfoFrom(null), { hbbsKey: null, hbbsPorts: [] });
+});
+
+// --------------------------------------------------------------- apiPortFrom
+
+test('apiPortFrom: an adopted API server reports the port it is ACTUALLY listening on', () => {
+    assert.equal(UI.apiPortFrom({ detection: { api: { port: 9999 } } }), 9999);
+});
+
+test('apiPortFrom: a fresh install with no PilotPorts loaded falls back to the fixed default', () => {
+    const had = Object.prototype.hasOwnProperty.call(globalThis, 'PilotPorts');
+    const prev = globalThis.PilotPorts;
+    delete globalThis.PilotPorts;
+    try {
+        assert.equal(UI.apiPortFrom({ detection: null }), 21114);
+        assert.equal(UI.apiPortFrom({}), 21114);
+    } finally {
+        if (had) globalThis.PilotPorts = prev;
+    }
+});
+
+test('apiPortFrom: a fresh install reads PilotPorts.API_DEFAULT live when it is loaded', () => {
+    const had = Object.prototype.hasOwnProperty.call(globalThis, 'PilotPorts');
+    const prev = globalThis.PilotPorts;
+    globalThis.PilotPorts = { API_DEFAULT: 31000 };
+    try {
+        assert.equal(UI.apiPortFrom({ detection: null }), 31000);
+    } finally {
+        if (had) globalThis.PilotPorts = prev; else delete globalThis.PilotPorts;
+    }
+});
+
+// ------------------------------------------------------- recordForRegistration
+
+test('recordForRegistration: a brand new local record gets safe defaults, never a secret field', () => {
+    const state = { choices: { target: 'local', host: '' }, detection: null, exec: { steps: [] }, required: [] };
+    const rec = UI.recordForRegistration(state, null, '2026-08-04T00:00:00.000Z');
+    assert.deepEqual(rec, {
+        id: 'local', host: 'localhost', sshPort: 22, apiPort: 21114,
+        tls: false, domain: null, hbbsKey: null, hbbsPorts: [],
+        installDir: undefined, createdAt: '2026-08-04T00:00:00.000Z'
+    });
+    assert.ok(!Object.prototype.hasOwnProperty.call(rec, 'password'));
+    assert.ok(!Object.prototype.hasOwnProperty.call(rec, 'token'));
+});
+
+test('recordForRegistration: a brand new ssh record carries the real host and ssh port', () => {
+    const state = {
+        choices: { target: 'ssh', host: 'rd.example.com', port: 2222 },
+        detection: { api: { port: 21114 }, hbbs: { pubkey: 'k1', ports: [21115, 21116] } },
+        exec: { steps: [] }, required: []
+    };
+    const rec = UI.recordForRegistration(state, null, '2026-08-04T00:00:00.000Z');
+    assert.equal(rec.id, 'rd-example-com-2222');
+    assert.equal(rec.host, 'rd.example.com');
+    assert.equal(rec.sshPort, 2222);
+    assert.equal(rec.apiPort, 21114);
+    assert.deepEqual(rec.hbbsKey, 'k1');
+    assert.deepEqual(rec.hbbsPorts, [21115, 21116]);
+    assert.equal(rec.createdAt, '2026-08-04T00:00:00.000Z');
+});
+
+test('recordForRegistration: re-provisioning the SAME target updates in place -- ' +
+    'preserves domain/tls/createdAt the wizard never collects, refreshes hbbsKey/hbbsPorts', () => {
+    const existing = {
+        id: 'rd-example-com', host: 'rd.example.com', sshPort: 22, apiPort: 21114,
+        tls: true, domain: 'rd.example.com', hbbsKey: 'OLD-KEY', hbbsPorts: [21115],
+        installDir: '/custom/install', createdAt: '2020-01-01T00:00:00.000Z'
+    };
+    const state = {
+        choices: { target: 'ssh', host: 'rd.example.com', port: 22 },
+        detection: { api: { port: 21114 }, hbbs: { pubkey: 'NEW-KEY', ports: [21115, 21116, 21117] } },
+        exec: { steps: [] }, required: []
+    };
+    const rec = UI.recordForRegistration(state, existing, '2026-08-04T00:00:00.000Z');
+    assert.equal(rec.id, 'rd-example-com', 'must update the SAME id, not create a second record');
+    assert.equal(rec.tls, true, 'a field the wizard does not collect must be preserved');
+    assert.equal(rec.domain, 'rd.example.com', 'a field the wizard does not collect must be preserved');
+    assert.equal(rec.installDir, '/custom/install', 'a field the wizard does not collect must be preserved');
+    assert.equal(rec.createdAt, '2020-01-01T00:00:00.000Z', 'createdAt must survive a re-provision');
+    assert.equal(rec.hbbsKey, 'NEW-KEY', 'hbbsKey IS collected by this run and must be refreshed');
+    assert.deepEqual(rec.hbbsPorts, [21115, 21116, 21117], 'hbbsPorts IS collected by this run and must be refreshed');
+});
+
+test('recordForRegistration: a hostile or missing state never throws', () => {
+    for (const bad of [null, undefined, 42, 'x', []]) {
+        assert.doesNotThrow(() => UI.recordForRegistration(bad, null, '2026-01-01T00:00:00.000Z'));
+    }
+});
+
+// ------------------------------------------------------------- registerServer
+
+test('registerServer: a first-time local registration writes the record, makes it active, ' +
+    'and notifies every listening surface', async () => {
+    const { fake, calls } = fakeServersRecorder();
+    await withFakeDocument((events) => withFakeServers(fake, async () => {
+        const c = UI.pilotSetupUi();
+        c.choices.target = 'local';
+        const ok = await c.registerServer();
+        assert.equal(ok, true);
+        assert.equal(c.registered, true);
+        assert.equal(c.registrationError, null);
+        assert.equal(c.registeredServerId, 'local');
+        assert.deepEqual(calls.read, ['local']);
+        assert.equal(calls.write.length, 1);
+        assert.equal(calls.write[0].id, 'local');
+        assert.deepEqual(calls.setActive, ['local']);
+        assert.equal(events.length, 1);
+        assert.equal(events[0].type, 'pilot:server-changed');
+        assert.deepEqual(events[0].detail, { id: 'local' });
+    }));
+});
+
+test('registerServer: re-registering the same ssh target reads the existing record first ' +
+    'and writes the SAME id back (update in place, never a duplicate)', async () => {
+    const existing = {
+        id: 'rd-example-com', host: 'rd.example.com', sshPort: 22, apiPort: 21114,
+        tls: false, domain: null, hbbsKey: 'OLD', hbbsPorts: [21115], installDir: '/opt/rustdesk-api',
+        createdAt: '2020-01-01T00:00:00.000Z'
+    };
+    const { fake, calls } = fakeServersRecorder({ read(id) { calls.read.push(id); return Promise.resolve(existing); } });
+    await withFakeServers(fake, async () => {
+        const c = UI.pilotSetupUi();
+        c.choices.target = 'ssh';
+        c.choices.host = 'rd.example.com';
+        const ok = await c.registerServer();
+        assert.equal(ok, true);
+        assert.equal(calls.write.length, 1);
+        assert.equal(calls.write[0].id, 'rd-example-com');
+        assert.equal(calls.write[0].createdAt, '2020-01-01T00:00:00.000Z', 'createdAt preserved across the update');
+    });
+});
+
+test('registerServer: an unusable host never touches PilotServers at all and records why', async () => {
+    const { fake, calls } = fakeServersRecorder();
+    await withFakeServers(fake, async () => {
+        const c = UI.pilotSetupUi();
+        c.choices.target = 'ssh';
+        c.choices.host = '...';
+        const ok = await c.registerServer();
+        assert.equal(ok, false);
+        assert.equal(c.registered, false);
+        assert.ok(c.registrationError);
+        assert.equal(calls.write.length, 0);
+        assert.equal(calls.read.length, 0);
+        assert.equal(calls.setActive.length, 0);
+    });
+});
+
+test('registerServer: no usable PilotServers.write() fails closed, silently, never throws -- ' +
+    '(under node, servers() falls back to require() of the REAL module, so this is modelled the ' +
+    'way it can genuinely happen: a PilotServers shape with no write() at all)', async () => {
+    const c = UI.pilotSetupUi();
+    c.choices.target = 'local';
+    await withFakeServers({}, async () => {
+        const ok = await c.registerServer();
+        assert.equal(ok, false);
+        assert.equal(c.registered, false);
+        assert.equal(c.registrationError, null);
+    });
+});
+
+test('registerServer: a write() rejection is recorded, never thrown, and never activates or notifies', async () => {
+    const { fake, calls } = fakeServersRecorder({
+        write() { return Promise.reject(Object.assign(new Error('disk full'), { name: 'PilotError', kind: 'GENERIC' })); }
+    });
+    await withFakeDocument((events) => withFakeServers(fake, async () => {
+        const c = UI.pilotSetupUi();
+        c.choices.target = 'local';
+        const ok = await c.registerServer();
+        assert.equal(ok, false);
+        assert.equal(c.registered, false);
+        assert.ok(c.registrationError);
+        assert.match(c.registrationError.message, /disk full/);
+        assert.equal(calls.setActive.length, 0, 'a failed write must never be followed by setActive');
+        assert.equal(events.length, 0, 'a failed write must never notify surfaces of a server that was not saved');
+    }));
+});
+
+test('registerServer: a setActive() failure is recorded but the record is still registered ' +
+    'and surfaces are still notified', async () => {
+    const { fake, calls } = fakeServersRecorder({
+        setActive(id) { calls.setActive.push(id); return Promise.reject(new Error('cannot write config')); }
+    });
+    await withFakeDocument((events) => withFakeServers(fake, async () => {
+        const c = UI.pilotSetupUi();
+        c.choices.target = 'local';
+        const ok = await c.registerServer();
+        assert.equal(ok, true, 'the record itself is safely written even if activation fails');
+        assert.equal(c.registered, true);
+        assert.ok(c.registrationError, 'the activation failure must still be surfaced');
+        assert.equal(events.length, 1, 'surfaces should still be told the registry changed');
+    }));
+});
+
+// ------------------------------------------------------ start(): the wiring
+
+test('start(): a fully successful local run registers "local", makes it active, and notifies', async () => {
+    const { fake, calls } = fakeServersRecorder();
+    await withFakeCockpit(fakeSpawnCockpit(RUN_OK_LOCAL_HBBS_KEY), () => withFakeDocument((events) => withFakeServers(fake, async () => {
+        const c = UI.pilotSetupUi();
+        c.choices.target = 'local';
+        c.plan = { target: 'local', host: null, steps: [{ id: 'hbbs-key', title: 'Read the public key', argv: ['cat'] }] };
+        const ok = await c.start();
+        assert.equal(ok, true);
+        assert.equal(c.registered, true);
+        assert.equal(c.registeredServerId, 'local');
+        assert.equal(calls.write.length, 1);
+        assert.equal(calls.write[0].hbbsKey, 'AAAAC3NzaC1lZDI1NTE5AAAAIFakeKeyForTest');
+        assert.deepEqual(calls.setActive, ['local']);
+        assert.ok(events.some((e) => e.type === 'pilot:server-changed' && e.detail.id === 'local'));
+    })));
+});
+
+test('start(): a partial run with only optional warnings outstanding (no required port blocked) ' +
+    'still registers -- the console is usable', async () => {
+    const { fake, calls } = fakeServersRecorder();
+    await withFakeCockpit(fakeSpawnCockpit(RUN_PARTIAL_NO_BLOCK), () => withFakeServers(fake, async () => {
+        const c = UI.pilotSetupUi();
+        c.choices.target = 'local';
+        c.plan = { target: 'local', host: null, steps: [{ id: 'hbbs-key', title: 'Read the public key', argv: ['cat'] }] };
+        const ok = await c.start();
+        assert.equal(ok, false, 'the run itself is not a clean "ok"');
+        assert.equal(c.handoverResult.status, 'partial');
+        assert.equal(c.registered, true, 'a warnings-only partial must still register -- the console IS reachable');
+        assert.equal(calls.write.length, 1);
+    }));
+});
+
+test('start(): a required port left blocked ends PARTIAL and must NOT register', async () => {
+    const { fake, calls } = fakeServersRecorder();
+    await withFakeCockpit(fakeSpawnCockpit(RUN_PARTIAL_BLOCKED), () => withFakeServers(fake, async () => {
+        const c = UI.pilotSetupUi();
+        c.choices.target = 'local';
+        c.plan = { target: 'local', host: null, steps: [{ id: 'hbbs-key', title: 'x', argv: ['cat'] }, { id: 'reachability', title: 'y', argv: ['ss'] }] };
+        const ok = await c.start();
+        assert.equal(ok, false);
+        assert.equal(c.handoverResult.status, 'partial');
+        assert.ok(c.handoverResult.blocked.length > 0);
+        assert.equal(c.registered, false, 'a server nobody can fully reach must never be registered');
+        assert.equal(calls.write.length, 0);
+    }));
+});
+
+test('start(): a failed run must not register, even for a target that would otherwise be usable', async () => {
+    const { fake, calls } = fakeServersRecorder();
+    await withFakeCockpit(fakeFailingSpawnCockpit(), () => withFakeServers(fake, async () => {
+        const c = UI.pilotSetupUi();
+        c.choices.target = 'ssh';
+        c.choices.host = 'rd.example.com';
+        c.plan = { steps: [{ id: 'fetch-api', title: 'Download API server', argv: ['curl'] }] };
+        const ok = await c.start();
+        assert.equal(ok, false);
+        assert.equal(c.registered, false);
+        assert.equal(calls.write.length, 0);
+    }));
+});
+
+// ------------------------------------------------ registration/credential ids agree
+
+test('persistCredential and registerServer key the SAME target under the SAME id -- ' +
+    'a non-default ssh port must not split the record and the credential apart', async () => {
+    const { fake: serversFake, calls } = fakeServersRecorder({
+        writeSshCredential(id, authType, secret) { calls.writeSshCredential = calls.writeSshCredential || []; calls.writeSshCredential.push(id); return Promise.resolve(); }
+    });
+    const RUN_OK_SSH = RUN_OK_LOCAL_HBBS_KEY.replace('"transport":"local"', '"transport":"ssh"');
+    await withFakeCockpit(fakeSpawnCockpit(RUN_OK_SSH), () => withFakeServers(serversFake, async () => {
+        const c = UI.pilotSetupUi();
+        c.choices.target = 'ssh';
+        c.choices.host = 'rd.example.com';
+        c.choices.port = 2222;
+        c.choices.auth = 'password';
+        c.choices.password = 'S3cr3t!';
+        c.choices.remember = true;
+        c.plan = { target: 'ssh', host: 'rd.example.com', steps: [{ id: 'hbbs-key', title: 'x', argv: ['cat'] }] };
+        await c.start();
+        assert.equal(c.registered, true);
+        assert.equal(c.registeredServerId, 'rd-example-com-2222');
+        assert.equal(c.credentialSaved, true);
+        assert.deepEqual(calls.writeSshCredential, ['rd-example-com-2222'],
+            'the credential must be keyed under the exact id the record was registered under');
+    }));
 });

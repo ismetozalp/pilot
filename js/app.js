@@ -72,6 +72,11 @@
             // fails safe to an anonymous request either way; this is what lets
             // that be told apart from "no token was ever set" after the fact.
             tokenError: null,
+            // Task 34: set only when switchServer()'s own PilotServers.setActive()
+            // call rejects (e.g. /etc/pilot is not yet writable in this
+            // session) — never thrown, and never blocks the wireApi() retry
+            // that follows it. null on every ordinary, successful switch.
+            switchError: null,
 
             // GAP B (task 33): js/features/server-ops-ui.js's "Run setup" and
             // js/features/overview.js's "Set up TLS" both dispatch
@@ -190,12 +195,51 @@
                 // wireApi() -> notifyServerChanged() -> the shell listener ->
                 // switchServer() -> ... A request for the server that is
                 // ALREADY active is a no-op.
+                //
+                // Task 34: compares against activeServerId DIRECTLY — no
+                // `|| 'local'` fallback on THIS side any more. That fallback
+                // used to make "nothing is configured yet" and "local is
+                // genuinely active" look identical, so the FIRST real
+                // registration of a local server (this task's whole point)
+                // could never actually get wired: wireApi()'s very first,
+                // no-active-server dispatch already carries the fallback id
+                // 'local' (notifyServerChanged(null), just below), so
+                // switchServer('local') looked like a no-op from the moment
+                // the page loaded — before js/features/setup-ui.js's
+                // registerServer() ever got a chance to create a real
+                // /etc/pilot/servers/local.json for it to read. Proven by a
+                // real browser: tests/e2e/setup.e2e.mjs's own TASK 34
+                // scenario went red against the OLD guard (activeServerId/
+                // apiReady never flipped after a successful local install)
+                // and green against this one. No infinite-loop risk: the
+                // request this guard is FOR (wireApi() re-notifying the id it
+                // just wired) always finds `requested === this.activeServerId`
+                // true by then, because wireApi() sets activeServerId BEFORE
+                // calling notifyServerChanged() — see below.
                 const requested = (typeof id === 'string' && id.trim()) ? id.trim() : 'local';
-                const current = this.activeServerId || 'local';
-                if (requested === current) return this;
+                if (requested === this.activeServerId) return this;
                 const Servers = root.PilotServers;
                 if (Servers && typeof Servers.setActive === 'function') {
-                    await Servers.setActive(id);
+                    // A hostile/malformed id is still a hard, LOUD rejection
+                    // — validated eagerly (outside the try/catch below) so it
+                    // throws exactly like it always did, before this call
+                    // ever reaches the transport.
+                    if (typeof Servers.validateId === 'function') Servers.validateId(id);
+                    // Task 34: this call is no longer reached only from a
+                    // deliberate user action (the old guard made every
+                    // "nothing configured, id is local" case a no-op before
+                    // this line). A REAL live Cockpit session caught this
+                    // uncaught: PilotServers.setActive() rejects when
+                    // /etc/pilot is not yet writable (e.g. superuser access
+                    // has not been elevated in this session), and — with no
+                    // try/catch here — that rejection was an unhandled
+                    // exception on every ordinary page load with no active
+                    // server, not merely a failed switch. Recorded so the
+                    // shell can see it, but never blocks the wireApi() retry
+                    // below: a stale/absent config.json is exactly what
+                    // wireApi() already fails safe against on its own.
+                    try { await Servers.setActive(id); this.switchError = null; }
+                    catch (e) { this.switchError = e; }
                 }
                 return this.wireApi();
             },
