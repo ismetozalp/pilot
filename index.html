@@ -186,6 +186,11 @@
             <p class="mb-1" data-testid="tls-preflight" :data-kind="preflight ? preflight.kind : ''"
                x-show="preflight" x-text="preflight ? preflight.message : ''"></p>
             <p class="text-danger mb-0" data-testid="tls-error" x-text="errors.tls || ''"></p>
+            <!-- rebuildPlan() reports here too: arriving straight on this step
+                 from Overview's "Set up TLS" CTA, with no detection run yet, has
+                 to say so rather than look like a button that does nothing. -->
+            <p class="text-danger mb-0" data-testid="tls-plan-error" x-show="error"
+               x-text="error ? error.message : ''"></p>
           </div>
 
           <div x-show="isStep('ports')" data-testid="pane-ports">
@@ -213,6 +218,15 @@
             <button class="btn btn-sm btn-outline-secondary mb-2" data-testid="copy-transcript"
                     @click="copyTranscript()">Copy full transcript</button>
             <span data-testid="copied" x-show="copied">Copied.</span>
+            <!-- start() can refuse before it spawns anything at all — the §6.1
+                 DNS pre-flight is exactly that case — and this is the only pane
+                 the user is looking at when it happens. Without this the Start
+                 button would appear to do nothing. -->
+            <div class="alert alert-danger" data-testid="execute-error" x-show="error">
+              <span data-testid="execute-error-message" x-text="error ? error.message : ''"></span>
+              <span class="fw-semibold ms-1" data-testid="execute-remediation"
+                    x-text="error ? (error.remediation || '') : ''"></span>
+            </div>
             <div data-testid="transcript">
               <template x-for="s in exec.steps" :key="s.id">
                 <div class="border-bottom py-1" :data-step-id="s.id" :data-status="s.status">

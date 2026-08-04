@@ -1157,7 +1157,11 @@
             tlsOn() { return str(this.choices.tlsTier) !== 'none'; },
             detectedIp() { return str(this.detection && this.detection.public_ip); },
 
-            back() { this.step = prevStep(this); },
+            // Clears the per-step validation errors on the way out, exactly as
+            // next() does on the way in: index.html's target pane renders every
+            // entry in `errors`, so a TLS message left behind would reappear
+            // there as if the target were wrong.
+            back() { this.errors = {}; this.step = prevStep(this); },
 
             next() {
                 this.errors = {};

@@ -711,7 +711,10 @@ async function runBody(ctx) {
                 await page.click('[data-testid="next"]');
                 await page.click('[data-testid="next"]');
                 await page.click('[data-testid="run-start"]');
-                await waitForText(page, '[data-testid="detect-error"]', (t) => t.length > 0, 'run error');
+                assertOk(await visible(page, '[data-testid="execute-error"]'),
+                    `${label}: the refusal must be visible on the pane the user is looking at`);
+                assertMatch(await page.textContent('[data-testid="execute-error-message"]'),
+                    /rd\.example\.com/, `${label}: and it must name the host it checked`);
                 const spawned = (await page.evaluate(() => window.__pilotStub.calls))
                     .filter((c) => c.kind === 'spawn' && c.argv.indexOf('--run') >= 0);
                 assertEqual(spawned.length, 0,
