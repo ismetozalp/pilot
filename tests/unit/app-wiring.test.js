@@ -10,6 +10,10 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+
+const ROOT = path.resolve(__dirname, '..', '..');
 
 require('../../js/core/errors.js');
 require('../../js/core/api-client.js');   // sets globalThis.PilotApi / PilotApiClient
@@ -429,5 +433,24 @@ test('openWizard: a malformed or missing detail never throws', () => {
         c.tab = 'overview';
         assert.doesNotThrow(() => c.openWizard(bad));
         assert.equal(c.tab, 'setup');
+    }
+});
+
+// ============================================== FINAL REVIEW, FINDING 2 ======
+//
+// Every piece of state js/app.js writes must be rendered by index.html or not
+// exist. apiReady, compatError, switchError and tokenError were all write-only:
+// the shell recorded them and no template ever read one. This is the structural
+// guard against that class returning — a new property that nothing renders now
+// has to be added to this list deliberately, with a reason.
+test('every state slot js/app.js writes is actually rendered by index.html', () => {
+    const html = fs.readFileSync(path.join(ROOT, 'index.html'), 'utf8');
+    // Inside a real Alpine binding — not merely mentioned in a comment or a
+    // data-testid, which is how a "rendered" claim can be true of a string and
+    // false of the page.
+    for (const name of ['apiReady', 'compatError', 'switchError', 'tokenError', 'activeServerId']) {
+        const bound = new RegExp('(?:x-show|x-text)="[^"]*\\b' + name + '\\b');
+        assert.ok(bound.test(html),
+            `js/app.js writes ${name} but no x-show/x-text in index.html reads it — render it or delete it`);
     }
 });

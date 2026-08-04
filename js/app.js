@@ -62,6 +62,15 @@
             // nothing. activeServerId/apiReady let the shell show which server is
             // live; compatError carries a failed probeCompatibility() without
             // undoing a transport that was already wired successfully.
+            // All four of these are RENDERED by index.html's .pilot-status
+            // strip. They were write-only until the final review: a token file
+            // that existed but could not be read, a version probe that never
+            // answered and an active-server choice that could not be persisted
+            // were each recorded here and shown to nobody. They are deliberately
+            // NOT the "global something went wrong" banner spec §7.2 forbids —
+            // each is a fact about the shell's own control-plane wiring, which
+            // no per-surface alert reports (a surface only ever sees its own
+            // fetch failing, if it fails at all).
             activeServerId: null,
             apiReady: false,
             compatError: null,

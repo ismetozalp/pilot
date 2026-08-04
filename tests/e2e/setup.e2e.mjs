@@ -875,6 +875,53 @@ async function runBody(ctx) {
         }
     });
 
+    // ============================================== FINAL REVIEW, FINDING 2 ==
+    //
+    // THE DEFECT: registered / registrationError / registeredServerId were
+    // written by registerServer() and appeared in NO template. Six unit tests
+    // asserted the state, including one whose message reads "the activation
+    // failure must still be surfaced" -- it was surfaced to nobody. A rejected
+    // PilotServers.write() (missing/unwritable /etc/pilot, SELinux, a failed
+    // setActive()) showed a green successful handover while every console tab
+    // stayed empty with no explanation.
+    await check('FINDING 2: a failing PilotServers.write() produces a VISIBLE error and a retry, ' +
+        'not a green handover', async () => {
+        const stub = {
+            spawn: { 'pilot-exec --detect': DETECTION, 'pilot-exec --run': RUN_OK },
+            // cockpit-stub.js rejects read AND replace for a file scripted with
+            // {error:true} -- exactly what an unwritable /etc/pilot looks like.
+            files: { '/etc/pilot/servers/local.json': { error: true, message: 'permission denied' } }
+        };
+        await withPage(ctx, stub, async (page) => {
+            await page.selectOption('[data-testid="target"]', 'local');
+            await page.click('[data-testid="next"]');
+            await page.click('[data-testid="run-detect"]');
+            await wait(page, '[data-plan-step]');
+            await page.click('[data-testid="next"]');
+            await page.click('[data-testid="next"]');
+            await page.click('[data-testid="next"]');
+            await page.click('[data-testid="run-start"]');
+            await wait(page, '[data-step-id="reachability"][data-status="ok"]');
+            await page.click('[data-testid="next"]');
+
+            // The run itself really did succeed -- which is exactly what made
+            // the silent registration failure so misleading.
+            assertEqual(await page.getAttribute('[data-testid="handover-status"]', 'data-status'), 'ok');
+            assertOk(await visible(page, '[data-testid="registration-error"]'),
+                'a rejected write() must be shown, not swallowed behind a green tick');
+            assertMatch(await page.textContent('[data-testid="registration-error-message"]'),
+                /could not write \/etc\/pilot\/servers\/local\.json/i,
+                'and it must name the operation and path that actually failed');
+            assertOk((await page.textContent('[data-testid="registration-remediation"]')).trim().length > 0,
+                'with the PilotErrors remediation for its kind, not just a bare message');
+            assertOk(!(await visible(page, '[data-testid="registered"]')),
+                'it must NOT also claim the server was registered');
+            assertOk(await visible(page, '[data-testid="registration-retry"]'),
+                'and it must offer a way to try again');
+            await shot(page, 'setup-registration-failed');
+        });
+    });
+
     // The other half of FINDING 1: js/features/overview.js's web client could
     // only ever be disabled, because no shipped path could record a server with
     // TLS. This drives the whole loop in one page -- wizard TLS step, real run,

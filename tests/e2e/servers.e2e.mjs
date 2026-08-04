@@ -139,6 +139,41 @@ export default async function run(ctx) {
     } finally {
         await page.ctx.close();
     }
+
+    // ============================================== FINAL REVIEW, FINDING 2 ==
+    //
+    // tokenError was write-only in js/app.js: task 19's review mandated it
+    // specifically so "no token configured" (readSecret resolves null -- an
+    // ordinary anonymous session) could be told apart from "a token file
+    // exists but could not be read" (a 0600/SELinux problem that silently
+    // downgrades every request to anonymous). That distinction reached no user
+    // at all. Both halves are driven here on a real page.
+    for (const [label, tokenFile, expectVisible] of [
+        ['an unreadable token file is reported', { error: true, message: 'access denied' }, true],
+        ['no token file at all is NOT reported as an error', undefined, false]
+    ]) {
+        await check(`FINDING 2: ${label}`, async () => {
+            const files = Object.assign({}, STUB.files);
+            if (tokenFile === undefined) delete files['/etc/pilot/servers/prod.token'];
+            else files['/etc/pilot/servers/prod.token'] = tokenFile;
+            const p2 = await ctx.open(ctx.browser, Object.assign({}, STUB, { files }));
+            p2.setDefaultTimeout(WAIT);
+            await installHelpers(p2);
+            try {
+                await waitApiReady(p2);
+                const shown = await p2.isVisible('[data-testid="token-error"]');
+                assertEqual(shown, expectVisible,
+                    expectVisible
+                        ? 'an unreadable token file must be surfaced, not silently anonymous'
+                        : 'an ordinary anonymous session must not look like a failure');
+                if (expectVisible)
+                    assertOk((await p2.textContent('[data-testid="token-error"]')).includes('could not be read'),
+                        'and it must say which of the two situations this is');
+            } finally {
+                await p2.ctx.close();
+            }
+        });
+    }
 }
 
 if (isMain(import.meta.url)) process.exit(await runScenario(run, name) ? 1 : 0);
