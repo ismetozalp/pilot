@@ -1784,3 +1784,68 @@ test('index.html never renders the fingerprint box or Accept without a fingerpri
             'an enabled "This fingerprint is correct" invites confirming nothing');
     }
 });
+
+// ------------------------------- the wizard never walks past a missing plan
+
+test('next(): Detection & plan cannot be left without a plan', () => {
+    // Detection is what PRODUCES the plan, and every later step consumes it:
+    // ports lists what the plan needs opened, start() has nothing to run
+    // without it. Leaving here empty walked the user through two panes with
+    // nothing to show to an Execute pane whose Start could only ever fail.
+    const c = UI.pilotSetupUi();
+    c.choices.target = 'local';
+    assert.equal(c.next(), true, 'target -> detect');
+    assert.equal(c.step, 'detect');
+    assert.equal(c.plan, null, 'guard: nothing has detected yet');
+    assert.equal(c.next(), false, 'and it must refuse to continue');
+    assert.equal(c.step, 'detect', 'the wizard stays put');
+    assert.match(c.errors.detect, /detection first/i);
+    // With a plan it moves on -- the gate is the plan, not the step.
+    c.plan = { steps: [{ id: 'x', title: 'X', why: 'y' }] };
+    assert.equal(c.next(), true);
+    assert.notEqual(c.step, 'detect');
+});
+
+test('index.html renders the detect gate, or the refusal is invisible', () => {
+    const html = fs.readFileSync(path.join(ROOT, 'index.html'), 'utf8');
+    assert.match(html, /data-testid="detect-gate"[\s\S]{0,120}errors\.detect/,
+        'next() refusing with no visible reason is a Next button that does nothing');
+});
+
+// ------------------------------- the execute pane shows nothing before a run
+
+test('hasRun(): false until a run exists, true the instant Start is pressed', () => {
+    const c = UI.pilotSetupUi();
+    assert.equal(c.hasRun(), false, 'a fresh wizard has no run');
+    c.busy = true;
+    assert.equal(c.hasRun(), true, 'the bar must appear on Start, not on the first step landing');
+    c.busy = false;
+    assert.equal(c.hasRun(), false);
+    c.exec.steps.push({ id: 'a', title: 'A', status: 'ok', exit: 0, lines: [], open: false });
+    assert.equal(c.hasRun(), true);
+    // Hostile / half-built shapes must not throw -- this drives x-show.
+    for (const bad of [null, undefined, {}, { steps: null }, { steps: 'no' }, { steps: {} }]) {
+        c.exec = bad;
+        assert.equal(typeof c.hasRun(), 'boolean', JSON.stringify(bad));
+    }
+});
+
+test('index.html hides the bar, the copy button and the transcript until a run exists (§7.3)', () => {
+    const html = fs.readFileSync(path.join(ROOT, 'index.html'), 'utf8');
+    const pane = html.slice(html.indexOf('data-testid="pane-execute"'), html.indexOf('data-testid="pane-handover"'));
+    assert.ok(pane.length > 0);
+    // The progress bar's x-show sits on its wrapper (the .progress div), not on
+    // the .progress-bar itself, so walk out to the wrapper's own open tag.
+    const barAt = pane.indexOf('data-testid="progress-bar"');
+    assert.ok(barAt > 0);
+    const wrapAt = pane.lastIndexOf('<div class="progress ', barAt);
+    assert.ok(wrapAt > 0 && wrapAt < barAt, 'the bar must live inside a .progress wrapper');
+    assert.match(pane.slice(wrapAt, pane.indexOf('>', wrapAt) + 1), /x-show="hasRun\(\)"/,
+        'a 0% progress bar over no run is a dead control');
+    const copyAt = pane.indexOf('data-testid="copy-transcript"');
+    const copyEl = pane.slice(pane.lastIndexOf('<', copyAt), pane.indexOf('>', copyAt) + 1);
+    assert.match(copyEl, /x-show="hasRun\(\)"/, 'nothing to copy before a run');
+    // And in their place, a sentence saying what to do.
+    assert.match(pane, /data-testid="execute-idle"[\s\S]{0,80}x-show="!hasRun\(\)"/);
+    assert.match(pane, /Nothing has run yet/);
+});

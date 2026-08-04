@@ -878,6 +878,63 @@ async function runBody(ctx) {
         }
     });
 
+    // The Execute pane, before Start: the progress bar, "Copy full transcript"
+    // and the transcript region are all views OF A RUN. Reported from a real
+    // first run as "no transcript" -- what the user saw was a 0% bar, a button
+    // that copies nothing and an empty region, with no statement of what to do.
+    // The live tier cannot reach this pane on a host with no helper installed,
+    // so the assertion lives here, where detection really produces a plan.
+    await check('the Execute pane renders no control over an absent run (§7.3)', async () => {
+        await withPage(ctx, { spawn: { 'pilot-exec --detect': DETECTION, 'pilot-exec --run': RUN_OK } },
+            async (page) => {
+            await page.selectOption('[data-testid="target"]', 'local');
+            await page.click('[data-testid="next"]');
+            await page.click('[data-testid="run-detect"]');
+            await wait(page, '[data-plan-step]');
+            await page.click('[data-testid="next"]');
+            await page.click('[data-testid="next"]');
+            await page.click('[data-testid="next"]');
+            assertEqual(await page.getAttribute('[data-testid="pane-execute"]', 'data-testid'), 'pane-execute');
+
+            assertOk(!(await visible(page, '[data-testid="progress-bar"]')),
+                'a 0% progress bar over no run is a dead control');
+            assertOk(!(await visible(page, '[data-testid="copy-transcript"]')),
+                '"Copy full transcript" is offered with no transcript to copy');
+            assertOk(await visible(page, '[data-testid="execute-idle"]'),
+                'and in their place the pane must say what to do');
+            assertMatch(await page.textContent('[data-testid="execute-idle"]'), /Start/,
+                'the explanation must name the action that produces a transcript');
+            assertOk(await visible(page, '[data-testid="run-start"]'), 'Start must still be offered');
+
+            // The instant Start is pressed, the bar appears -- it must not wait
+            // for the first step to land, or the click looks like it did nothing.
+            await page.click('[data-testid="run-start"]');
+            // Wait for the run to actually produce a step -- polling the bar's
+            // mere presence races the spawn, since the element exists (hidden)
+            // the whole time.
+            await wait(page, '[data-step-id]');
+            assertOk(!(await visible(page, '[data-testid="execute-idle"]')),
+                'the idle explanation must go away once a run exists');
+            await shot(page, 'setup-execute-idle');
+        });
+    });
+
+    // Detection is what PRODUCES the plan; leaving that step without one walked
+    // the user through Ports (nothing to list) to an Execute pane whose Start
+    // could only ever fail.
+    await check('Detection & plan cannot be clicked past, and the refusal is visible', async () => {
+        await withPage(ctx, {}, async (page) => {
+            await page.selectOption('[data-testid="target"]', 'local');
+            await page.click('[data-testid="next"]');
+            for (let i = 0; i < 3; i++) await page.click('[data-testid="next"]');
+            assertOk(await visible(page, '[data-testid="pane-detect"]'),
+                'the wizard walked past Detection with no plan');
+            assertOk(!(await visible(page, '[data-testid="pane-execute"]')));
+            assertMatch(await page.textContent('[data-testid="detect-gate"]'), /detection first/i,
+                'a Next that silently does nothing is the same defect in a different hat');
+        });
+    });
+
     // ============================================== FINAL REVIEW, FINDING 2 ==
     //
     // THE DEFECT: registered / registrationError / registeredServerId were

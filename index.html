@@ -148,6 +148,9 @@
               <div x-show="manual"><pre data-testid="manual-script" x-text="manualScript()"></pre></div>
             </div>
             <p class="text-danger mb-0" data-testid="detect-error" x-text="error ? error.message : ''"></p>
+            <!-- next() refuses to leave this step without a plan; without this
+                 binding that refusal was invisible and Next just did nothing. -->
+            <p class="text-danger mb-0" data-testid="detect-gate" x-text="errors.detect || ''"></p>
           </div>
 
           <!-- TLS & domain (spec §6.1). The tier vocabulary, the validation and
@@ -218,12 +221,19 @@
 
           <div x-show="isStep('execute')" data-testid="pane-execute">
             <button class="btn btn-primary mb-2" data-testid="run-start" @click="start()" :disabled="busy">Start</button>
-            <div class="progress mb-2" role="progressbar">
+            <!-- §7.3: the bar, the copy button and the transcript below are all
+                 views OF A RUN. Before Start there is no run, and rendering them
+                 anyway gave a 0% bar, a button that copies nothing and an empty
+                 region -- three dead controls and no statement of what to do. -->
+            <p class="text-secondary" data-testid="execute-idle" x-show="!hasRun()">
+              Nothing has run yet. Click Start to run the plan on this target — every command and
+              its output appears here as it happens.</p>
+            <div class="progress mb-2" role="progressbar" x-show="hasRun()">
               <div class="progress-bar" data-testid="progress-bar" :style="'width: ' + progress().percent + '%'"
                    x-text="progress().done + ' / ' + progress().total"></div>
             </div>
             <button class="btn btn-sm btn-outline-secondary mb-2" data-testid="copy-transcript"
-                    @click="copyTranscript()">Copy full transcript</button>
+                    x-show="hasRun()" @click="copyTranscript()">Copy full transcript</button>
             <span data-testid="copied" x-show="copied">Copied.</span>
             <!-- start() can refuse before it spawns anything at all — the §6.1
                  DNS pre-flight is exactly that case — and this is the only pane

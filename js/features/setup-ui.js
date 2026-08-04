@@ -1204,6 +1204,17 @@
             // shell's tab switch in js/app.js's openWizard() — this is the
             // half of GAP B's fix that only this component can do).
             onOpenWizard(detail) { this.step = applyWizardStep(this, detail); return this.step; },
+            // §7.3: the execute pane's progress bar, "Copy full transcript" and
+            // transcript region are all views OF A RUN. Before Start there is no
+            // run, so they rendered as a 0% bar, a button that copies nothing
+            // and an empty region -- three dead controls and no statement of
+            // what to do. busy counts as "has run": the bar must appear the
+            // instant Start is pressed, not only once the first step lands.
+            hasRun() {
+                if (this.busy) return true;
+                const e = this.exec;
+                return !!(e && Array.isArray(e.steps) && e.steps.length > 0);
+            },
             progress() { return progress(this.exec); },
             transcript() { return transcriptText(this.exec); },
             hostPorts() { return portRows(this.required, this.firewall).host; },
@@ -1240,6 +1251,15 @@
                 }
                 if (this.step === 'hostkey' && !(this.hostkey && this.hostkey.confirmed === true)) {
                     this.errors = { hostkey: 'Confirm the host key fingerprint before continuing.' };
+                    return false;
+                }
+                // Detection is what PRODUCES the plan, and every step after this
+                // one consumes it: ports lists what the plan needs opened, and
+                // start() has nothing to run without it. Leaving here without a
+                // plan walked the user to an Execute pane whose Start button
+                // could only ever fail, past two steps that had nothing to show.
+                if (this.step === 'detect' && !this.plan) {
+                    this.errors = { detect: 'Run detection first — Pilot needs a plan before it can continue.' };
                     return false;
                 }
                 if (this.step === 'tls') {
