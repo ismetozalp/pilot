@@ -19,6 +19,7 @@
                 <li class="nav-item">
                     <button class="nav-link py-1 px-3"
                             :class="{ active: tab === t.id }"
+                            :data-tab="t.id"
                             @click="tab = t.id"
                             x-text="t.label"></button>
                 </li>
@@ -30,7 +31,130 @@
         <!-- One mount per surface. Each surface reports its own failure into
              errors[<tab>]; there is deliberately no global error banner (spec §7.2). -->
         <div x-show="tab === 'overview'"    id="pilot-overview"></div>
-        <div x-show="tab === 'setup'"       id="pilot-setup"></div>
+        <div x-show="tab === 'setup'" id="pilot-setup" x-data="pilotSetupUi()">
+          <ol class="nav nav-pills mb-3" data-testid="setup-steps">
+            <template x-for="id in steps()" :key="id">
+              <li class="nav-item"><span class="nav-link" :class="{ active: isStep(id) }"
+                  :data-step="id" x-text="stepTitle(id)"></span></li>
+            </template>
+          </ol>
+
+          <div x-show="isStep('target')" data-testid="pane-target">
+            <label class="form-label">Where should Pilot install?</label>
+            <select class="form-select mb-2" data-testid="target" x-model="choices.target">
+              <option value="local">This machine (localhost)</option>
+              <option value="ssh">A remote host over SSH</option>
+            </select>
+            <div x-show="choices.target === 'ssh'">
+              <input class="form-control mb-1" data-testid="host" placeholder="host" x-model="choices.host">
+              <input class="form-control mb-1" data-testid="port" type="number" x-model.number="choices.port">
+              <input class="form-control mb-1" data-testid="user" placeholder="user" x-model="choices.user">
+              <select class="form-select mb-1" data-testid="auth" x-model="choices.auth">
+                <option value="agent">SSH agent / existing key</option>
+                <option value="password">Password</option>
+                <option value="pem">PEM private key</option>
+              </select>
+              <input class="form-control mb-1" data-testid="password" type="password" x-model="choices.password"
+                     x-show="choices.auth === 'password'">
+              <textarea class="form-control mb-1" data-testid="pem" x-model="choices.pem"
+                        x-show="choices.auth === 'pem'"></textarea>
+              <div class="form-check"><input class="form-check-input" type="checkbox" id="pl-remember"
+                   data-testid="remember" x-model="choices.remember">
+                <label class="form-check-label" for="pl-remember">Remember for day-2 operations</label></div>
+            </div>
+            <template x-for="(msg, field) in errors" :key="field">
+              <p class="text-danger mb-0" data-testid="target-error" x-text="msg"></p>
+            </template>
+          </div>
+
+          <div x-show="isStep('hostkey')" data-testid="pane-hostkey">
+            <p>Confirm this host key fingerprint before Pilot connects.</p>
+            <pre class="border p-2" data-testid="fingerprint" x-text="hostkey ? hostkey.fingerprint : ''"></pre>
+            <button class="btn btn-primary" data-testid="accept-hostkey" @click="acceptHostKey()">
+              This fingerprint is correct</button>
+            <p class="text-danger mb-0" data-testid="hostkey-error" x-text="errors.hostkey || ''"></p>
+            <!-- C6 hard stop: a CHANGED host key is never auto-accepted, and is
+                 surfaced here explicitly rather than folded into the generic
+                 next()-validation message above. -->
+            <p class="text-danger fw-bold" data-testid="hostkey-hardstop"
+               x-show="error && error.kind === 'SSH_HOSTKEY_CHANGED'" x-text="error ? error.message : ''"></p>
+          </div>
+
+          <div x-show="isStep('detect')" data-testid="pane-detect">
+            <button class="btn btn-secondary mb-2" data-testid="run-detect" @click="detect()">Detect</button>
+            <div x-show="!!plan">
+              <table class="table"><tbody>
+                <template x-for="s in (plan ? plan.steps : [])" :key="s.id">
+                  <tr :data-plan-step="s.id"><td x-text="s.title"></td><td x-text="s.why"></td></tr>
+                </template>
+              </tbody></table>
+              <button class="btn btn-link" data-testid="manual-toggle" @click="manual = !manual">Manual mode</button>
+              <div x-show="manual"><pre data-testid="manual-script" x-text="manualScript()"></pre></div>
+            </div>
+            <p class="text-danger mb-0" data-testid="detect-error" x-text="error ? error.message : ''"></p>
+          </div>
+
+          <div x-show="isStep('ports')" data-testid="pane-ports">
+            <h5>Pilot will open these on the host firewall</h5>
+            <ul data-testid="host-ports"><template x-for="p in hostPorts()" :key="p.port + p.proto">
+              <li x-text="p.port + '/' + p.proto + ' — ' + p.component"></li></template></ul>
+            <p x-show="!hostPorts().length" data-testid="no-host-fw">
+              No supported host firewall was detected — open these yourself.</p>
+            <h5>You must open these on your cloud or edge firewall</h5>
+            <ul data-testid="cloud-ports"><template x-for="p in cloudPorts()" :key="p.port + p.proto">
+              <li x-text="p.port + '/' + p.proto + ' — ' + p.component"></li></template></ul>
+            <input class="form-control mb-1" data-testid="sg-id" placeholder="sg-…" x-model="aws.groupId">
+            <input class="form-control mb-1" data-testid="sg-region" placeholder="eu-west-1" x-model="aws.region">
+            <pre class="border p-2" data-testid="aws-command" x-text="awsLine()"></pre>
+            <p x-show="portsUnavailable()" data-testid="ports-unavailable">
+              Pilot could not work out the required port list. This is not a statement that no ports are needed.</p>
+          </div>
+
+          <div x-show="isStep('execute')" data-testid="pane-execute">
+            <button class="btn btn-primary mb-2" data-testid="run-start" @click="start()" :disabled="busy">Start</button>
+            <div class="progress mb-2" role="progressbar">
+              <div class="progress-bar" data-testid="progress-bar" :style="'width: ' + progress().percent + '%'"
+                   x-text="progress().done + ' / ' + progress().total"></div>
+            </div>
+            <button class="btn btn-sm btn-outline-secondary mb-2" data-testid="copy-transcript"
+                    @click="copyTranscript()">Copy full transcript</button>
+            <span data-testid="copied" x-show="copied">Copied.</span>
+            <div data-testid="transcript">
+              <template x-for="s in exec.steps" :key="s.id">
+                <div class="border-bottom py-1" :data-step-id="s.id" :data-status="s.status">
+                  <button class="btn btn-link p-0" :data-toggle-step="s.id" @click="toggleStep(s)"
+                          x-text="s.title + ' — ' + s.status + ' (exit ' + (s.exit === null ? 'n/a' : s.exit) + ')'"></button>
+                  <div x-show="s.open">
+                    <pre class="mb-0" :data-cmd="s.id" x-text="'$ ' + s.cmd"></pre>
+                    <template x-for="(l, i) in s.lines" :key="i">
+                      <pre class="mb-0" :data-stream="l.stream" x-text="l.text"></pre>
+                    </template>
+                  </div>
+                </div>
+              </template>
+            </div>
+          </div>
+
+          <div x-show="isStep('handover')" data-testid="pane-handover">
+            <p data-testid="handover-status" :data-status="handoverResult ? handoverResult.status : 'none'"
+               x-text="handoverResult ? handoverResult.message : ''"></p>
+            <ul data-testid="blocked-ports">
+              <template x-for="b in (handoverResult ? handoverResult.blocked : [])" :key="b.port + b.proto">
+                <li x-text="b.port + '/' + b.proto + ' (' + b.scope + ')'"></li></template>
+            </ul>
+            <input class="form-control mb-1" data-testid="new-password" type="password" x-model="pw.password">
+            <input class="form-control mb-1" data-testid="confirm-password" type="password" x-model="pw.confirm">
+            <button class="btn btn-primary" data-testid="finish" @click="finish()">Change password and finish</button>
+            <p class="text-danger mb-0" data-testid="pw-error"
+               x-text="(pwErrors.password || '') + ' ' + (pwErrors.confirm || '')"></p>
+            <p data-testid="finished" x-show="finished">Setup finished.</p>
+          </div>
+
+          <div class="mt-3">
+            <button class="btn btn-outline-secondary" data-testid="back" @click="back()">Back</button>
+            <button class="btn btn-outline-primary" data-testid="next" @click="next()">Next</button>
+          </div>
+        </div>
         <div x-show="tab === 'devices'"     id="pilot-devices"></div>
         <div x-show="tab === 'addressbook'" id="pilot-addressbook"></div>
         <div x-show="tab === 'users'"       id="pilot-users"></div>

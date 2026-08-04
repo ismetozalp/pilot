@@ -517,14 +517,430 @@
         return str(Plan.manualScript(plan));
     }
 
+    // =============================================================
+    // cockpit I/O — everything below this line touches the bridge.
+    // Every access is guarded so the module still loads under node.
+    // =============================================================
+
+    const Errors = underNode ? require('../core/errors.js') : root.PilotErrors;
+    const EXEC = '/usr/libexec/pilot/pilot-exec';
+
+    function two(n) { return (n < 10 ? '0' : '') + n; }
+
+    function runIdFor(date) {
+        let d = (date instanceof Date) ? date : new Date();
+        if (isNaN(d.getTime())) d = new Date(0);
+        return String(d.getUTCFullYear()) + two(d.getUTCMonth() + 1) + two(d.getUTCDate()) +
+            'T' + two(d.getUTCHours()) + two(d.getUTCMinutes()) + two(d.getUTCSeconds()) + 'Z';
+    }
+
+    // A stream chunk can end mid-line, and half a JSON document parses as noise.
+    function splitStream(buffer) {
+        const parts = str(buffer).split('\n');
+        const rest = parts.pop();
+        return { lines: parts, rest: rest === undefined ? '' : rest };
+    }
+
+    // C2/C3: the ssh block and the credentials both travel in the stdin document.
+    function sshBlock(state) {
+        const c = (state && state.choices) || {};
+        if (str(c.target) !== 'ssh') return null;
+        const hk = state && state.hostkey;
+        const confirmed = !!(hk && hk.confirmed === true && str(hk.fingerprint) !== '');
+        return {
+            host: str(c.host),
+            port: (typeof c.port === 'number' && isFinite(c.port)) ? Math.floor(c.port) : 22,
+            user: str(c.user),
+            auth: AUTHS.indexOf(str(c.auth)) >= 0 ? str(c.auth) : 'agent',
+            accept_fingerprint: confirmed ? str(hk.fingerprint) : null
+        };
+    }
+
+    function credentialsBlock(state) {
+        const c = (state && state.choices) || {};
+        if (str(c.target) !== 'ssh') return null;
+        const auth = str(c.auth);
+        if (auth === 'password' && str(c.password) !== '')
+            return { password: str(c.password), pem: null };
+        if (auth === 'pem' && str(c.pem) !== '')
+            return { password: null, pem: str(c.pem) };
+        return null;
+    }
+
+    function detectRequest(state) {
+        const remote = !!(state && state.choices && str(state.choices.target) === 'ssh');
+        return {
+            version: 1,
+            transport: remote ? 'ssh' : 'local',
+            ssh: sshBlock(state),
+            credentials: credentialsBlock(state)
+        };
+    }
+
+    function envelopeCtx(state, runId) {
+        const remote = !!(state && state.choices && str(state.choices.target) === 'ssh');
+        return {
+            run_id: str(runId),
+            transport: remote ? 'ssh' : 'local',
+            ssh: sshBlock(state),
+            credentials: credentialsBlock(state)
+        };
+    }
+
+    // Feature-detected, never assumed: if core/ports.js is not loaded the step
+    // says it cannot list the ports rather than rendering an empty table that
+    // reads as "no ports needed".
+    function requiredPorts(choices) {
+        const P = root ? root.PilotPorts : null;
+        if (!P || typeof P.required !== 'function') return [];
+        try {
+            const r = P.required(choices);
+            return Array.isArray(r) ? r : [];
+        } catch (e) { return []; }
+    }
+
+    // PilotProvisionPlan.build()/PilotPorts.required() need an install/firewall/TLS
+    // policy shape (installHbbs, openFirewall, tlsTier, apiPort, sshPort) that the
+    // wizard's six steps (target, hostkey, detect, ports, execute, handover) never
+    // collect from the user — there is no "policy" step in the spec. Rather than
+    // invent one, or grow blankState()'s choices (owned by the pure half above this
+    // divider), this adapter fills safe, fixed defaults at the one call site that
+    // needs them: attempt an install when nothing is adopted, open the host
+    // firewall, and no TLS (the wizard collects no domain/DuckDNS input to make TLS
+    // safe to turn on by default). This is additive only — it never changes what
+    // blankState(), Plan.build() or Ports.required() themselves accept.
+    function planChoicesFor(choices) {
+        const c = (choices && typeof choices === 'object') ? choices : {};
+        const P = root ? root.PilotPorts : null;
+        const target = str(c.target) === 'ssh' ? 'ssh' : 'local';
+        return {
+            target: target,
+            host: (target === 'ssh' && str(c.host) !== '') ? str(c.host) : null,
+            installHbbs: true,
+            openFirewall: true,
+            tlsTier: 'none',
+            domain: null,
+            duckdns: null,
+            apiPort: (P && typeof P.API_DEFAULT === 'number') ? P.API_DEFAULT : 21114,
+            sshPort: (P && typeof P.SSH_DEFAULT === 'number') ? P.SSH_DEFAULT : 22
+        };
+    }
+
+    // The reachability step reports per-port results as ordinary transcript
+    // output. Only an explicit blocked/unreachable/closed verdict counts —
+    // silence is never read as success.
+    const REACH_RE = /\b([0-9]{1,5})\/(tcp|udp)\b[^\n]*?\b(blocked|unreachable|closed)\b/i;
+
+    function reachFrom(exec) {
+        const e = (exec && typeof exec === 'object') ? exec : blankExec();
+        const steps = Array.isArray(e.steps) ? e.steps : [];
+        const out = [];
+        const seen = {};
+        for (let i = 0; i < steps.length; i++) {
+            if (steps[i].id !== 'reachability') continue;
+            const lines = Array.isArray(steps[i].lines) ? steps[i].lines : [];
+            for (let j = 0; j < lines.length; j++) {
+                const m = REACH_RE.exec(lines[j].text);
+                if (!m) continue;
+                const port = parseInt(m[1], 10);
+                if (!isFinite(port) || port < 1 || port > 65535) continue;
+                const proto = m[2].toLowerCase();
+                const key = proto + ':' + port;
+                if (Object.prototype.hasOwnProperty.call(seen, key)) continue;
+                seen[key] = true;
+                out.push({ port: port, proto: proto, reachable: false, scope: 'cloud' });
+            }
+        }
+        return out;
+    }
+
+    function hasSpawn() {
+        return typeof cockpit !== 'undefined' && cockpit && typeof cockpit.spawn === 'function';
+    }
+
+    function describe(err) {
+        if (err && typeof err === 'object' && typeof err.kind === 'string') {
+            return {
+                kind: err.kind,
+                message: str(err.message),
+                remediation: (Errors && typeof Errors.remediation === 'function')
+                    ? Errors.remediation(err.kind) : null
+            };
+        }
+        const e = (Errors && typeof Errors.create === 'function')
+            ? Errors.create('GENERIC', str(err && err.message) || str(err) || 'Unknown failure', null)
+            : { kind: 'GENERIC', message: str(err && err.message) || str(err) };
+        return {
+            kind: e.kind,
+            message: str(e.message),
+            remediation: (Errors && typeof Errors.remediation === 'function')
+                ? Errors.remediation(e.kind) : null
+        };
+    }
+
+    function fail(kind, message) {
+        return (Errors && typeof Errors.create === 'function')
+            ? Errors.create(kind, message, null)
+            : Object.assign(new Error(message), { kind: kind });
+    }
+
+    function pilotSetupUi() {
+        return Object.assign(blankState(), {
+            busy: false,
+            error: null,
+            copied: false,
+            transcriptSaved: false,
+            runId: null,
+            handoverResult: null,
+            generatedPassword: '',
+            pw: { password: '', confirm: '' },
+            pwErrors: {},
+            finished: false,
+            // Wired by app.js: (password) => Promise. Deliberately null by
+            // default and deliberately fails closed — a wizard that pretends it
+            // changed the admin password is worse than one that says it cannot.
+            passwordWriter: null,
+
+            steps() { return visibleSteps(this); },
+            stepTitle(id) {
+                return Object.prototype.hasOwnProperty.call(STEP_TITLES, str(id))
+                    ? STEP_TITLES[str(id)] : str(id);
+            },
+            isStep(id) { return this.step === id; },
+            progress() { return progress(this.exec); },
+            transcript() { return transcriptText(this.exec); },
+            hostPorts() { return portRows(this.required, this.firewall).host; },
+            cloudPorts() { return portRows(this.required, this.firewall).cloud; },
+            portsUnavailable() { return !Array.isArray(this.required) || this.required.length === 0; },
+            awsLine() { return awsCommand(this.cloudPorts(), this.aws); },
+            manualScript() { return manualFor(this.plan); },
+            toggleStep(s) { s.open = !s.open; },
+
+            back() { this.step = prevStep(this); },
+
+            next() {
+                this.errors = {};
+                if (this.step === 'target') {
+                    const r = validateTarget(this.choices);
+                    this.errors = r.errors;
+                    if (!r.ok) return false;
+                }
+                if (this.step === 'hostkey' && !(this.hostkey && this.hostkey.confirmed === true)) {
+                    this.errors = { hostkey: 'Confirm the host key fingerprint before continuing.' };
+                    return false;
+                }
+                this.step = nextStep(this);
+                return true;
+            },
+
+            acceptHostKey() {
+                if (!this.hostkey) return false;
+                // A changed key is a hard stop (C6) — never a confirm dialog.
+                if (this.hostkey.changed === true) {
+                    this.error = describe(fail('SSH_HOSTKEY_CHANGED',
+                        'The host key for this server has changed. Pilot will not continue.'));
+                    return false;
+                }
+                this.hostkey.confirmed = true;
+                return true;
+            },
+
+            async checkHostKey() {
+                if (this.busy) return false;
+                this.busy = true;
+                this.error = null;
+                try {
+                    if (!hasSpawn()) throw fail('GENERIC', 'This page cannot reach the system helper.');
+                    const p = cockpit.spawn([EXEC, '--check-hostkey'],
+                        { superuser: 'require', err: 'message' });
+                    if (typeof p.input === 'function')
+                        p.input(JSON.stringify({ host: str(this.choices.host), port: this.choices.port }));
+                    const out = await p;
+                    const parsed = JSON.parse(str(out));
+                    this.hostkey = {
+                        fingerprint: clean(parsed.fingerprint),
+                        known: parsed.known === true,
+                        changed: parsed.changed === true,
+                        confirmed: false
+                    };
+                    return true;
+                } catch (e) {
+                    this.error = describe(e);
+                    return false;
+                } finally {
+                    this.busy = false;
+                }
+            },
+
+            async detect() {
+                if (this.busy) return false;
+                this.busy = true;
+                this.error = null;
+                try {
+                    if (!hasSpawn()) throw fail('GENERIC', 'This page cannot reach the system helper.');
+                    const p = cockpit.spawn([EXEC, '--detect'], { superuser: 'require', err: 'message' });
+                    if (typeof p.input === 'function') p.input(JSON.stringify(detectRequest(this)));
+                    const det = JSON.parse(str(await p));
+                    if (!det || typeof det !== 'object')
+                        throw fail('GENERIC', 'The helper returned no detection result.');
+                    this.detection = det;
+                    this.firewall = str(det.firewall) || 'none';
+                    this.plan = Plan.build(det, planChoicesFor(this.choices));
+                    this.required = requiredPorts(planChoicesFor(this.choices));
+                    return true;
+                } catch (e) {
+                    this.detection = null;
+                    this.plan = null;
+                    this.error = describe(e);
+                    return false;
+                } finally {
+                    this.busy = false;
+                }
+            },
+
+            ingest(line, raw) {
+                const text = str(line);
+                if (text.trim() === '') return;
+                raw.push(text);
+                const ev = parseLine(text);
+                this.exec = ev
+                    ? reduce(this.exec, ev)
+                    : reduce(this.exec, { t: 'output', id: '', stream: 'stderr', line: text });
+            },
+
+            async start() {
+                if (this.busy) return false;
+                if (!this.plan || typeof this.plan !== 'object') {
+                    this.error = describe(fail('GENERIC',
+                        'There is no provisioning plan to run. Run detection first.'));
+                    return false;
+                }
+                this.busy = true;
+                this.error = null;
+                this.copied = false;
+                this.transcriptSaved = false;
+                this.exec = blankExec();
+                this.runId = runIdFor(new Date());
+
+                let envelope = null;
+                try {
+                    envelope = Plan.toEnvelope(this.plan, envelopeCtx(this, this.runId));
+                    if (!envelope || envelope.version !== 1)
+                        throw fail('GENERIC', 'The provisioning plan could not be encoded.');
+                } catch (e) {
+                    this.busy = false;
+                    this.error = describe(e);
+                    return false;
+                }
+
+                const raw = [];
+                let carry = '';
+                let streamed = false;
+                try {
+                    if (!hasSpawn()) throw fail('GENERIC', 'This page cannot reach the system helper.');
+                    const p = cockpit.spawn([EXEC, '--run'], { superuser: 'require', err: 'message' });
+                    // Credentials travel here and nowhere else: argv is world-readable.
+                    if (typeof p.input === 'function') p.input(JSON.stringify(envelope));
+                    if (typeof p.stream === 'function') p.stream((chunk) => {
+                        streamed = true;
+                        const split = splitStream(carry + str(chunk));
+                        carry = split.rest;
+                        for (let i = 0; i < split.lines.length; i++) this.ingest(split.lines[i], raw);
+                    });
+                    const out = await p;
+                    // A bridge (or stub) with no working stream still has to produce
+                    // the same transcript, so fall back to the resolved output.
+                    if (!streamed) {
+                        const split = splitStream(carry + str(out));
+                        carry = split.rest;
+                        for (let i = 0; i < split.lines.length; i++) this.ingest(split.lines[i], raw);
+                    }
+                    if (carry.trim() !== '') this.ingest(carry, raw);
+                } catch (e) {
+                    if (carry.trim() !== '') this.ingest(carry, raw);
+                    if (this.exec.status === 'running' || this.exec.status === 'idle')
+                        this.exec = reduce(this.exec,
+                            { t: 'run-end', status: 'failed', kind: describe(e).kind });
+                    this.error = describe(e);
+                }
+
+                await this.persist(this.runId, raw);
+                this.reach = reachFrom(this.exec);
+                this.handoverResult = handover(this.exec, this.reach);
+                this.busy = false;
+                return this.handoverResult.status === 'ok';
+            },
+
+            // Persisted so a failed setup can be diagnosed after the page is gone.
+            // The raw lines are written verbatim — pilot-exec already redacted them.
+            async persist(id, raw) {
+                const path = runPath(id);
+                if (!path) return false;
+                if (typeof cockpit === 'undefined' || !cockpit || typeof cockpit.file !== 'function')
+                    return false;
+                const f = cockpit.file(path, { superuser: 'require' });
+                try {
+                    await f.replace(raw.join('\n') + '\n');
+                    this.transcriptSaved = true;
+                    return true;
+                } catch (e) {
+                    this.transcriptSaved = false;
+                    return false;
+                } finally {
+                    if (f && typeof f.close === 'function') f.close();
+                }
+            },
+
+            async copyTranscript() {
+                this.copied = false;
+                const text = transcriptText(this.exec);
+                try {
+                    if (root.navigator && root.navigator.clipboard &&
+                        typeof root.navigator.clipboard.writeText === 'function') {
+                        await root.navigator.clipboard.writeText(text);
+                        this.copied = true;
+                        return true;
+                    }
+                } catch (e) { /* the transcript is on screen to select by hand */ }
+                return false;
+            },
+
+            async finish() {
+                const gate = passwordGate(this.pw, this.generatedPassword);
+                this.pwErrors = gate.errors;
+                if (!gate.ok) return false;
+                if (typeof this.passwordWriter !== 'function') {
+                    this.error = describe(fail('API_UNREACHABLE',
+                        'Pilot could not change the administrator password — nothing is wired to write it.'));
+                    return false;
+                }
+                this.busy = true;
+                try {
+                    await this.passwordWriter(str(this.pw.password));
+                    this.pw = { password: '', confirm: '' };
+                    this.finished = true;
+                    return true;
+                } catch (e) {
+                    this.error = describe(e);
+                    return false;
+                } finally {
+                    this.busy = false;
+                }
+            }
+        });
+    }
+
     const PilotSetupUi = {
         STEP_IDS, STEP_TITLES, MAX_LINES, MAX_LINE_CHARS, MAX_NOISE,
         blankExec, blankState, visibleSteps, nextStep, prevStep,
         validateTarget, portRows, awsCommand,
         parseLine, reduce, progress, transcriptText, runPath,
-        handover, passwordGate, manualFor
+        handover, passwordGate, manualFor,
+        runIdFor, splitStream, detectRequest, envelopeCtx, requiredPorts, reachFrom,
+        pilotSetupUi
     };
 
+    root.pilotSetupUi = pilotSetupUi;
     root.PilotSetupUi = PilotSetupUi;
     if (typeof module !== 'undefined' && module.exports) module.exports = PilotSetupUi;
 })(typeof window !== 'undefined' ? window : globalThis);
