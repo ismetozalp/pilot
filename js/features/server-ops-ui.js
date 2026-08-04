@@ -35,6 +35,7 @@
     const Errors = need('PilotErrors', '../core/errors.js');
     const View = need('PilotConsoleView', '../core/console-view.js');
     const SetupUi = need('PilotSetupUi', './setup-ui.js');
+    const EmptyState = need('PilotEmptyState', '../core/emptystate.js');
 
     const MOUNT_ID = 'pilot-server-ops';
     const SERVER_CHANGED_EVENT = 'pilot:server-changed';
@@ -427,6 +428,19 @@
 
     function servers() { return root.PilotServers || null; }
 
+    // Task 32's js/core/emptystate.js is the single source of truth for this
+    // copy; this call site was built (Task 30) before that module existed, so
+    // it hardcoded the identical text behind this fallback. The fallback stays
+    // — never a hard dependency — so this file still works standing alone
+    // (e.g. under a stripped-down test load that never requires emptystate.js).
+    function serverEmptyState() {
+        if (EmptyState && typeof EmptyState.forKind === 'function') {
+            const k = EmptyState.forKind('server');
+            if (k) return k;
+        }
+        return { message: 'No RustDesk server configured yet.', ctaLabel: 'Run setup', tab: 'setup' };
+    }
+
     // Same unwrap setup-ui.js's describe()/unwrapFatal() perform on pilot-exec's
     // uncaught {"t":"fatal",...} stderr envelope — duplicated narrowly (rather
     // than reached into setup-ui's private scope) since it is not exported there.
@@ -505,6 +519,8 @@
     function serverOpsUi() {
         return Object.assign(blankState(), {
             OPS: OPS,
+
+            emptyState: function () { return serverEmptyState(); },
 
             init: function (doc) {
                 const target = doc || root.document || null;
@@ -716,9 +732,9 @@
         '  <h5 class="mb-3">Server Ops</h5>',
         '  <template x-if="!server">',
         '    <div data-testid="server-ops-empty">',
-        '      <p class="mb-2">No RustDesk server configured yet.</p>',
+        '      <p class="mb-2" x-text="emptyState().message"></p>',
         '      <button type="button" class="btn btn-sm btn-primary" data-testid="server-ops-empty-action"',
-        '              @click="$dispatch(\'pilot:open-wizard\', {})">Run setup</button>',
+        '              @click="$dispatch(\'pilot:open-wizard\', {})" x-text="emptyState().ctaLabel"></button>',
         '    </div>',
         '  </template>',
         '  <template x-if="server">',
@@ -818,7 +834,7 @@
         isOpAllowed: isOpAllowed, opArgv: opArgv, hbbsDataDirFor: hbbsDataDirFor,
         parseUnitState: parseUnitState, unitStatesFrom: unitStatesFrom, STATUS_UNITS: STATUS_UNITS,
         parseRelayLog: parseRelayLog, summarise: summarise,
-        blankState: blankState, serverOpsUi: serverOpsUi,
+        blankState: blankState, serverOpsUi: serverOpsUi, serverEmptyState: serverEmptyState,
         TEMPLATE: TEMPLATE, mount: mount
     };
     root.PilotServerOpsUi = PilotServerOpsUi;

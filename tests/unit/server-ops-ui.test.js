@@ -30,6 +30,46 @@ test('module loads with no DOM and no cockpit global', () => {
     assert.equal(globalThis.PilotServerOpsUi, S);
 });
 
+// ------------------------------------------------------------ Task 32 wiring
+//
+// server-ops-empty (template lines ~717-722) was inline copy standing in for
+// PilotEmptyState.forKind('server') before js/core/emptystate.js existed
+// (Task 30's report flagged this explicitly). Now that it exists, this proves
+// the call site actually sources its copy from the shared module rather than
+// two independent hardcoded strings silently drifting apart over time.
+
+test('serverEmptyState() matches PilotEmptyState.forKind(\'server\') exactly', () => {
+    const ES = require('../../js/core/emptystate.js');
+    assert.deepEqual(S.serverEmptyState(), ES.forKind('server'));
+    assert.deepEqual(S.serverEmptyState(),
+        { message: 'No RustDesk server configured yet.', ctaLabel: 'Run setup', tab: 'setup' });
+});
+
+test('serverEmptyState() falls back to the identical copy if PilotEmptyState is unavailable', () => {
+    // Simulates the module not being loaded (an older build, or a stripped-down
+    // test harness) — the fallback must read exactly the same as the real thing,
+    // so no visible copy ever depends on which path was taken.
+    const saved = globalThis.PilotEmptyState;
+    delete globalThis.PilotEmptyState;
+    try {
+        assert.deepEqual(S.serverEmptyState(),
+            { message: 'No RustDesk server configured yet.', ctaLabel: 'Run setup', tab: 'setup' });
+    } finally {
+        globalThis.PilotEmptyState = saved;
+    }
+});
+
+test('the server-ops-empty template sources its text from emptyState(), not a literal', () => {
+    assert.match(SOURCE, /data-testid="server-ops-empty"/);
+    const block = SOURCE.split('data-testid="server-ops-empty"')[1].split('</div>')[0];
+    assert.match(block, /x-text="emptyState\(\)\.message"/);
+    assert.match(block, /x-text="emptyState\(\)\.ctaLabel"/);
+    assert.ok(!block.includes('No RustDesk server configured yet.'),
+        'the message must come from emptyState(), not a hardcoded literal in the template');
+    assert.ok(!/>Run setup</.test(block),
+        'the CTA label must come from emptyState(), not a hardcoded literal in the template');
+});
+
 test('the pure half never references cockpit', () => {
     const upToDivider = SOURCE.split('cockpit I/O')[0];
     assert.ok(!/\bcockpit\b/.test(upToDivider), 'pure section must not reference cockpit');
