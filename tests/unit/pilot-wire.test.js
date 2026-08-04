@@ -141,3 +141,43 @@ test('usage errors exit 2', () => {
     assert.equal(runFails(dir, ['script']).status, 2);
     assert.equal(runFails(dir, ['nonsense', 'x']).status, 2);
 });
+
+// The wiring tool must not disagree with the two files that JUDGE its output.
+// Before the final review it did: tools/pilot-wire.mjs's C7 omitted
+// js/core/console-view.js (which tests/unit/skeleton.test.js pins) while
+// skeleton.test.js omitted js/core/emptystate.js (which the tool pins). Each
+// list was therefore blind to a module the other treated as authoritative, so
+// a tool-inserted tag could land in a position the judging test rejects.
+function c7Of(relPath) {
+    const src = fs.readFileSync(path.join(__dirname, '..', '..', relPath), 'utf8');
+    const m = /const C7 = \[([\s\S]*?)\];/.exec(src);
+    assert.ok(m, `${relPath} has no "const C7 = [...]" list`);
+    return [...m[1].matchAll(/'([^']+)'/g)].map((x) => x[1]);
+}
+
+test('the C7 order is identical in the wiring tool, the skeleton test and the smoke suite', () => {
+    const tool = c7Of('tools/pilot-wire.mjs');
+    const skeleton = c7Of('tests/unit/skeleton.test.js');
+    const smoke = c7Of('tests/smoke.mjs');
+    assert.deepEqual(tool, skeleton,
+        'tools/pilot-wire.mjs and tests/unit/skeleton.test.js disagree about C7');
+    assert.deepEqual(tool, smoke,
+        'tools/pilot-wire.mjs and tests/smoke.mjs disagree about C7');
+    for (const s of ['js/core/console-view.js', 'js/core/emptystate.js', 'js/features/theme-ui.js']) {
+        assert.ok(tool.includes(s), `C7 must name ${s}`);
+    }
+});
+
+test('every C7 entry that exists on disk is loaded by index.html in that order', () => {
+    const c7 = c7Of('tools/pilot-wire.mjs');
+    const html = fs.readFileSync(path.join(__dirname, '..', '..', 'index.html'), 'utf8');
+    let prev = -1;
+    let prevSrc = '';
+    for (const s of c7) {
+        const at = html.indexOf('src="' + s + '"');
+        if (at === -1) continue;
+        assert.ok(at > prev, `index.html loads ${s} before ${prevSrc}, against C7`);
+        prev = at;
+        prevSrc = s;
+    }
+});

@@ -1,0 +1,46 @@
+- generic [ref=f1e2]:
+  - generic [ref=f1e3]:
+    - strong [ref=f1e4]: Pilot
+    - list [ref=f1e5]:
+      - listitem [ref=f1e6]:
+        - button "Overview" [ref=f1e7] [cursor=pointer]
+      - listitem [ref=f1e8]:
+        - button "Setup" [ref=f1e9] [cursor=pointer]
+      - listitem [ref=f1e10]:
+        - button "Devices" [ref=f1e11] [cursor=pointer]
+      - listitem [ref=f1e12]:
+        - button "Address Book" [ref=f1e13] [cursor=pointer]
+      - listitem [ref=f1e14]:
+        - button "Users" [ref=f1e15] [cursor=pointer]
+      - listitem [ref=f1e16]:
+        - button "Audit" [ref=f1e17] [cursor=pointer]
+      - listitem [ref=f1e18]:
+        - button "Server Ops" [ref=f1e19] [cursor=pointer]
+  - generic [ref=f1e22]:
+    - generic [ref=f1e23]:
+      - heading "Overview" [level=2] [ref=f1e24]
+      - button "Refresh" [ref=f1e25] [cursor=pointer]
+    - generic [ref=f1e26]: Server
+    - combobox "Server" [ref=f1e27]:
+      - option "This server" [selected]
+    - generic [ref=f1e28]:
+      - generic [ref=f1e31]:
+        - paragraph [ref=f1e32]: Devices
+        - paragraph [ref=f1e33]: "0"
+      - generic [ref=f1e36]:
+        - paragraph [ref=f1e37]: Online
+        - paragraph [ref=f1e38]: "0"
+      - generic [ref=f1e41]:
+        - paragraph [ref=f1e42]: Offline
+        - paragraph [ref=f1e43]: "0"
+    - generic [ref=f1e44]:
+      - text: "no API transport is configured Recommended: try again."
+      - button "Try again" [ref=f1e45] [cursor=pointer]
+    - generic [ref=f1e47]:
+      - heading "Web client" [level=3] [ref=f1e48]
+      - paragraph [ref=f1e49]:
+        - button "Open the web client" [disabled]
+      - paragraph [ref=f1e50]: TLS is not configured on this server, so there is no HTTPS address to open the web client at.
+      - paragraph [ref=f1e51]:
+        - button "Set up TLS" [ref=f1e52] [cursor=pointer]
+  - button "Update check failed" [ref=f1e54] [cursor=pointer]

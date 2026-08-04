@@ -17,12 +17,22 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 // C7 verbatim, plus js/features/theme-ui.js immediately after js/features/update.js.
+//
+// This list is judged by tests/unit/skeleton.test.js's own C7 (which is what
+// actually fails a wrong insertion) and by tests/smoke.mjs rule 4. All three
+// must name the same modules in the same order, or this tool can happily emit
+// an index.html the test that judges it then rejects: before the final review
+// this list omitted js/core/console-view.js (present in skeleton.test.js) while
+// skeleton.test.js omitted js/core/emptystate.js (present here), so each list
+// was blind to a module the other pinned. tests/unit/pilot-wire.test.js now
+// asserts the three lists agree.
 const C7 = [
     'js/alpine.min.js', 'js/bootstrap.bundle.min.js',
     'js/core/errors.js', 'js/core/semver.js', 'js/core/themes.js', 'js/core/settings.js',
     'js/core/ostarget.js', 'js/core/ports.js', 'js/core/firewall.js', 'js/core/tls.js',
     'js/core/provision-plan.js', 'js/core/redact.js',
-    'js/core/servers.js', 'js/core/api-io.js', 'js/core/api-client.js', 'js/core/addressbook.js',
+    'js/core/servers.js', 'js/core/api-io.js', 'js/core/api-client.js',
+    'js/core/console-view.js', 'js/core/addressbook.js',
     'js/core/emptystate.js',
     'js/features/update.js', 'js/features/theme-ui.js', 'js/features/setup-ui.js',
     'js/features/devices-ui.js', 'js/features/addressbook-ui.js',
