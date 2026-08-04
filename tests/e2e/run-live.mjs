@@ -40,6 +40,9 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 export const ROOT = path.resolve(HERE, '..', '..');
 
 export const BASE_URL = 'https://localhost:9090';
+// The system location `sudo make install` uses. Most dev machines have no
+// passwordless root, so this is not the ONLY place this tier looks --
+// see pluginDirCandidates() below.
 export const PLUGIN_DIR = '/usr/share/cockpit/pilot';
 const DEFAULT_CRED_FILE = path.join(os.homedir(), '.config', '.claude', 'cockpit-credentials.json');
 
@@ -136,13 +139,56 @@ async function probeChromium() {
     }
 }
 
-export function pluginInstalled(dir) {
-    const d = typeof dir === 'string' ? dir : PLUGIN_DIR;
-    try {
-        return fs.existsSync(path.join(d, 'manifest.json'));
-    } catch (e) {
-        return false;
+// Cockpit reads plugins from the system location AND, per-user, from
+// ~/.local/share/cockpit/<name> -- a first-class Cockpit search path, not a
+// hack (this machine already has `~/.local/share/cockpit/hangar` symlinked
+// for that sibling project's own dev loop). A machine with no passwordless
+// root can still get a genuine, standing live-tier install this way: `ln -s
+// $(pwd) ~/.local/share/cockpit/pilot`, no sudo required. PILOT_PLUGIN_DIR
+// overrides the search to exactly one directory when set.
+function homePluginDir(home) {
+    return path.join((home === undefined || home === null) ? os.homedir() : home,
+        '.local', 'share', 'cockpit', 'pilot');
+}
+
+export function pluginDirCandidates(overrides) {
+    const o = (overrides && typeof overrides === 'object') ? overrides : {};
+    const env = o.env || process.env;
+    if (typeof env.PILOT_PLUGIN_DIR === 'string' && env.PILOT_PLUGIN_DIR !== '') {
+        return [env.PILOT_PLUGIN_DIR];
     }
+    return [PLUGIN_DIR, homePluginDir(o.home)];
+}
+
+// Returns the first candidate directory that really has a manifest.json, or
+// null. `overrides.candidates` lets the unit tests supply an explicit list
+// (real tmp dirs) instead of touching PILOT_PLUGIN_DIR / the real home dir.
+export function findPluginDir(overrides) {
+    const o = (overrides && typeof overrides === 'object') ? overrides : {};
+    const candidates = Array.isArray(o.candidates) ? o.candidates : pluginDirCandidates(o);
+    for (const d of candidates) {
+        try {
+            if (fs.existsSync(path.join(String(d), 'manifest.json'))) return d;
+        } catch (e) {
+            // ignore and try the next candidate
+        }
+    }
+    return null;
+}
+
+// dir === undefined: search every candidate location (system + per-user, or
+// the PILOT_PLUGIN_DIR override). An explicit dir checks only that one path
+// -- used directly by callers (and the unit test) that already know where to
+// look.
+export function pluginInstalled(dir) {
+    if (dir !== undefined) {
+        try {
+            return fs.existsSync(path.join(String(dir), 'manifest.json'));
+        } catch (e) {
+            return false;
+        }
+    }
+    return findPluginDir() !== null;
 }
 
 // Returns a reason string when a precondition is unmet, or null when every
@@ -280,15 +326,26 @@ async function shot(page, name) {
 // --- the tiny ledger, mirroring tests/e2e.mjs's check()/report() shape ----
 
 let RESULTS = [];
-async function check(name, fn) {
-    try {
-        await fn();
-        RESULTS.push({ name, ok: true, error: null });
-        console.log(`  ok  ${name}`);
-    } catch (e) {
-        RESULTS.push({ name, ok: false, error: e });
-        console.log(`  FAIL  ${name}\n        ${e && e.message}`);
-    }
+// A factory, not a bare function: the failure branch must redact the same way
+// newLivePage()'s console/pageerror listeners and runScenarios()'s own catch
+// already do, and that requires the scenario's password in scope. Nothing
+// interpolates the password into a check() message today, but this is the
+// most-exercised print path in the file (every `await check(...)` in both
+// scenarios) and is handed to future scenario authors via ctx.check, so it
+// gets the same guarantee as every other print site rather than being the one
+// gap in an otherwise-held invariant.
+export function makeCheck(password) {
+    return async function check(name, fn) {
+        try {
+            await fn();
+            RESULTS.push({ name, ok: true, error: null });
+            console.log(`  ok  ${name}`);
+        } catch (e) {
+            const msg = redact(String(e && e.message), password);
+            RESULTS.push({ name, ok: false, error: e });
+            console.log(`  FAIL  ${name}\n        ${msg}`);
+        }
+    };
 }
 function assertOk(v, msg) { if (!v) throw new Error(msg || 'assertion failed'); }
 function assertEqual(a, b, msg) {
@@ -299,7 +356,7 @@ function scenarioContext(browser, creds) {
     return {
         browser, creds, base: BASE_URL,
         newPage: (b) => newLivePage(b, creds.password),
-        login, openPilot, shot, check, assertOk, assertEqual, isCspViolation
+        login, openPilot, shot, check: makeCheck(creds.password), assertOk, assertEqual, isCspViolation
     };
 }
 
@@ -341,11 +398,21 @@ async function runScenarios(browser, creds) {
 }
 
 async function main() {
+    // Hoisted so the watchdog can reach into an in-flight run and actually
+    // close the browser it launched, instead of merely setting exitCode while
+    // a chromium process keeps running in the background.
+    let liveBrowser = null;
     let watchdogTimer = null;
     const watchdog = new Promise((_, reject) => {
         watchdogTimer = setTimeout(() => {
-            reject(new Error(`test:live: overall time budget of ${OVERALL_TIMEOUT_MS}ms exceeded -- ` +
-                'treating this as a hang, not a slow pass'));
+            (async () => {
+                if (liveBrowser) {
+                    try { await liveBrowser.close(); } catch (e) { /* best effort */ }
+                }
+            })().finally(() => {
+                reject(new Error(`test:live: overall time budget of ${OVERALL_TIMEOUT_MS}ms exceeded -- ` +
+                    'treating this as a hang, not a slow pass'));
+            });
         }, OVERALL_TIMEOUT_MS);
     });
 
@@ -360,25 +427,31 @@ async function main() {
             return 0;
         }
 
-        if (!pluginInstalled()) {
-            console.log(`test:live: skipped -- Pilot is not installed at ${PLUGIN_DIR}.`);
-            console.log('test:live: run `sudo make install` (from the repo root), then ' +
-                '`systemctl try-restart cockpit`, then re-run `npm run test:live`.');
+        const installedAt = findPluginDir();
+        if (!installedAt) {
+            const candidates = pluginDirCandidates();
+            console.log(`test:live: skipped -- Pilot is not installed at any of: ${candidates.join(', ')}`);
+            console.log('test:live: install system-wide with `sudo make install` (then ' +
+                '`systemctl try-restart cockpit`), or per-user with no root at all via ' +
+                `\`ln -s ${ROOT} ${homePluginDir()}\` (or set PILOT_PLUGIN_DIR), then re-run ` +
+                '`npm run test:live`.');
             if (requireLive()) {
                 console.error('test:live: PILOT_LIVE_REQUIRE=1 but Pilot is not installed -- treating the skip as a failure');
                 return 1;
             }
             return 0;
         }
+        console.log(`test:live: Pilot found installed at ${installedAt}`);
 
         const creds = credentials();
         const { chromium } = await import('playwright');
-        const browser = await chromium.launch({ headless: !process.env.HEADED, timeout: 30000 });
+        liveBrowser = await chromium.launch({ headless: !process.env.HEADED, timeout: 30000 });
         console.log(`test:live: chromium launched, driving ${BASE_URL}`);
         try {
-            return await runScenarios(browser, creds);
+            return await runScenarios(liveBrowser, creds);
         } finally {
-            await browser.close();
+            await liveBrowser.close();
+            liveBrowser = null;
         }
     }
 
@@ -394,7 +467,10 @@ async function main() {
     }
 }
 
-export const PilotLive = { credentials, shouldSkip, loginUrl, isCspViolation, requireLive, pluginInstalled };
+export const PilotLive = {
+    credentials, shouldSkip, loginUrl, isCspViolation, requireLive,
+    pluginInstalled, pluginDirCandidates, findPluginDir, makeCheck
+};
 
 if (isMain(import.meta.url)) {
     main();

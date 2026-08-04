@@ -237,3 +237,109 @@ test('pluginInstalled is true only when manifest.json exists under the given dir
     fs.writeFileSync(path.join(dir, 'manifest.json'), '{}');
     assert.equal(Live.pluginInstalled(dir), true);
 });
+
+// --- pluginDirCandidates / findPluginDir: the system-vs-per-user search ----
+// (IMPORTANT 2 fix -- a dev machine with no passwordless root can still get a
+// standing live install via ~/.local/share/cockpit/pilot, and PILOT_PLUGIN_DIR
+// overrides the search to one exact directory.)
+
+test('pluginDirCandidates: defaults to [system, ~/.local/share/cockpit/pilot] for the given home', () => {
+    const got = Live.pluginDirCandidates({ env: {}, home: '/home/nobody' });
+    assert.deepEqual(got, [
+        '/usr/share/cockpit/pilot',
+        path.join('/home/nobody', '.local', 'share', 'cockpit', 'pilot')
+    ]);
+});
+
+test('pluginDirCandidates: PILOT_PLUGIN_DIR overrides the search to exactly one directory', () => {
+    const got = Live.pluginDirCandidates({ env: { PILOT_PLUGIN_DIR: '/opt/whatever/pilot' }, home: '/home/nobody' });
+    assert.deepEqual(got, ['/opt/whatever/pilot']);
+});
+
+test('pluginDirCandidates: an empty-string PILOT_PLUGIN_DIR is treated as unset', () => {
+    const got = Live.pluginDirCandidates({ env: { PILOT_PLUGIN_DIR: '' }, home: '/home/nobody' });
+    assert.deepEqual(got, [
+        '/usr/share/cockpit/pilot',
+        path.join('/home/nobody', '.local', 'share', 'cockpit', 'pilot')
+    ]);
+});
+
+test('findPluginDir: null when none of the candidates has a manifest.json', () => {
+    const a = tmpdir();
+    const b = tmpdir();
+    assert.equal(Live.findPluginDir({ candidates: [a, b] }), null);
+});
+
+test('findPluginDir: returns the first candidate (in order) that really has a manifest.json', () => {
+    const a = tmpdir();
+    const b = tmpdir();
+    fs.writeFileSync(path.join(b, 'manifest.json'), '{}');
+    assert.equal(Live.findPluginDir({ candidates: [a, b] }), b);
+    // Order matters: a system install found first must win over a per-user one.
+    fs.writeFileSync(path.join(a, 'manifest.json'), '{}');
+    assert.equal(Live.findPluginDir({ candidates: [a, b] }), a);
+});
+
+test('findPluginDir: a nonexistent directory in the list is skipped, not thrown on', () => {
+    const dir = tmpdir();
+    fs.writeFileSync(path.join(dir, 'manifest.json'), '{}');
+    const missing = path.join(dir, 'does', 'not', 'exist');
+    assert.equal(Live.findPluginDir({ candidates: [missing, dir] }), dir);
+});
+
+test('pluginInstalled with no argument searches every candidate via findPluginDir', () => {
+    // Exercise the real default path (env/home unset) purely as "does not throw
+    // and returns a boolean" -- it may legitimately be true or false depending
+    // on this machine's actual installs, so nothing about its value is asserted.
+    assert.equal(typeof Live.pluginInstalled(), 'boolean');
+});
+
+// --- makeCheck: the IMPORTANT-1 regression (check()'s failure path must
+// redact the same way every other print site in this file does) -----------
+
+test('makeCheck: a failing check redacts the password from its printed FAIL message', async () => {
+    const SECRET = 'do-not-print-me-98765';
+    const check = Live.makeCheck(SECRET);
+    const originalLog = console.log;
+    const lines = [];
+    console.log = (...args) => lines.push(args.join(' '));
+    try {
+        await check('a check whose thrown error happens to contain the password', async () => {
+            throw new Error(`login failed for user ada with password ${SECRET}`);
+        });
+    } finally {
+        console.log = originalLog;
+    }
+    const joined = lines.join('\n');
+    assert.equal(joined.includes(SECRET), false, `password leaked through check(): ${joined}`);
+    assert.match(joined, /FAIL/);
+    assert.match(joined, /\[REDACTED\]/);
+});
+
+test('makeCheck: a passing check never prints anything to redact in the first place', async () => {
+    const check = Live.makeCheck('irrelevant-password');
+    const originalLog = console.log;
+    const lines = [];
+    console.log = (...args) => lines.push(args.join(' '));
+    try {
+        await check('a check that passes', async () => {});
+    } finally {
+        console.log = originalLog;
+    }
+    assert.match(lines.join('\n'), /ok/);
+});
+
+test('makeCheck: with no password, the message passes through unredacted (nothing to hide)', async () => {
+    const check = Live.makeCheck(undefined);
+    const originalLog = console.log;
+    const lines = [];
+    console.log = (...args) => lines.push(args.join(' '));
+    try {
+        await check('a check that fails with no password in scope', async () => {
+            throw new Error('plain failure, no secret involved');
+        });
+    } finally {
+        console.log = originalLog;
+    }
+    assert.match(lines.join('\n'), /plain failure, no secret involved/);
+});
