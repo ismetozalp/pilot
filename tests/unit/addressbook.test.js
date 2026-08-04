@@ -90,7 +90,7 @@ test('dedupePeers merges by id, unions tags and drops peers with no id', () => {
         { id: '', alias: 'orphan' },
         null
     ]);
-    assert.deepEqual(out.merged, ['1']);
+    assert.deepEqual(out.merged, [{ id: '1', exact: false }]);
     assert.equal(out.peers.length, 2);
     assert.equal(out.peers[0].alias, 'first');
     assert.equal(out.peers[0].hostname, 'h1');
@@ -99,16 +99,17 @@ test('dedupePeers merges by id, unions tags and drops peers with no id', () => {
 });
 
 test('dedupePeers names exactly which conflicting field values were discarded', () => {
-    // dedupePeers has no book scoping -- two records that happen to share an id
-    // fuse into one regardless of whether they came from the same address book or
-    // two unrelated ones. `merged` alone only says an id was touched; `conflicts`
-    // is what lets a caller notice a fusion it should not have allowed and see
-    // exactly what would be lost.
+    // Without book scoping, two records that happen to share an id fuse into one
+    // regardless of whether they came from the same address book or two unrelated
+    // ones. `conflicts` is the finer-grained record of which non-empty field
+    // values disagreed and were discarded; `merged` (checked in the next test)
+    // is what tells a caller a fusion happened at all, even when nothing here
+    // technically "conflicted".
     const out = AB.dedupePeers([
         { id: '1', alias: 'front desk', hostname: 'ws-01', tags: ['siteA'] },
         { id: '1', alias: 'back office', hostname: 'ws-02', tags: ['siteB'] }
     ]);
-    assert.deepEqual(out.merged, ['1']);
+    assert.deepEqual(out.merged, [{ id: '1', exact: false }]);
     assert.deepEqual(out.conflicts, [
         { id: '1', field: 'alias', kept: 'front desk', discarded: 'back office' },
         { id: '1', field: 'hostname', kept: 'ws-01', discarded: 'ws-02' }
@@ -117,11 +118,79 @@ test('dedupePeers names exactly which conflicting field values were discarded', 
     assert.equal(out.peers[0].alias, 'front desk');
     assert.deepEqual(out.peers[0].tags, ['siteA', 'siteB'], 'tags still union, not a conflict');
 
-    // filling an EMPTY field from a duplicate is not a conflict -- only two
-    // non-empty, differing values are.
+    // filling an EMPTY field from a duplicate is not a CONFLICT -- only two
+    // non-empty, differing values are -- but it still counts as fusion in `merged`
+    // (the duplicate contributed real information the kept record didn't have).
     const filled = AB.dedupePeers([{ id: '2' }, { id: '2', alias: 'only one has a name' }]);
     assert.deepEqual(filled.conflicts, []);
+    assert.deepEqual(filled.merged, [{ id: '2', exact: false }]);
     assert.equal(filled.peers[0].alias, 'only one has a name');
+});
+
+test('dedupePeers.merged is meaningful on its own: a caller need not consult conflicts', () => {
+    // The reviewer's exact reproduction: two records whose ONLY difference is
+    // their tags. No text field disagrees, so `conflicts` is empty -- but two
+    // genuinely different tag sets were still fused into one peer, and a caller
+    // who reads "conflicts: []" as "nothing was fused" would be wrong. `merged`
+    // must say so on its own.
+    const fused = AB.dedupePeers([{ id: '99', tags: ['siteA'] }, { id: '99', tags: ['siteB'] }]);
+    assert.equal(fused.peers.length, 1);
+    assert.deepEqual(fused.peers[0].tags, ['siteA', 'siteB']);
+    assert.deepEqual(fused.conflicts, [], 'no non-empty field disagreed');
+    assert.deepEqual(fused.merged, [{ id: '99', exact: false }],
+        'merged must flag real fusion even with zero conflicts');
+
+    // Contrast: literally the same record stated twice (e.g. the same CSV row
+    // appearing twice) contributes nothing new, so it is exact -- a caller can
+    // tell the two cases apart using merged alone.
+    const restated = AB.dedupePeers([
+        { id: '5', alias: 'x', tags: ['a'] },
+        { id: '5', alias: 'x', tags: ['a'] }
+    ]);
+    assert.deepEqual(restated.merged, [{ id: '5', exact: true }]);
+    assert.equal(restated.merged.some((m) => !m.exact), false);
+    assert.equal(fused.merged.some((m) => !m.exact), true);
+});
+
+test('dedupePeers refuses to merge across books when book info is supplied', () => {
+    // A caller that accidentally combines peer lists from two different address
+    // books must not have two unrelated machines silently fused just because they
+    // share an id. Passing { byBook: true } plus a `book` key on each raw item
+    // makes that refusal automatic instead of a "partition your list first"
+    // convention nothing enforces.
+    const crossBook = AB.dedupePeers([
+        { id: '99', book: 'A', alias: 'machine A' },
+        { id: '99', book: 'B', alias: 'machine B' }
+    ], { byBook: true });
+    assert.equal(crossBook.peers.length, 2, 'different books must stay separate records');
+    assert.deepEqual(crossBook.merged, []);
+    assert.deepEqual(crossBook.conflicts, []);
+    assert.deepEqual(crossBook.peers.map((p) => p.alias).sort(), ['machine A', 'machine B']);
+
+    // Same id, same book: still merges exactly like the unscoped case.
+    const sameBook = AB.dedupePeers([
+        { id: '99', book: 'A', alias: 'first' },
+        { id: '99', book: 'A', hostname: 'h1' }
+    ], { byBook: true });
+    assert.equal(sameBook.peers.length, 1);
+    assert.equal(sameBook.peers[0].alias, 'first');
+    assert.equal(sameBook.peers[0].hostname, 'h1');
+    assert.deepEqual(sameBook.merged, [{ id: '99', exact: false }]);
+
+    // The realistic hazard in one call: a combined, mixed-book list where one
+    // id repeats within a book (must merge) and the same id also appears in a
+    // different book (must not merge into the first).
+    const mixed = AB.dedupePeers([
+        { id: '1', book: 'A', alias: 'a1' },
+        { id: '1', book: 'A', hostname: 'hA' },
+        { id: '1', book: 'B', alias: 'b1' }
+    ], { byBook: true });
+    assert.equal(mixed.peers.length, 2, 'book A fuses to one, book B stays its own');
+    const byAlias = mixed.peers.slice().sort((a, b) => a.alias < b.alias ? -1 : 1);
+    assert.equal(byAlias[0].alias, 'a1');
+    assert.equal(byAlias[0].hostname, 'hA');
+    assert.equal(byAlias[1].alias, 'b1');
+    assert.deepEqual(mixed.merged, [{ id: '1', exact: false }]);
 });
 
 test('withTags and bulkTag honour add/remove/set and reject any other mode', () => {

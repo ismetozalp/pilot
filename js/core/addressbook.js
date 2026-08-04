@@ -113,25 +113,52 @@
         return { ok: problems.length === 0, peer, problems };
     }
 
-    // dedupePeers has no notion of "book" -- Peer carries no book/guid field (that
-    // lives on Book, a separate record), so identity here is id ALONE. A caller
-    // that gathers peers from more than one book before calling this MUST
-    // partition its own list by book first, or two genuinely different machines
-    // that happen to share an id will fuse. Rather than leave that as an
-    // unenforced convention, every discarded conflicting field value is reported
-    // in `conflicts` -- a caller can inspect it and refuse, warn on, or undo a
-    // fusion it did not intend. `merged` (the pinned shape) only ever names WHICH
-    // ids were touched; `conflicts` says what was lost doing it.
-    function dedupePeers(list) {
-        const byId = new Map();
-        const order = [];
-        const merged = [];
+    // Identity is id ALONE unless the caller opts into book-scoping. Peer itself
+    // carries no book/guid field (that lives on Book, a separate record), so a raw
+    // input item may carry an extra `book` key purely for THIS function's benefit;
+    // normalizePeer never reads it and it never appears on the returned Peer.
+    //
+    // opts.byBook: true makes the merge key (id, book) instead of id alone, so two
+    // items with the same id but a different `book` stay separate records --
+    // exactly the enforcement a caller merging peers gathered from more than one
+    // address book needs, instead of an unenforced "partition your list first"
+    // convention. Leave it unset (the default) for the common case of deduping
+    // within a single already-known book (e.g. one CSV import): every same-id
+    // item merges, as before.
+    //
+    // Either way, fusion is never silent: `merged` reports EVERY id that absorbed
+    // a duplicate, each tagged `exact` -- true only when the duplicate contributed
+    // literally nothing not already present (a genuine re-statement of the same
+    // record), false the instant it contributed anything new: a filled-in field, a
+    // conflicting field, or even just a tag the kept record didn't have yet. A
+    // caller can read `merged` alone -- `merged.some(m => !m.exact)` -- and know
+    // real fusion happened without ever looking at `conflicts`. `conflicts` stays
+    // as the finer-grained record of specifically which non-empty field values
+    // disagreed and were discarded; it can be empty even when a fusion was real
+    // (two peers whose only difference was their tags, say), which is exactly why
+    // `merged` no longer defers to it.
+    function dedupePeers(list, opts) {
+        const byBook = !!(opts && opts.byBook === true);
+        function bookKey(raw) {
+            return byBook ? str(raw && typeof raw === 'object' ? raw.book : '').trim() : '';
+        }
+        const byKey = new Map();
+        const keyOrder = [];
+        const mergedByKey = new Map();
         const conflicts = [];
         for (const raw of (Array.isArray(list) ? list : [])) {
             const peer = normalizePeer(raw);
             if (!peer.id) continue;
-            if (!byId.has(peer.id)) { byId.set(peer.id, peer); order.push(peer.id); continue; }
-            const kept = byId.get(peer.id);
+            const key = byBook ? (peer.id + '#' + bookKey(raw)) : peer.id;
+            if (!byKey.has(key)) { byKey.set(key, peer); keyOrder.push(key); continue; }
+
+            const kept = byKey.get(key);
+            let addsInfo = false;
+            for (const f of TEXT_FIELDS.concat(['note']))
+                if (peer[f] && peer[f] !== kept[f]) addsInfo = true;
+            for (const t of peer.tags)
+                if (kept.tags.indexOf(t) === -1) addsInfo = true;
+
             for (const f of TEXT_FIELDS.concat(['note'])) {
                 if (!kept[f] && peer[f]) { kept[f] = peer[f]; continue; }
                 if (kept[f] && peer[f] && kept[f] !== peer[f])
@@ -139,9 +166,14 @@
             }
             for (const t of peer.tags)
                 if (kept.tags.indexOf(t) === -1 && kept.tags.length < LIMITS.tagsPerPeer) kept.tags.push(t);
-            if (merged.indexOf(peer.id) === -1) merged.push(peer.id);
+
+            const entry = mergedByKey.get(key);
+            if (!entry) mergedByKey.set(key, { id: peer.id, exact: !addsInfo });
+            else if (addsInfo) entry.exact = false;
         }
-        return { peers: order.map((k) => byId.get(k)), merged, conflicts };
+        const merged = [];
+        mergedByKey.forEach((v) => merged.push(v));
+        return { peers: keyOrder.map((k) => byKey.get(k)), merged, conflicts };
     }
 
     function withTags(peer, tags, mode) {
@@ -385,7 +417,10 @@
             candidates.push(v.peer);
         }
         const d = dedupePeers(candidates);
-        for (const id of d.merged) problems.push('duplicate id merged: ' + id);
+        for (const m of d.merged)
+            problems.push(m.exact
+                ? 'duplicate id restated: ' + m.id + ' (identical rows, nothing lost)'
+                : 'duplicate id merged: ' + m.id);
         for (const c of d.conflicts)
             problems.push('duplicate id ' + c.id + ': ' + c.field + ' "' + c.discarded +
                 '" was discarded in favor of "' + c.kept + '"');
