@@ -187,8 +187,10 @@ test('a secret DuckDNS step redacts the token, never emitting it in cleartext', 
     assert.equal(out.indexOf('SECRET123ABC'), -1, 'literal token does not appear');
     // Placeholder must be present
     assert.ok(out.indexOf('${DUCKDNS_TOKEN}') !== -1, 'placeholder present');
-    // Env var instruction must be present
-    assert.ok(out.indexOf('DUCKDNS_TOKEN=') !== -1, 'env var instruction present');
+    // Env var requirement must be present (:? means fail loudly if unset)
+    assert.ok(out.indexOf('DUCKDNS_TOKEN:?') !== -1, 'env var requirement present');
+    // Domain must be assigned to a variable
+    assert.ok(out.indexOf('PILOT_DUCKDNS_DOMAINS=') !== -1, 'domain variable present');
 });
 
 test('an idempotency-checked step is truly skipped on re-run (resumable script)', () => {

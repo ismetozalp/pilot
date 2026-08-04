@@ -498,21 +498,63 @@
         return (i === -1 || i + 1 >= argv.length) ? '' : argv[i + 1];
     }
 
-    // Redact credentials in argv by replacing secret tokens with env var references.
-    function redactArgv(argv, id) {
-        const secret = id === 'tls-duckdns';
-        if (!secret || argv.length === 0) return argv;
-        // DuckDNS token is in the URL: ...token=TOKEN... Replace with ${DUCKDNS_TOKEN}
-        const redacted = [];
-        for (let i = 0; i < argv.length; i++) {
-            const arg = argv[i];
-            if (typeof arg === 'string' && arg.indexOf('token=') !== -1) {
-                redacted.push(arg.replace(/token=[^&]*/, 'token=${DUCKDNS_TOKEN}'));
-            } else {
-                redacted.push(arg);
+    // For secret steps, render variable assignments before the command.
+    // Returns { preLines, commandLine }: preLines are setup lines (env checks, variable assignments),
+    // commandLine is the full rendered command (or null to use normal argv rendering).
+    function renderSecretStep(step) {
+        const preLines = [];
+        if (!step.secret) return { preLines: [], commandLine: null };
+
+        // DuckDNS: extract domain and token from URL, render as variables
+        if (step.id === 'tls-duckdns' && Array.isArray(step.argv)) {
+            // Find the URL argument (has token= in it)
+            let urlArg = '';
+            for (let i = 0; i < step.argv.length; i++) {
+                if (String(step.argv[i]).indexOf('token=') !== -1) {
+                    urlArg = String(step.argv[i]);
+                    break;
+                }
+            }
+            if (urlArg) {
+                // Extract domains=DOMAINS from URL
+                const domainsMatch = urlArg.match(/domains=([^&]+)/);
+                const domains = domainsMatch ? domainsMatch[1] : '';
+
+                if (domains) {
+                    // Render env var requirement (loud failure if unset)
+                    preLines.push(": \"${DUCKDNS_TOKEN:?set DUCKDNS_TOKEN to your DuckDNS token before running this script}\"");
+                    // Assign domain to variable with proper quoting (uses sq() for safety)
+                    preLines.push('PILOT_DUCKDNS_DOMAINS=' + sq(domains));
+
+                    // Render the curl command with double-quoted URL (so variables expand)
+                    const beforeUrl = [];
+                    const afterUrl = [];
+                    let foundUrl = false;
+                    for (let i = 0; i < step.argv.length; i++) {
+                        const arg = String(step.argv[i]);
+                        if (!foundUrl && arg.indexOf('token=') !== -1) {
+                            foundUrl = true;
+                            // Build URL with variable references (double-quoted)
+                            const baseUrl = 'https://www.duckdns.org/update?domains=${PILOT_DUCKDNS_DOMAINS}&token=${DUCKDNS_TOKEN}&ip=';
+                            continue; // Skip this arg, we'll add the double-quoted version
+                        }
+                        if (foundUrl) {
+                            afterUrl.push(arg);
+                        } else {
+                            beforeUrl.push(arg);
+                        }
+                    }
+
+                    // Build the command line: before-args, then double-quoted URL, then after-args
+                    let cmdLine = argvLine(beforeUrl) + ' "https://www.duckdns.org/update?domains=${PILOT_DUCKDNS_DOMAINS}&token=${DUCKDNS_TOKEN}&ip="';
+                    if (afterUrl.length > 0) cmdLine += ' ' + argvLine(afterUrl);
+
+                    return { preLines: preLines, commandLine: cmdLine };
+                }
             }
         }
-        return redacted;
+
+        return { preLines: [], commandLine: null };
     }
 
     // Find a collision-free heredoc delimiter by checking content for collisions.
@@ -567,10 +609,12 @@
                 out.push('chmod ' + q(s.write.mode) + ' ' + q(s.write.path));
                 out.push('chown ' + q(s.write.owner) + ' ' + q(s.write.path));
             } else {
-                const argv = s.secret ? redactArgv(s.argv, s.id) : s.argv;
-                out.push(argvLine(argv));
-                if (s.secret && s.id === 'tls-duckdns') {
-                    out.push('# Set DUCKDNS_TOKEN before running this script: export DUCKDNS_TOKEN=your-actual-token');
+                const secretInfo = renderSecretStep(s);
+                for (let j = 0; j < secretInfo.preLines.length; j++) out.push(secretInfo.preLines[j]);
+                if (secretInfo.commandLine) {
+                    out.push(secretInfo.commandLine);
+                } else {
+                    out.push(argvLine(s.argv));
                 }
             }
 
