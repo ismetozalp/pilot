@@ -131,7 +131,11 @@ test('isAllowedAssetUrl rejects a bare host with no path, and non-strings', () =
 });
 
 test('isAllowedAssetUrl.ASSET_HOSTS is the exact closed allow-list used above', () => {
-    assert.deepEqual(U.ASSET_HOSTS, ['github.com', 'codeload.github.com',
+    // api.github.com is included deliberately: the Releases API always populates
+    // zipball_url as https://api.github.com/repos/{owner}/{repo}/zipball/{tag}
+    // (see the fixture), and without this host every release with no attached
+    // .zip asset would report available with an unusable, blanked assetUrl.
+    assert.deepEqual(U.ASSET_HOSTS, ['github.com', 'api.github.com', 'codeload.github.com',
         'objects.githubusercontent.com', 'release-assets.githubusercontent.com']);
 });
 
@@ -154,11 +158,19 @@ test('parseRelease reports no update when the installed version is current or ne
 });
 
 test('parseRelease falls back to zipball_url when no zip asset is attached', () => {
+    // The fixture's zipball_url is untouched here on purpose: GitHub's Releases
+    // API always populates it as https://api.github.com/repos/{owner}/{repo}
+    // /zipball/{tag} (see tests/fixtures/github/synthetic-release-latest.json),
+    // never a codeload.github.com URL. A test that substitutes a synthetic
+    // codeload URL before asserting success verifies a shape GitHub never sends,
+    // not the real contract — that hid api.github.com's absence from ASSET_HOSTS
+    // (fixed by the coordinator's review; see js/features/update.js ASSET_HOSTS).
     const rel = JSON.parse(FIXTURE);
     rel.assets = [{ name: 'SHA256SUMS', browser_download_url: 'https://github.com/x/y/s' }];
-    rel.zipball_url = 'https://codeload.github.com/ismetozalp/pilot/zip/refs/tags/v1.4.0';
-    assert.equal(U.parseRelease(JSON.stringify(rel), '1.0.0').assetUrl,
-        'https://codeload.github.com/ismetozalp/pilot/zip/refs/tags/v1.4.0');
+    assert.equal(rel.zipball_url,
+        'https://api.github.com/repos/ismetozalp/pilot/zipball/v1.4.0',
+        'fixture drifted — this test must exercise the real GitHub shape');
+    assert.equal(U.parseRelease(JSON.stringify(rel), '1.0.0').assetUrl, rel.zipball_url);
 });
 
 test('parseRelease blanks an asset URL pointing at a host we would refuse anyway', () => {
@@ -351,6 +363,39 @@ test('badge label and title distinguish never-checked, up-to-date, available and
     assert.match(c.updateBadgeLabel(), /up to date/);
 });
 
+test('badgeTitle and openUpdateModal both name it plainly when a release is ' +
+    'available but nothing is installable', () => {
+    // A hostile or unusual assets structure (or, before this fix, ANY real
+    // release with no attached .zip: see the ASSET_HOSTS test above) can leave
+    // available=true with assetUrl=''. That must never look like a working
+    // "click to install" button that silently does nothing.
+    const c = U.pilotUpdateUi();
+    c.update = Object.assign(U.blankState(), { available: true, version: '9.9.9', assetUrl: '' });
+    assert.match(c.badgeTitle(), /no installable asset/i);
+    assert.doesNotMatch(c.badgeTitle(), /click to install/);
+
+    const opened = c.openUpdateModal();
+    assert.equal(opened, true, 'the click is answered, not a no-op');
+    assert.equal(c.updatePhase, U.PHASE.ERROR);
+    assert.match(c.updateLog.join('\n'), /no installable asset/i);
+});
+
+test('openUpdateModal opens the confirm phase normally when an asset IS present', () => {
+    const c = U.pilotUpdateUi();
+    c.update = Object.assign(U.blankState(), {
+        available: true, version: '1.4.0',
+        assetUrl: 'https://github.com/ismetozalp/pilot/releases/download/v1.4.0/pilot-1.4.0.zip'
+    });
+    assert.equal(c.openUpdateModal(), true);
+    assert.equal(c.updatePhase, U.PHASE.CONFIRM);
+});
+
+test('openUpdateModal does nothing when no update is available at all', () => {
+    const c = U.pilotUpdateUi();
+    assert.equal(c.openUpdateModal(), false);
+    assert.equal(c.updatePhase, U.PHASE.IDLE);
+});
+
 test('the update modal partial exists and binds the component', () => {
     const html = fs.readFileSync(
         path.join(__dirname, '..', '..', 'html', 'modals', 'update.html'), 'utf8');
@@ -480,4 +525,24 @@ test('readInstalledVersion never throws when the file is missing or cockpit is a
     global.cockpit = { file: () => ({ read: () => Promise.reject(new Error('ENOENT')) }) };
     t.after(() => { delete global.cockpit; });
     assert.equal(await c.readInstalledVersion(), '');
+});
+
+test('readInstalledVersion falls back to 0.0.0 on a corrupted stamp, rather than ' +
+    'silently disabling update detection forever', async (t) => {
+    // A crashed `make install` can leave a truncated or garbage stamp. Returning
+    // it raw would make PilotSemver.isNewer(candidate, garbage) return false for
+    // every future release, indistinguishable from "already up to date" — a
+    // silent, permanent failure. '0.0.0' keeps the failure loud instead: every
+    // real release compares as newer, so the badge starts working again.
+    for (const garbage of ['', '1.4\x00', 'not-a-version', '1..0', 'v\n2.0.0']) {
+        global.cockpit = { file: () => ({ read: () => Promise.resolve(garbage) }) };
+        t.after(() => { delete global.cockpit; });
+        const c = U.pilotUpdateUi();
+        const v = await c.readInstalledVersion();
+        // An empty (whitespace-only) stamp reads as "no information" and is left
+        // for checkForUpdate's own fallback; anything non-empty but unparseable
+        // is the corrupted-stamp case and must resolve to '0.0.0'.
+        const want = garbage.trim() === '' ? '' : '0.0.0';
+        assert.equal(v, want, JSON.stringify(garbage));
+    }
 });

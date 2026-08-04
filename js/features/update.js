@@ -5,11 +5,15 @@
 // Every network call here goes through cockpit.spawn(['curl', ...]) on the host.
 // Reaching for fetch() appears to work in a unit test and fails silently in the
 // browser — it is the single most likely way this feature gets reimplemented wrong.
-// For the same reason this file never calls fetch() or XMLHttpRequest for ANYTHING,
-// including reading the installed version: that comes from
-// cockpit.file('/etc/pilot/installed-version') — the file `make install` stamps —
-// rather than a same-origin fetch('VERSION'), so there is exactly one network
-// primitive in this module to reason about, not two.
+//
+// This file also never uses fetch() or XMLHttpRequest for reading the installed
+// version, but NOT because CSP would block it: VERSION ships same-origin beside
+// index.html, so connect-src 'self' would in fact permit fetch('VERSION') (see
+// js/boot.js, which fetches its modal partials the same way). The real reasons are
+// narrower: cockpit.file('/etc/pilot/installed-version') reports the version
+// `make install` actually stamped on THIS host, not merely what the browser has
+// cached for this page, and it keeps this module down to one network primitive
+// (cockpit.spawn/cockpit.file) to reason about instead of two.
 //
 // Flow: check release -> confirm -> download -> unpack -> `make install` (superuser)
 // -> detached Cockpit restart. Nothing touches /usr/share/cockpit/pilot until the
@@ -38,8 +42,14 @@
     const INSTALLED_VERSION_PATH = '/etc/pilot/installed-version';
 
     // github.com serves the release page redirect; codeload serves zipballs;
-    // the githubusercontent hosts serve the signed asset payloads themselves.
-    const ASSET_HOSTS = ['github.com', 'codeload.github.com',
+    // the githubusercontent hosts serve the signed asset payloads themselves;
+    // api.github.com is what the Releases API always puts in zipball_url — every
+    // release carries one, `curl -L` follows its redirect to codeload for the
+    // actual bytes, and without it here `parseRelease` reports an update as
+    // available with no installable asset for any release that has no attached
+    // .zip (which is the common case: GitHub builds zipball_url automatically,
+    // nothing has to be uploaded for it to exist).
+    const ASSET_HOSTS = ['github.com', 'api.github.com', 'codeload.github.com',
         'objects.githubusercontent.com', 'release-assets.githubusercontent.com'];
 
     function oops(message, detail) {
@@ -248,17 +258,34 @@
             },
 
             async readInstalledVersion() {
-                // NOT fetch('VERSION'): see the file header. This is same-origin to
-                // the bridge either way, but keeping every read on cockpit.file/spawn
-                // means there is exactly one network primitive in this file.
+                // NOT fetch('VERSION'): keeping every read on cockpit.file/spawn means
+                // there is exactly one network primitive in this file — see the header.
+                // (VERSION itself is same-origin and connect-src 'self' would in fact
+                // permit fetching it; this file reads the stamp `make install` writes
+                // instead because that is what is actually installed, not merely what
+                // the browser has cached for this page.)
+                //
+                // '' means "genuinely no information" (no cockpit, or the stamp does
+                // not exist yet — a plugin that was never installed via `make
+                // install`) and is left for checkForUpdate's own `|| '0.0.0'` fallback.
+                // A stamp that DOES exist but is not a valid semver — truncated by a
+                // crashed `make install`, or hand-edited — is a different failure and
+                // must not be confused with "no information": Semver.isNewer(x, v)
+                // is false for any unparseable v, so silently returning that garbage
+                // would look identical to "already on the latest version" forever,
+                // with no way to tell the two apart. '0.0.0' keeps that failure loud
+                // instead: every real release then compares as newer.
                 if (typeof cockpit === 'undefined' || !cockpit || typeof cockpit.file !== 'function')
                     return '';
+                let text = '';
                 try {
-                    const text = await cockpit.file(INSTALLED_VERSION_PATH).read();
-                    return typeof text === 'string' ? text.trim() : '';
+                    text = await cockpit.file(INSTALLED_VERSION_PATH).read();
                 } catch (e) {
                     return '';
                 }
+                const v = typeof text === 'string' ? text.trim() : '';
+                if (v === '') return '';
+                return Semver.isValid(v) ? v : '0.0.0';
             },
 
             async checkForUpdate(manual, prefs) {
@@ -286,9 +313,21 @@
             },
 
             openUpdateModal() {
-                if (!this.update.assetUrl) return false;
-                this.updatePhase = PHASE.CONFIRM;
+                if (!this.update.available) return false;
                 this.updateLog = [];
+                // A release can be "available" with nothing installable: GitHub
+                // returned a tag newer than what is installed, but no attached .zip
+                // and no zipball_url this module is willing to trust. Silently doing
+                // nothing here reads as a broken button; open the modal in the error
+                // phase instead, so the click is answered.
+                if (!this.update.assetUrl) {
+                    this.updatePhase = PHASE.ERROR;
+                    this.updateLog = ['Version ' + this.update.version + ' is available, but no ' +
+                        'installable asset was found for it (no attached .zip and no usable ' +
+                        'zipball_url). There is nothing this page can install automatically.'];
+                } else {
+                    this.updatePhase = PHASE.CONFIRM;
+                }
                 const el = root.document && root.document.getElementById('pilot-update');
                 if (el && root.bootstrap) root.bootstrap.Modal.getOrCreateInstance(el).show();
                 return true;
@@ -378,6 +417,9 @@
                 if (this.update.checking) return 'Checking for updates…';
                 if (this.update.error)
                     return 'Update check failed: ' + this.update.error + ' — click to try again';
+                if (this.update.available && !this.update.assetUrl)
+                    return 'Version ' + this.update.version + ' is available, but no installable ' +
+                        'asset was found for it — click for details';
                 if (this.update.available)
                     return 'Version ' + this.update.version + ' is available — click to install';
                 if (!this.prefs.repo)
