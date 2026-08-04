@@ -5,21 +5,30 @@
    checks that every other registry id has a block below, so a theme added to the
    registry but never styled fails the build.
 
-   Pilot's own accents are namespaced --pl-* (mirroring manifest's --mf-*). The
-   :root defaults below intentionally match css/pilot.css's own :root block
-   verbatim, so linking this stylesheet after pilot.css (as tools/pilot-wire.mjs
-   does) changes nothing for the system/light/dark themes -- only a
-   [data-bs-theme="<id>"] block below can override an accent, and only for its
-   own custom theme.
+   Pilot's own accents are namespaced --pl-* (mirroring manifest's --mf-*).
 
-   Contrast checked for WCAG AA body text against its own background: every
-   custom palette's --bs-body-color against --bs-body-bg (and --pl-log-fg
-   against --pl-log-bg) computed at 7.5:1 or better -- see task-28-report.md
-   for the ratios. */
+   IMPORTANT: --pl-log-bg / --pl-log-fg are deliberately NOT declared in the :root
+   block below, even though every other --pl-* accent is. tools/pilot-wire.mjs
+   links this stylesheet after css/pilot.css, and a plain :root selector has the
+   same specificity as an attribute selector on the built-in dark theme, so a
+   :root declaration here would win over pilot.css's own attribute-scoped
+   override -- silently flattening the built-in dark theme's transcript pane
+   back to pilot.css's light-mode shade.
+   Leaving them undeclared here means pilot.css's :root default and its dark
+   override both keep working for system/light/dark, exactly as Task 1 intended;
+   every custom theme below still sets its own --pl-log-bg/--pl-log-fg pair, so
+   nothing loses coverage. See tests/unit/themes.test.js for the regression test
+   and task-28-report.md for the full writeup. --pl-row-selected-bg is safe to
+   declare here: both files express it as var(--bs-tertiary-bg, ...), and that
+   variable is itself corrected per-theme by Bootstrap's own dark-mode CSS, so
+   either file "winning" resolves to the same computed colour.
+
+   Contrast checked for WCAG AA body text (>=4.5:1) against its own background,
+   and for WCAG 1.4.11 non-text/graphical accents (--bs-primary/success/warning/
+   danger, >=3:1) against their own background, for every custom palette -- see
+   task-28-report.md for the computed ratios. */
 
 :root {
-    --pl-log-bg: #1c1f24;
-    --pl-log-fg: #d7dae0;
     --pl-step-ok: var(--bs-success, #2e7d32);
     --pl-step-fail: var(--bs-danger, #c62828);
     --pl-step-running: var(--bs-primary, #0d6efd);
@@ -117,7 +126,7 @@
     --bs-primary: #d65d0e;
     --bs-success: #98971a;
     --bs-warning: #d79921;
-    --bs-danger: #cc241d;
+    --bs-danger: #fb4934;
     --bs-link-color: #83a598;
     --bs-link-hover-color: #a3c5b8;
     --pl-log-bg: #1d2021;
@@ -211,7 +220,7 @@
     --bs-border-color: #d3c4a3;
     --bs-primary: #a0522d;
     --bs-success: #6b8e23;
-    --bs-warning: #b8860b;
+    --bs-warning: #8b6508;
     --bs-danger: #a52a2a;
     --bs-link-color: #8b4513;
     --bs-link-hover-color: #6f370f;
