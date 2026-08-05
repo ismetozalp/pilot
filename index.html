@@ -99,7 +99,13 @@
               </select>
               <input class="form-control mb-1" data-testid="password" type="password" x-model="choices.password"
                      x-show="choices.auth === 'password'">
-              <textarea class="form-control mb-1" data-testid="pem" x-model="choices.pem"
+              <!-- rows=14 so a whole key is visible at once: an ed25519 PEM is
+                   ~9 lines and an RSA-2048 one ~28, and a 2-row box made it
+                   impossible to see whether what was pasted was complete or
+                   truncated. Monospace for the same reason. -->
+              <textarea class="form-control mb-1 font-monospace" data-testid="pem" x-model="choices.pem"
+                        rows="14" spellcheck="false" wrap="off"
+                        placeholder="-----BEGIN OPENSSH PRIVATE KEY-----&#10;...&#10;-----END OPENSSH PRIVATE KEY-----"
                         x-show="choices.auth === 'pem'"></textarea>
               <div class="form-check"><input class="form-check-input" type="checkbox" id="pl-remember"
                    data-testid="remember" x-model="choices.remember">
@@ -119,11 +125,27 @@
                  "This fingerprint is correct" invites confirming nothing. -->
             <pre class="border p-2" data-testid="fingerprint" x-show="hostkey && hostkey.fingerprint"
                  x-text="hostkey ? hostkey.fingerprint : ''"></pre>
-            <button class="btn btn-primary" data-testid="accept-hostkey"
-                    x-show="hostkey && hostkey.fingerprint" @click="acceptHostKey()">
-              This fingerprint is correct</button>
+            <!-- A checkbox, not a button: this is a standing statement of trust
+                 that Next then depends on, and a checkbox shows its own state.
+                 The button gave no feedback at all -- pressing it looked
+                 identical to not pressing it, so the only way to discover it was
+                 required was to press Next and be refused. -->
+            <div class="form-check mb-2" x-show="hostkey && hostkey.fingerprint">
+              <input class="form-check-input" type="checkbox" id="pl-hostkey-ok"
+                     data-testid="accept-hostkey"
+                     :checked="!!(hostkey && hostkey.confirmed)"
+                     @change="$event.target.checked ? acceptHostKey() : unacceptHostKey()">
+              <label class="form-check-label" for="pl-hostkey-ok">This fingerprint is correct</label>
+            </div>
             <button class="btn btn-link" data-testid="retry-hostkey" @click="checkHostKey()">Retry</button>
             <p class="text-danger mb-0" data-testid="hostkey-error" x-text="errors.hostkey || ''"></p>
+            <!-- Says what is still needed BEFORE Next is pressed, rather than
+                 only scolding afterwards. -->
+            <p class="text-secondary mb-0" data-testid="hostkey-pending"
+               x-show="hostkey && hostkey.fingerprint && !hostkey.confirmed && !errors.hostkey">
+              Tick the box above to confirm this fingerprint before continuing.</p>
+            <p class="text-success mb-0" data-testid="hostkey-confirmed"
+               x-show="hostkey && hostkey.confirmed">Fingerprint confirmed.</p>
             <!-- C6 hard stop: a CHANGED host key is never auto-accepted, and is
                  surfaced here explicitly rather than folded into the generic
                  next()-validation message above. -->
@@ -137,7 +159,17 @@
           </div>
 
           <div x-show="isStep('detect')" data-testid="pane-detect">
-            <button class="btn btn-secondary mb-2" data-testid="run-detect" @click="detect()">Detect</button>
+            <!-- Detection is a real round trip to the target (seconds over SSH).
+                 An unchanged, still-clickable button made that look like nothing
+                 had happened, and invited a second press mid-flight. -->
+            <button class="btn btn-secondary mb-2" data-testid="run-detect" @click="detect()"
+                    :disabled="busy">
+              <span class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"
+                    x-show="busy" data-testid="detect-spinner"></span>
+              <span x-text="busy ? 'Detecting…' : (plan ? 'Detect again' : 'Detect')"></span>
+            </button>
+            <p class="text-secondary" data-testid="detect-busy" x-show="busy">
+              Asking the target what it is running. This can take a few seconds.</p>
             <div x-show="!!plan">
               <table class="table"><tbody>
                 <template x-for="s in (plan ? plan.steps : [])" :key="s.id">
@@ -247,8 +279,18 @@
             <div data-testid="transcript">
               <template x-for="s in exec.steps" :key="s.id">
                 <div class="border-bottom py-1" :data-step-id="s.id" :data-status="s.status">
+                  <!-- A step is 'running' from its step-start until its step-end.
+                       Some take seconds (a download, apt-get, a 60s curl retry
+                       loop), and without a marker a long-running step is
+                       indistinguishable from a stalled one. The spinner is
+                       bound to the step's own status, so it disappears exactly
+                       when the step ends -- there is no second source of truth
+                       to fall out of sync. -->
+                  <span class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"
+                        x-show="s.status === 'running'" :data-step-spinner="s.id"></span>
                   <button class="btn btn-link p-0" :data-toggle-step="s.id" @click="toggleStep(s)"
-                          x-text="s.title + ' — ' + s.status + ' (exit ' + (s.exit === null ? 'n/a' : s.exit) + ')'"></button>
+                          x-text="s.title + ' — ' + s.status + (s.status === 'running' ? '' :
+                                  ' (exit ' + (s.exit === null ? 'n/a' : s.exit) + ')')"></button>
                   <div x-show="s.open">
                     <pre class="mb-0" :data-cmd="s.id" x-text="'$ ' + s.cmd"></pre>
                     <template x-for="(l, i) in s.lines" :key="i">

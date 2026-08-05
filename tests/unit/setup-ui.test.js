@@ -1773,13 +1773,21 @@ test('index.html never renders the fingerprint box or Accept without a fingerpri
     const html = fs.readFileSync(path.join(ROOT, 'index.html'), 'utf8');
     const pane = html.slice(html.indexOf('data-testid="pane-hostkey"'), html.indexOf('data-testid="pane-detect"'));
     assert.ok(pane.length > 0);
+    const GUARD = 'x-show="hostkey && hostkey.fingerprint"';
     for (const id of ['fingerprint', 'accept-hostkey']) {
         const at = pane.indexOf('data-testid="' + id + '"');
         assert.ok(at > 0, id + ' must be in the host-key pane');
-        // The element's own tag, from its '<' to the end of the open tag.
-        const start = pane.lastIndexOf('<', at);
-        const el = pane.slice(start, pane.indexOf('>', at) + 1);
-        assert.match(el, /x-show="hostkey && hostkey\.fingerprint"/,
+        // The guard may sit on the element itself or on a wrapper (the accept
+        // control is a checkbox inside a .form-check div). What matters is that
+        // it is EFFECTIVE: the nearest preceding guard must not be closed off
+        // before the control, or the control renders while the guard does not
+        // apply to it.
+        const tagStart = pane.lastIndexOf('<', at);
+        const ownTag = pane.slice(tagStart, pane.indexOf('>', at) + 1);
+        if (ownTag.includes(GUARD)) continue;   // guarded on the element itself
+        const guardAt = pane.lastIndexOf(GUARD, tagStart);
+        assert.ok(guardAt > 0, id + ' has no fingerprint guard, on itself or on a wrapper');
+        assert.ok(!pane.slice(guardAt, tagStart).includes('</div>'),
             id + ' must be hidden when there is no fingerprint -- an empty bordered box above ' +
             'an enabled "This fingerprint is correct" invites confirming nothing');
     }
@@ -1978,4 +1986,116 @@ test('start(): a classified kind survives -- the step text never overwrites it',
     });
     assert.equal(c.error.kind, 'CHECKSUM_MISMATCH', 'a hard stop must not be downgraded to GENERIC');
     assert.match(c.error.message, /does not match/);
+});
+
+// ------------------------------------------------- the four usability fixes
+
+test('the host key confirmation is reversible, and Next follows it both ways', () => {
+    // It became a checkbox because a button gave no feedback: pressing it looked
+    // identical to not pressing it, so the only way to learn it was required was
+    // to press Next and be refused. A checkbox shows its own state -- and a
+    // checkbox that cannot be unticked is a lie, so untick must really re-block.
+    const c = UI.pilotSetupUi();
+    c.choices.target = 'ssh';
+    c.choices.host = 'example.com';
+    c.step = 'hostkey';
+    c.hostkey = { fingerprint: 'SHA256:abc', known: false, changed: false, confirmed: false };
+
+    assert.equal(c.next(), false, 'unconfirmed must not advance');
+    assert.match(c.errors.hostkey, /Confirm the host key/i);
+
+    assert.equal(c.acceptHostKey(), true);
+    assert.equal(c.hostkey.confirmed, true);
+    c.step = 'hostkey';
+    assert.equal(c.next(), true, 'confirmed advances');
+
+    c.step = 'hostkey';
+    assert.equal(c.unacceptHostKey(), true, 'withdrawing confirmation must be possible');
+    assert.equal(c.hostkey.confirmed, false);
+    assert.equal(c.next(), false, 'and it must really re-block, not just clear a tick');
+
+    // With no host key at all there is nothing to accept or withdraw.
+    c.hostkey = null;
+    assert.equal(c.acceptHostKey(), false);
+    assert.equal(c.unacceptHostKey(), false);
+});
+
+test('a CHANGED host key cannot be confirmed by ticking the box either', () => {
+    // C6 hard stop. The control changed shape; the rule did not.
+    const c = UI.pilotSetupUi();
+    c.hostkey = { fingerprint: 'SHA256:abc', known: true, changed: true, confirmed: false };
+    assert.equal(c.acceptHostKey(), false);
+    assert.equal(c.hostkey.confirmed, false, 'a changed key must never end up confirmed');
+    assert.equal(c.error.kind, 'SSH_HOSTKEY_CHANGED');
+});
+
+test('index.html: the host key checkbox reflects state and says what is still needed', () => {
+    const html = fs.readFileSync(path.join(ROOT, 'index.html'), 'utf8');
+    const pane = html.slice(html.indexOf('data-testid="pane-hostkey"'), html.indexOf('data-testid="pane-detect"'));
+    const at = pane.indexOf('data-testid="accept-hostkey"');
+    const el = pane.slice(pane.lastIndexOf('<', at), pane.indexOf('>', at) + 1);
+    assert.match(el, /type="checkbox"/, 'a button gave no feedback; the control must show its own state');
+    assert.match(el, /:checked="!!\(hostkey && hostkey\.confirmed\)"/,
+        'the tick must be bound to the real state, not to a separate local flag');
+    assert.match(el, /unacceptHostKey\(\)/, 'unticking must do something');
+    // Validation the user sees BEFORE pressing Next, and confirmation after.
+    assert.match(pane, /data-testid="hostkey-pending"[\s\S]{0,200}!hostkey\.confirmed/);
+    assert.match(pane, /data-testid="hostkey-confirmed"[\s\S]{0,120}hostkey\.confirmed/);
+});
+
+test('index.html: Detect cannot be pressed twice and says it is working', () => {
+    const html = fs.readFileSync(path.join(ROOT, 'index.html'), 'utf8');
+    const at = html.indexOf('data-testid="run-detect"');
+    assert.ok(at > 0);
+    const el = html.slice(html.lastIndexOf('<', at), html.indexOf('>', at) + 1);
+    assert.match(el, /:disabled="busy"/,
+        'detection is a real round trip; a still-clickable button invites a second press mid-flight');
+    const pane = html.slice(html.indexOf('data-testid="pane-detect"'), html.indexOf('data-testid="pane-tls"'));
+    // Attribute order is not a contract; presence on the right element is.
+    const tagWith = (testid) => {
+        const i = pane.indexOf('data-testid="' + testid + '"');
+        assert.ok(i > 0, testid + ' is missing');
+        return pane.slice(pane.lastIndexOf('<', i), pane.indexOf('>', i) + 1);
+    };
+    assert.match(tagWith('detect-spinner'), /x-show="busy"/, 'the spinner must follow the real busy flag');
+    assert.match(tagWith('detect-busy'), /x-show="busy"/);
+    assert.match(pane, /x-text="busy \? 'Detecting…'/, 'the label itself must change');
+});
+
+test('index.html: each transcript step spins only while it is running', () => {
+    const html = fs.readFileSync(path.join(ROOT, 'index.html'), 'utf8');
+    const pane = html.slice(html.indexOf('data-testid="transcript"'), html.indexOf('data-testid="pane-handover"'));
+    assert.match(pane, /:data-step-spinner="s\.id"/, 'every step needs its own marker, not one global one');
+    const at = pane.indexOf(':data-step-spinner');
+    const el = pane.slice(pane.lastIndexOf('<', at), pane.indexOf('>', at) + 1);
+    assert.match(el, /x-show="s\.status === 'running'"/,
+        'bound to the step\'s own status, so it clears exactly when the step ends');
+    // A running step has no exit code yet; printing "(exit n/a)" beside a
+    // spinner reads as a failure.
+    assert.match(pane, /s\.status === 'running' \? '' :/);
+});
+
+test('a step really is "running" between step-start and step-end, so the spinner has state to bind to', () => {
+    // The markup above is only honest if the status it binds to exists.
+    let exec = UI.blankExec();
+    exec = UI.reduce(exec, { t: 'run-start', run_id: 'r', transport: 'local', steps: 1 });
+    exec = UI.reduce(exec, { t: 'step-start', id: 'a', title: 'A', cmd: 'true' });
+    assert.equal(exec.steps[0].status, 'running');
+    assert.equal(exec.steps[0].exit, null, 'and it has no exit code yet');
+    exec = UI.reduce(exec, { t: 'step-end', id: 'a', status: 'ok', exit: 0, ms: 5 });
+    assert.equal(exec.steps[0].status, 'ok', 'the spinner clears because the status changed');
+});
+
+test('index.html: the PEM box is tall enough to show a whole key', () => {
+    const html = fs.readFileSync(path.join(ROOT, 'index.html'), 'utf8');
+    const at = html.indexOf('data-testid="pem"');
+    assert.ok(at > 0);
+    const el = html.slice(html.lastIndexOf('<', at), html.indexOf('>', at) + 1);
+    const rows = /rows="(\d+)"/.exec(el);
+    assert.ok(rows, 'the PEM box must set an explicit height');
+    // An OpenSSH ed25519 private key is ~9 lines; RSA-2048 is ~28. Anything
+    // under about a dozen makes it impossible to see at a glance whether what
+    // was pasted is complete or truncated.
+    assert.ok(Number(rows[1]) >= 12, 'a whole key must be visible at once, got rows=' + rows[1]);
+    assert.match(el, /font-monospace/, 'key material is fixed-width; wrapping it hides truncation');
 });

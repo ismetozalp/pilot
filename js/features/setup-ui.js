@@ -1336,6 +1336,17 @@
                 return true;
             },
 
+            // The confirmation is now a checkbox, so it must be reversible: a
+            // user who ticks it, reads the fingerprint again and thinks better
+            // of it has to be able to withdraw. next() gates on
+            // hostkey.confirmed === true, so clearing it really does block the
+            // wizard again -- untick is not cosmetic.
+            unacceptHostKey() {
+                if (!this.hostkey) return false;
+                this.hostkey.confirmed = false;
+                return true;
+            },
+
             acceptHostKey() {
                 if (!this.hostkey) return false;
                 // A changed key is a hard stop (C6) — never a confirm dialog.

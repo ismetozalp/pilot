@@ -219,23 +219,76 @@ async function runBody(ctx) {
                 'target,hostkey,detect,tls,ports,execute,handover', 'host key must be present for remote');
             await page.click('[data-testid="next"]');
             assertOk(await visible(page, '[data-testid="pane-hostkey"]'), 'remote stops at the host key');
-            await page.click('[data-testid="next"]');
-            assertOk(await visible(page, '[data-testid="pane-hostkey"]'),
-                'an unconfirmed fingerprint must block the wizard');
+
             // No state was poked to get here — checkHostKey() fired on its own
             // when the wizard landed on this step. Prove the fingerprint came
             // from a real spawn call, not from nothing.
             const fingerprint = await waitForText(page, '[data-testid="fingerprint"]',
                 (t) => t === fp, 'fingerprint');
             assertEqual(fingerprint, fp);
+
+            // BEFORE Next has ever been refused: the pane already says what is
+            // needed. The old button said nothing, so the only way to learn it
+            // was required was to press Next and be told off.
+            assertOk(await visible(page, '[data-testid="hostkey-pending"]'),
+                'the pane must say what is still needed before Next is pressed');
+            assertEqual(await page.isChecked('[data-testid="accept-hostkey"]'), false);
+
+            await page.click('[data-testid="next"]');
+            assertOk(await visible(page, '[data-testid="pane-hostkey"]'),
+                'an unconfirmed fingerprint must block the wizard');
+            // Once refused, the red error carries the same instruction, so the
+            // grey hint stands down rather than saying it twice.
+            assertMatch(await page.textContent('[data-testid="hostkey-error"]'), /Confirm the host key/i);
+            assertOk(!(await visible(page, '[data-testid="hostkey-pending"]')),
+                'the hint and the error must not both say the same thing');
             const call = await spawnedCheckHostkey(page);
             assertOk(call, '--check-hostkey was never spawned by the real UI flow');
             assertEqual(JSON.parse(call.input).host, 'rd.example.com', 'the request carried the typed host');
             await shot(page, 'setup-remote-hostkey');
+            // The confirmation is a CHECKBOX, so the state it shows must be the
+            // state the wizard gates on -- and it must be reversible. Before
+            // ticking, the pane says what is still needed; a button said nothing
+            // and the only way to discover it was required was to be refused.
+            await page.click('[data-testid="accept-hostkey"]');
+            assertEqual(await page.isChecked('[data-testid="accept-hostkey"]'), true);
+            assertOk(await visible(page, '[data-testid="hostkey-confirmed"]'));
+            assertOk(!(await visible(page, '[data-testid="hostkey-pending"]')));
+
+            // Untick really withdraws: the box is not decoration over a
+            // one-way flag.
+            await page.click('[data-testid="accept-hostkey"]');
+            assertEqual(await page.isChecked('[data-testid="accept-hostkey"]'), false);
+            await page.click('[data-testid="next"]');
+            assertOk(await visible(page, '[data-testid="pane-hostkey"]'),
+                'withdrawing confirmation must block the wizard again');
+            assertMatch(await page.textContent('[data-testid="hostkey-error"]'), /Confirm the host key/i);
+
             await page.click('[data-testid="accept-hostkey"]');
             await page.click('[data-testid="next"]');
             assertOk(await visible(page, '[data-testid="pane-detect"]'),
                 'a confirmed, unchanged fingerprint must let the wizard continue');
+        });
+    });
+
+    // Detection is a real round trip to the target. An unchanged, still-clickable
+    // button made that look like nothing had happened.
+    await check('Detect shows it is working and cannot be pressed again mid-flight', async () => {
+        await withPage(ctx, { spawn: { 'pilot-exec --detect': DETECTION } }, async (page) => {
+            await page.selectOption('[data-testid="target"]', 'local');
+            await page.click('[data-testid="next"]');
+            assertOk(!(await visible(page, '[data-testid="detect-spinner"]')),
+                'nothing is happening yet, so nothing may spin');
+            assertEqual(await page.isDisabled('[data-testid="run-detect"]'), false);
+
+            await page.click('[data-testid="run-detect"]');
+            await wait(page, '[data-plan-step]');
+            // Once the plan is in, the button is usable again and re-labelled.
+            assertEqual(await page.isDisabled('[data-testid="run-detect"]'), false);
+            assertOk(!(await visible(page, '[data-testid="detect-spinner"]')),
+                'the spinner must clear when detection ends');
+            assertMatch(await page.textContent('[data-testid="run-detect"]'), /Detect again/,
+                'the label must say the plan can be rebuilt, not offer a first Detect again');
         });
     });
 

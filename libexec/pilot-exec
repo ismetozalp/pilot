@@ -1265,8 +1265,25 @@ if [ -n "$hbbs_bin" ]; then
     if [ -n "$dd" ] && [ -r "$dd/id_ed25519.pub" ]; then
         emit hbbs_pubkey "$(head -n1 "$dd/id_ed25519.pub" | tr -d '\\r\\n')"
     fi
-    ports=$(ss -H -ltun 2>/dev/null | awk '{print $5}' | sed 's/.*://' \
+    # hbbs_ports means "the ports hbbs and hbbr are listening on", NOT "every
+    # listening port". This used to take the whole `ss -ltun` table, so a normal
+    # server reported sshd, systemd-resolved, chronyd and Caddy as hbbs ports --
+    # 13 of them on the reference host, which then tripped the registry's
+    # MAX_HBBS_PORTS guard and blocked registration entirely with "too many
+    # hbbsPorts". -p names the owning process, which is how the question is
+    # actually answered.
+    ports=$(ss -H -ltunp 2>/dev/null | grep -E '"(hbbs|hbbr)"' \
+            | awk '{print $5}' | sed 's/.*://' \
             | sort -un | tr '\\n' ',' | sed 's/,$//')
+    if [ -z "${ports:-}" ]; then
+        # -p needs privilege to name another user's process. Without it, fall
+        # back to the canonical RustDesk ports rather than to EVERY port: an
+        # over-broad answer is what caused the bug, and a narrow one that misses
+        # a non-default port is merely incomplete.
+        ports=$(ss -H -ltun 2>/dev/null | awk '{print $5}' | sed 's/.*://' \
+                | sort -un | grep -E '^(21115|21116|21117|21118|21119)$' \
+                | tr '\\n' ',' | sed 's/,$//')
+    fi
     emit hbbs_ports "${ports:-}"
 else
     emit hbbs_present false
