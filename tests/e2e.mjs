@@ -394,6 +394,21 @@ async function main() {
                 console.log(`  FAIL  ${label} threw: ${e && e.message}`);
             }
             failures += report(label);
+
+            // A dead browser is not N failed checks -- it is one broken run, and
+            // reporting it as N buries the cause. Observed for real: chromium
+            // died mid-suite (two e2e runs racing for the same machine) and the
+            // log came back with 23 "failures", 44 of them saying only "browser
+            // has been closed", with the genuine first symptom lost in the
+            // middle. Stop at the first one and say what actually happened.
+            if (!browser.isConnected()) {
+                console.log(`\ne2e: ABORTED — the browser died during "${label}". ` +
+                    'Every check after this point would report "browser has been closed", ' +
+                    'which says nothing about the product. Usual cause: another browser ' +
+                    'or test run competing for this machine.');
+                process.exitCode = 1;
+                return;
+            }
         }
     } finally {
         await browser.close();

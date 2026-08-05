@@ -86,8 +86,22 @@ const HOSTKEY_UNREACHABLE = {
     message: JSON.stringify({ t: 'fatal', kind: 'SSH_UNREACHABLE', message: 'connection refused' })
 };
 
-const STUB = (run, hostkey) => {
-    const spawn = { 'pilot-exec --detect': DETECTION, 'pilot-exec --run': run };
+// Every required port reachable, unless a scenario says otherwise. Without
+// this the stub rejected --probe-ports as unscripted, probeReach() took its
+// catch path, and the e2e tier never exercised the probe at ALL -- the same
+// shape of gap that let "Every required port is reachable" mean nothing.
+const PROBE_ALL_OK = JSON.stringify({
+    host: '127.0.0.1',
+    results: [21114, 21115, 21116, 21117].map((port) =>
+        ({ port, proto: 'tcp', reachable: true, detail: '' }))
+}) + '\n';
+
+const STUB = (run, hostkey, probe) => {
+    const spawn = {
+        'pilot-exec --detect': DETECTION,
+        'pilot-exec --run': run,
+        'pilot-exec --probe-ports': probe === undefined ? PROBE_ALL_OK : probe
+    };
     if (hostkey !== undefined) spawn['pilot-exec --check-hostkey'] = hostkey;
     return { spawn };
 };
@@ -121,6 +135,24 @@ async function visible(page, selector) {
 // Waits for a specific element's text to settle, rather than merely existing
 // — the fingerprint <pre> is always in the DOM (unconditionally rendered),
 // only its text content changes once checkHostKey()'s real spawn resolves.
+// Polls a SNAPSHOT until it satisfies the predicate, and returns that same
+// snapshot. The point is atomicity: a caller asserting a simultaneous invariant
+// ("these two are never both showing") must read both facts from one moment,
+// not from two round trips with the page free to move in between. waitForText
+// below cannot do that -- it waits, then reads again.
+async function waitForCondition(page, take, predicate, label) {
+    const deadline = Date.now() + WAIT;
+    let last = null;
+    for (;;) {
+        last = await take();
+        if (predicate(last)) return last;
+        if (Date.now() > deadline)
+            throw new Error(`${label || 'condition'} never held within ${WAIT}ms; last: ` +
+                JSON.stringify(last));
+        await new Promise((r) => setTimeout(r, 50));
+    }
+}
+
 async function waitForText(page, selector, predicate, label) {
     try {
         await page.waitForFunction(
@@ -238,14 +270,49 @@ async function runBody(ctx) {
             assertOk(await visible(page, '[data-testid="pane-hostkey"]'),
                 'an unconfirmed fingerprint must block the wizard');
             // Once refused, the red error carries the same instruction, so the
-            // grey hint stands down rather than saying it twice. Wait for the
-            // error to actually render before reading the hint: visible() polls
-            // and would otherwise catch the frame before Alpine re-renders,
-            // which is a race, not a result.
-            assertMatch(await waitForText(page, '[data-testid="hostkey-error"]',
-                (t) => /Confirm the host key/i.test(t), 'hostkey-error'), /Confirm the host key/i);
-            assertOk(!(await page.isVisible('[data-testid="hostkey-pending"]')),
-                'the hint and the error must not both say the same thing');
+            // grey hint stands down rather than saying it twice.
+            //
+            // This is a SIMULTANEOUS invariant -- "these two are never both
+            // showing" -- and reading it as two separate round trips is what
+            // made it flaky: the page is free to move between the two reads, so
+            // the assertion was about two different moments in time. Waiting for
+            // the error first (the previous attempt) narrowed the window without
+            // closing it. One evaluate, one snapshot, both facts: now it either
+            // holds or it does not, and the answer is the same every run.
+            const pair = await waitForCondition(page, () => page.evaluate(() => {
+                const el = (id) => document.querySelector('[data-testid="' + id + '"]');
+                const err = el('hostkey-error');
+                const pend = el('hostkey-pending');
+                const root = document.querySelector('#pilot-setup');
+                const d = root && root._x_dataStack ? root._x_dataStack[0] : null;
+                return {
+                    errText: err ? (err.textContent || '').trim() : '',
+                    pendingVisible: !!pend && pend.offsetParent !== null,
+                    pendDisplay: pend ? (pend.style.display || '(unset)') : '(missing)',
+                    state: d ? {
+                        step: d.step, busy: d.busy,
+                        errorsHostkey: d.errors ? d.errors.hostkey : '(no errors obj)',
+                        hostkey: d.hostkey
+                    } : '(no alpine data)'
+                };
+            // Waits for the pair to SETTLE, and both facts come from one
+            // snapshot so a settled state is really settled.
+            //
+            // Not "never both, at any instant": x-text on the error and x-show
+            // on the hint are separate Alpine effects over the same state, and
+            // Alpine batches DOM mutations -- so a single frame with the error
+            // already painted and the hint not yet hidden is an implementation
+            // artifact, not something a user can perceive. Asserting the
+            // instantaneous version made this check fail roughly one run in ten
+            // for a condition the product does not actually violate. The real
+            // requirement is that the user is never LEFT looking at both, and
+            // that is what this asserts; if it never settles, the throw carries
+            // the last snapshot and the component state with it.
+            }), (v) => /Confirm the host key/i.test(v.errText) && !v.pendingVisible,
+                'the error to appear and the hint to stand down');
+            assertMatch(pair.errText, /Confirm the host key/i);
+            assertOk(!pair.pendingVisible,
+                'the hint and the error must not both say the same thing: ' + JSON.stringify(pair));
             const call = await spawnedCheckHostkey(page);
             assertOk(call, '--check-hostkey was never spawned by the real UI flow');
             assertEqual(JSON.parse(call.input).host, 'rd.example.com', 'the request carried the typed host');
@@ -510,6 +577,7 @@ async function runBody(ctx) {
         const stub = {
             spawn: {
                 'pilot-exec --detect': DETECTION, 'pilot-exec --run': RUN_OK,
+                'pilot-exec --probe-ports': PROBE_ALL_OK,
                 'pilot-exec --check-hostkey': HOSTKEY_UNKNOWN(fp),
                 // writeSshCredential() (js/core/servers.js's writeSecret())
                 // chmods and chowns the secret file after writing it — no
@@ -622,6 +690,7 @@ async function runBody(ctx) {
     await check("FINDING 1: the wizard's TLS step drives a real Let's Encrypt plan -- " +
         'the emitted plan carries the tls-* steps and the ports step switches to 443', async () => {
         await withPage(ctx, { spawn: { 'pilot-exec --detect': DETECTION, 'pilot-exec --run': RUN_OK,
+            'pilot-exec --probe-ports': PROBE_ALL_OK,
             'getent ahostsv4': GETENT_OK } }, async (page) => {
             await page.selectOption('[data-testid="target"]', 'local');
             await page.click('[data-testid="next"]');
@@ -689,6 +758,7 @@ async function runBody(ctx) {
         'argv, the DOM, storage, the transcript or the written server record', async () => {
         const TOKEN = 'DuckSecret-0123456789';
         await withPage(ctx, { spawn: { 'pilot-exec --detect': DETECTION, 'pilot-exec --run': RUN_OK,
+            'pilot-exec --probe-ports': PROBE_ALL_OK,
             'getent ahostsv4': GETENT_OK, chmod: '', chown: '',
             'find /etc/pilot/servers -maxdepth 1 -type f -name *.json': '/etc/pilot/servers/local.json\n' },
         files: {} }, async (page) => {
@@ -752,6 +822,7 @@ async function runBody(ctx) {
         'so no rate-limit attempt is burnt', async () => {
         for (const [label, getent] of [['pointing elsewhere', GETENT_ELSEWHERE], ['no A record', GETENT_NXDOMAIN]]) {
             await withPage(ctx, { spawn: { 'pilot-exec --detect': DETECTION, 'pilot-exec --run': RUN_OK,
+            'pilot-exec --probe-ports': PROBE_ALL_OK,
                 'getent ahostsv4': getent } }, async (page) => {
                 await page.selectOption('[data-testid="target"]', 'local');
                 await page.click('[data-testid="next"]');
@@ -992,6 +1063,57 @@ async function runBody(ctx) {
         });
     });
 
+    // The handover's verdict must come from a REAL probe of this host, not from
+    // the target's own `ss` output. Before the probe existed the claim was
+    // vacuous; before this scenario existed, nothing drove it end to end.
+    await check('a port the target is listening on but this host cannot reach is reported, not hidden',
+        async () => {
+        const blocked = JSON.stringify({ host: '127.0.0.1', results: [
+            { port: 21114, proto: 'tcp', reachable: false, detail: 'timed out after 4.0s' },
+            { port: 21115, proto: 'tcp', reachable: true, detail: '' }
+        ] }) + '\n';
+        await withPage(ctx, STUB(RUN_OK, undefined, blocked), async (page) => {
+            await page.selectOption('[data-testid="target"]', 'local');
+            await page.click('[data-testid="next"]');
+            await page.click('[data-testid="run-detect"]');
+            await wait(page, '[data-plan-step]');
+            await page.click('[data-testid="next"]');
+            await page.click('[data-testid="next"]');
+            await page.click('[data-testid="next"]');
+            await page.click('[data-testid="run-start"]');
+            await wait(page, '[data-testid="pane-handover"] [data-testid="handover-status"]');
+            await waitForText(page, '[data-testid="handover-status"]', (t) => t.trim() !== '', 'handover');
+
+            const status = await page.textContent('[data-testid="handover-status"]');
+            assertMatch(status, /21114\/tcp/,
+                'a port this host cannot reach must appear in the verdict: ' + status);
+            assertOk(!/Every required port is reachable/.test(status),
+                'the run succeeded and the target was listening — which is exactly the ' +
+                'situation that used to be reported as a clean finish');
+            // And the REASON, because "dropped" and "refused" need opposite fixes.
+            assertMatch(await page.textContent('[data-testid="blocked-ports"]'),
+                /cloud or edge firewall/i);
+            await shot(page, 'setup-blocked-port');
+        });
+    });
+
+    await check('when every port really is reachable, the verdict says so', async () => {
+        await withPage(ctx, STUB(RUN_OK), async (page) => {
+            await page.selectOption('[data-testid="target"]', 'local');
+            await page.click('[data-testid="next"]');
+            await page.click('[data-testid="run-detect"]');
+            await wait(page, '[data-plan-step]');
+            await page.click('[data-testid="next"]');
+            await page.click('[data-testid="next"]');
+            await page.click('[data-testid="next"]');
+            await page.click('[data-testid="run-start"]');
+            await waitForText(page, '[data-testid="handover-status"]', (t) => t.trim() !== '', 'handover');
+            assertMatch(await page.textContent('[data-testid="handover-status"]'),
+                /Every required port is reachable/);
+            assertEqual((await page.textContent('[data-testid="blocked-ports"]')).trim(), '');
+        });
+    });
+
     // ============================================== FINAL REVIEW, FINDING 2 ==
     //
     // THE DEFECT: registered / registrationError / registeredServerId were
@@ -1068,6 +1190,7 @@ async function runBody(ctx) {
         const stub = {
             spawn: {
                 'pilot-exec --detect': DETECTION, 'pilot-exec --run': RUN_OK,
+                'pilot-exec --probe-ports': PROBE_ALL_OK,
                 'getent ahostsv4': '203.0.113.10 STREAM rd.example.com\n',
                 'find /etc/pilot/servers -maxdepth 1 -type f -name *.json':
                     '/etc/pilot/servers/local.json\n'
