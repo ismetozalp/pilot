@@ -873,6 +873,30 @@
 
     // The one rule this screen exists to enforce: a green "finished" over a
     // console nobody can reach is worse than an honest partial.
+    // "Unreachable" covers two situations that need opposite responses, and
+    // saying only "unreachable" is why a user who HAD opened their firewall was
+    // told to go and open it again:
+    //   timed out         -> the packets never arrived. Something upstream is
+    //                        DROPPING them: a cloud security group or an edge
+    //                        device. The server cannot see this and cannot fix
+    //                        it, and no amount of ufw will change it.
+    //   connection refused -> the packets DID arrive and the host answered. The
+    //                        firewall is fine; nothing is listening on that port.
+    // The distinction is already in the probe's own detail string; it was simply
+    // being thrown away.
+    function blockedReason(detail) {
+        const d = str(detail).toLowerCase();
+        if (d.indexOf('timed out') !== -1 || d.indexOf('timeout') !== -1)
+            return 'dropped before it reached the server — open this port on the cloud or edge ' +
+                'firewall (the server itself cannot do this)';
+        if (d.indexOf('refused') !== -1)
+            return 'the server answered but nothing is listening on this port — the firewall is ' +
+                'not the problem here';
+        if (d.indexOf('unreachable') !== -1 || d.indexOf('no route') !== -1)
+            return 'no route to the server on this port';
+        return d === '' ? '' : detail;
+    }
+
     function handover(exec, reach) {
         const e = (exec && typeof exec === 'object') ? exec : blankExec();
         const list = Array.isArray(reach) ? reach : [];
@@ -886,7 +910,8 @@
             blocked.push({
                 port: Math.floor(p),
                 proto: str(r.proto).toLowerCase() === 'udp' ? 'udp' : 'tcp',
-                scope: str(r.scope) === 'host' ? 'host' : 'cloud'
+                scope: str(r.scope) === 'host' ? 'host' : 'cloud',
+                reason: blockedReason(r.detail)
             });
         }
 
@@ -2103,7 +2128,7 @@
         validateTarget, portRows, awsCommand,
         parseLine, reduce, progress, transcriptText, runPath,
         firstFailure, failureMessage, capturePassword, scrubSecret, scrubLines, SECRET_MASK,
-        handover, passwordGate, manualFor, mergeReach,
+        handover, passwordGate, manualFor, mergeReach, blockedReason,
         runIdFor, splitStream, detectRequest, envelopeCtx, planChoicesFor, requiredPorts, reachFrom,
         notifyServerChanged,
         pilotSetupUi

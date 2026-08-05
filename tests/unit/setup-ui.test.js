@@ -676,7 +676,8 @@ test('a still-blocked port makes handover PARTIAL and names the port', () => {
     ]);
     assert.equal(h.status, 'partial');
     assert.equal(h.kind, 'PORT_BLOCKED');
-    assert.deepEqual(h.blocked, [{ port: 21116, proto: 'udp', scope: 'cloud' }]);
+    assert.deepEqual(h.blocked, [{ port: 21116, proto: 'udp', scope: 'cloud', reason: '' }],
+        'no probe detail means no invented reason');
     assert.ok(h.message.includes('21116/udp'));
     assert.match(h.message, /partial/i);
 });
@@ -2495,7 +2496,8 @@ test('a blocked port makes the handover say so instead of claiming success', () 
     const h = UI.handover({ status: 'ok', kind: null, steps: [] }, merged);
     assert.match(h.message, /21114\/tcp/);
     assert.ok(!/Every required port is reachable/.test(h.message));
-    assert.deepEqual(h.blocked, [{ port: 21114, proto: 'tcp', scope: 'cloud' }]);
+    assert.deepEqual(h.blocked, [{ port: 21114, proto: 'tcp', scope: 'cloud',
+        reason: UI.blockedReason('timed out after 4.0s') }]);
 });
 
 test('probeReach(): a real probe result becomes reach rows; udp is never called reachable', async () => {
@@ -2591,5 +2593,53 @@ test('start(): the reachability probe really runs, and its verdict reaches the h
     assert.match(c.handoverResult.message, /21114\/tcp/,
         'the blocked port must reach the verdict: ' + c.handoverResult.message);
     assert.ok(!/Every required port is reachable/.test(c.handoverResult.message));
-    assert.deepEqual(c.handoverResult.blocked, [{ port: 21114, proto: 'tcp', scope: 'cloud' }]);
+    assert.deepEqual(c.handoverResult.blocked, [{ port: 21114, proto: 'tcp', scope: 'cloud',
+        reason: UI.blockedReason('timed out after 4.0s') }]);
+});
+
+// -------------- "unreachable" is two different problems with opposite fixes
+
+test('blockedReason: a dropped port and a refused one are told apart', () => {
+    // The report that prompted this: "why 21114 unreachable, we enabled all
+    // ports you asked". Both ports were reported the same way, but they were
+    // not the same problem -- and only one of them was about a firewall.
+    const dropped = UI.blockedReason('timed out after 4.0s');
+    assert.match(dropped, /cloud or edge firewall/i);
+    assert.match(dropped, /server itself cannot do this/i,
+        'it must say the server cannot fix this, or the user goes and edits ufw again');
+
+    const refused = UI.blockedReason('[Errno 111] Connection refused');
+    assert.match(refused, /nothing is listening/i);
+    assert.match(refused, /firewall is not the problem/i);
+    assert.notEqual(dropped, refused, 'the two must not read the same');
+
+    assert.match(UI.blockedReason('[Errno 113] No route to host'), /no route/i);
+    // Anything unrecognised is passed through rather than invented or dropped.
+    assert.equal(UI.blockedReason('something odd'), 'something odd');
+    for (const empty of ['', null, undefined]) assert.equal(UI.blockedReason(empty), '');
+});
+
+test('handover carries the reason per blocked port, not just the number', () => {
+    const merged = UI.mergeReach([], [
+        { port: 21114, proto: 'tcp', reachable: false, scope: 'cloud', detail: 'timed out after 4.0s' },
+        { port: 443, proto: 'tcp', reachable: false, scope: 'cloud', detail: '[Errno 111] Connection refused' }
+    ]);
+    const h = UI.handover({ status: 'ok', kind: null, steps: [] }, merged);
+    const by = {};
+    h.blocked.forEach((b) => { by[b.port] = b; });
+    assert.match(by[21114].reason, /cloud or edge firewall/i);
+    assert.match(by[443].reason, /nothing is listening/i);
+    // A verdict with no measurement behind it must not invent a reason.
+    const noDetail = UI.handover({ status: 'ok', kind: null, steps: [] },
+        [{ port: 21117, proto: 'tcp', reachable: false, scope: 'host' }]);
+    assert.equal(noDetail.blocked[0].reason, '');
+});
+
+test('index.html: the blocked list shows the reason, and falls back to the scope', () => {
+    const html = fs.readFileSync(path.join(ROOT, 'index.html'), 'utf8');
+    const pane = html.slice(html.indexOf('data-testid="blocked-ports"'), html.indexOf('data-testid="registered"'));
+    assert.match(pane, /x-show="b\.reason"/, 'the reason must be rendered when there is one');
+    assert.match(pane, /b\.reason/);
+    assert.match(pane, /x-show="!b\.reason"[\s\S]{0,60}b\.scope/,
+        'and with no reason it must still say something rather than nothing');
 });

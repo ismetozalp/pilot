@@ -318,9 +318,16 @@
           <div x-show="isStep('handover')" data-testid="pane-handover">
             <p data-testid="handover-status" :data-status="handoverResult ? handoverResult.status : 'none'"
                x-text="handoverResult ? handoverResult.message : ''"></p>
+            <!-- The reason matters more than the fact: "dropped" and "refused"
+                 need opposite responses, and reporting only "unreachable" sent a
+                 user who had already opened their firewall back to open it
+                 again. -->
             <ul data-testid="blocked-ports">
               <template x-for="b in (handoverResult ? handoverResult.blocked : [])" :key="b.port + b.proto">
-                <li x-text="b.port + '/' + b.proto + ' (' + b.scope + ')'"></li></template>
+                <li><strong x-text="b.port + '/' + b.proto"></strong>
+                  <span x-show="b.reason" x-text="' — ' + b.reason"></span>
+                  <span class="text-secondary" x-show="!b.reason" x-text="' (' + b.scope + ')'"></span>
+                </li></template>
             </ul>
 
             <!-- Registration outcome (task 34). registerServer() writes the
