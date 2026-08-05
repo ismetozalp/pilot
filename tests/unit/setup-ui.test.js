@@ -2258,3 +2258,121 @@ test('start(): the generated password never survives in the transcript or the pe
             'the persisted run file at ' + w.path + ' still contains the password');
     assert.ok(written.length > 0, 'guard: nothing was persisted, so this proved nothing');
 });
+
+// ------------------------------- the stale generated password (field report)
+
+test('the captured password is a convenience: a rejected sign-in asks for the real one', async () => {
+    // FROM THE FIELD: the journal's "Admin Password Is:" line is printed ONCE,
+    // at first-boot migration. The password had been changed since, so the
+    // captured value was stale, the login failed with UsernameOrPasswordError,
+    // and -- because the handover pane never rendered `error` -- the button
+    // looked dead. Nothing told the user anything.
+    const c = UI.pilotSetupUi();
+    c.generatedPassword = 'staleSeed1';
+    c.changePassword = true;
+    c.pw = { password: 'a properly long password', confirm: 'a properly long password' };
+
+    const attempts = [];
+    await withFakeCockpit({}, async () => {
+        globalThis.PilotApi = {
+            users: {
+                login: (u, p) => {
+                    attempts.push(p);
+                    return Promise.reject(Object.assign(new Error('UsernameOrPasswordError'),
+                        { name: 'PilotError', kind: 'API_AUTH_FAILED' }));
+                }
+            }
+        };
+        try {
+            assert.equal(await c.finish(), false, 'a rejected sign-in must not report success');
+        } finally { delete globalThis.PilotApi; }
+    });
+
+    assert.deepEqual(attempts, ['staleSeed1'], 'it must try the captured one first');
+    assert.equal(c.needCurrentPassword, true, 'and then ask for the current password');
+    assert.equal(c.error.kind, 'API_AUTH_FAILED');
+    assert.match(c.error.message, /first boot|stale/i,
+        'the message must explain WHY the captured one failed: ' + c.error.message);
+    assert.equal(c.finished, false);
+});
+
+test('a supplied current password is used INSTEAD of the stale captured one', async () => {
+    const c = UI.pilotSetupUi();
+    c.generatedPassword = 'staleSeed1';
+    c.currentPassword = 'theRealOne99';
+    c.changePassword = true;
+    c.pw = { password: 'a properly long password', confirm: 'a properly long password' };
+
+    const attempts = [];
+    const reset = [];
+    await withFakeCockpit({}, async () => {
+        globalThis.PilotApi = {
+            users: {
+                login: (u, p) => { attempts.push([u, p]); return Promise.resolve({ token: 'T' }); },
+                resetPassword: (id, pw) => { reset.push([id, pw]); return Promise.resolve(); }
+            },
+            setTransport() {}
+        };
+        globalThis.PilotApiIo = { transport: () => (() => Promise.resolve({ status: 200, body: {} })) };
+        try {
+            await withFakeServers({ read: () => Promise.resolve({ host: 'h', apiPort: 21114, tls: false }) },
+                () => withFakeDocument(() => c.finish()));
+        } finally { delete globalThis.PilotApi; delete globalThis.PilotApiIo; }
+    });
+
+    assert.deepEqual(attempts, [['admin', 'theRealOne99']],
+        'the user-supplied password must win over the stale captured one');
+    assert.deepEqual(reset, [[1, 'a properly long password']]);
+    assert.equal(c.finished, true);
+    assert.equal(c.currentPassword, '', 'neither password may linger after the change');
+    assert.equal(c.generatedPassword, '');
+    assert.equal(c.needCurrentPassword, false);
+});
+
+test('with no password at all, finish() says so instead of dead-ending', async () => {
+    const c = UI.pilotSetupUi();
+    c.changePassword = true;
+    c.generatedPassword = '';
+    c.pw = { password: 'a properly long password', confirm: 'a properly long password' };
+    await withFakeCockpit({}, async () => {
+        globalThis.PilotApi = { users: { login: () => Promise.reject(new Error('never called')) } };
+        try { assert.equal(await c.finish(), false); } finally { delete globalThis.PilotApi; }
+    });
+    assert.equal(c.needCurrentPassword, true);
+    assert.match(c.error.message, /Enter the current one/i);
+});
+
+test('index.html: the handover pane renders finish()\'s failure and offers the current password', () => {
+    const html = fs.readFileSync(path.join(ROOT, 'index.html'), 'utf8');
+    const pane = html.slice(html.indexOf('data-testid="pane-handover"'));
+    // The defect: registrationError, credentialSaveError and pwErrors were all
+    // rendered; `error` -- the one finish() sets -- was not.
+    assert.match(pane, /data-testid="handover-error"[\s\S]{0,80}x-show="error"/);
+    assert.match(pane, /data-testid="handover-error-message"[\s\S]{0,120}error\.message/);
+    const at = pane.indexOf('data-testid="current-pw-block"');
+    assert.ok(at > 0, 'there must be somewhere to type the current password');
+    assert.match(pane.slice(pane.lastIndexOf('<', at), pane.indexOf('>', at) + 1),
+        /x-show="needCurrentPassword"/, 'and it appears only once it is actually needed');
+    assert.match(pane, /<label[^>]*for="pl-current-pw"/, 'labelled, like the other two');
+});
+
+test('index.html: Next is disabled on the last step rather than silently doing nothing', () => {
+    const html = fs.readFileSync(path.join(ROOT, 'index.html'), 'utf8');
+    const at = html.indexOf('data-testid="next"');
+    const el = html.slice(html.lastIndexOf('<', at), html.indexOf('>', at) + 1);
+    assert.match(el, /:disabled="isLastStep\(\)"/);
+});
+
+test('isLastStep(): true only on the final visible step, for both targets', () => {
+    const c = UI.pilotSetupUi();
+    c.choices.target = 'local';
+    for (const id of UI.STEP_IDS.filter((x) => x !== 'hostkey')) {
+        c.step = id;
+        assert.equal(c.isLastStep(), id === 'handover', id);
+    }
+    c.choices.target = 'ssh';
+    c.step = 'hostkey';
+    assert.equal(c.isLastStep(), false, 'hostkey is visible for remote, and is not last');
+    c.step = 'handover';
+    assert.equal(c.isLastStep(), true);
+});

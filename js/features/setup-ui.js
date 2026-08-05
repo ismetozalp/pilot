@@ -1269,6 +1269,9 @@
             // chose is a bad thing to leave in place, but it is the user's call.
             changePassword: true,
             showGenerated: false,
+            // Filled in by the user when the captured one is stale or absent.
+            currentPassword: '',
+            needCurrentPassword: false,
 
             // Set by start()/checkDns() only. tlsFailure carries
             // acmeFailureFrom()'s classified verdict for a failed tls-* step.
@@ -1280,6 +1283,12 @@
                     ? STEP_TITLES[str(id)] : str(id);
             },
             isStep(id) { return this.step === id; },
+            // nextStep() clamps at the end, so on the last step Next silently
+            // did nothing -- indistinguishable from a broken button.
+            isLastStep() {
+                const v = visibleSteps(this);
+                return v.length > 0 && v[v.length - 1] === this.step;
+            },
             // describe() carries PilotErrors' remediation TOKEN ('none',
             // 'fix-dns', …). Binding that token straight to x-text printed a
             // bold "none" under every GENERIC failure — including the
@@ -1860,16 +1869,41 @@
                 const Api = root ? root.PilotApi : null;
                 if (!Api || !Api.users || typeof Api.users.login !== 'function')
                     throw fail('API_UNREACHABLE', 'The API client is not loaded, so the password cannot be changed.');
-                if (!this.generatedPassword)
-                    throw fail('API_UNREACHABLE',
-                        'Pilot did not capture the generated administrator password, so it cannot sign in to change it. ' +
-                        'Set it yourself in the RustDesk admin console.');
+                // "Admin Password Is:" is printed ONCE, at first-boot migration.
+                // It is therefore stale the moment anyone changes it, and absent
+                // entirely on a server Pilot adopted rather than installed --
+                // which is exactly what happened in the field: the journal still
+                // carried the original seed, the password had since been
+                // changed, and the login failed with UsernameOrPasswordError.
+                // So the captured value is a CONVENIENCE, not a requirement: the
+                // user can always supply the current one instead.
+                const signInWith = str(this.currentPassword) || str(this.generatedPassword);
+                if (!signInWith) {
+                    this.needCurrentPassword = true;
+                    throw fail('API_AUTH_FAILED',
+                        'Pilot has no administrator password to sign in with. Enter the current one below.');
+                }
                 // /api/admin/login needs no token, so the anonymous transport
                 // app.js already wired is enough to obtain one.
-                const session = await Api.users.login(ADMIN_USER, this.generatedPassword);
+                let session = null;
+                try {
+                    session = await Api.users.login(ADMIN_USER, signInWith);
+                } catch (e) {
+                    this.needCurrentPassword = true;
+                    throw fail('API_AUTH_FAILED',
+                        'The API server did not accept that administrator password. ' +
+                        (this.currentPassword
+                            ? 'Check it and try again.'
+                            : 'The one Pilot read from the journal is printed only at first boot, so it is ' +
+                              'stale if the password has been changed since. Enter the current one below.'),
+                        { cause: str(e && e.message) });
+                }
                 const token = session && (session.token || (session.data && session.data.token));
-                if (!token)
-                    throw fail('API_AUTH_FAILED', 'The API server did not accept the generated administrator password.');
+                if (!token) {
+                    this.needCurrentPassword = true;
+                    throw fail('API_AUTH_FAILED',
+                        'The API server did not accept that administrator password. Enter the current one below.');
+                }
 
                 // The token is baked into a transport at construction (api-io.js
                 // keeps it out of every other module by design), so using it
@@ -1912,8 +1946,10 @@
                 try {
                     await writer(str(this.pw.password));
                     this.pw = { password: '', confirm: '' };
-                    // Once changed, the generated one is dead: stop showing it.
+                    // Once changed, the old ones are dead: stop holding either.
                     this.generatedPassword = '';
+                    this.currentPassword = '';
+                    this.needCurrentPassword = false;
                     this.finished = true;
                     return true;
                 } catch (e) {

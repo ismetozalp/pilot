@@ -359,7 +359,27 @@
                 Set a new administrator password now</label>
             </div>
 
+            <!-- finish() records its failure in `error`, and the handover pane
+                 rendered registrationError, credentialSaveError and pwErrors but
+                 NEVER this one -- so a rejected sign-in set the field and showed
+                 nothing, and the button looked dead. That is exactly what
+                 happened in the field. -->
+            <div class="alert alert-danger" data-testid="handover-error" x-show="error">
+              <p class="mb-1" data-testid="handover-error-message" x-text="error ? error.message : ''"></p>
+              <p class="mb-0 fw-semibold" data-testid="handover-remediation"
+                 x-show="remediationText(error)" x-text="remediationText(error)"></p>
+            </div>
+
             <div x-show="changePassword" data-testid="pw-fields">
+              <!-- The journal's "Admin Password Is:" line is printed once, at
+                   first-boot migration. It is stale the moment anyone changes
+                   the password, and absent on an adopted server -- so when it is
+                   refused, ask instead of dead-ending. -->
+              <div x-show="needCurrentPassword" data-testid="current-pw-block">
+                <label class="form-label mb-1" for="pl-current-pw">Current administrator password</label>
+                <input class="form-control mb-2" id="pl-current-pw" data-testid="current-password"
+                       type="password" autocomplete="current-password" x-model="currentPassword">
+              </div>
               <label class="form-label mb-1" for="pl-new-pw">New password</label>
               <input class="form-control mb-2" id="pl-new-pw" data-testid="new-password"
                      type="password" autocomplete="new-password" x-model="pw.password">
@@ -385,7 +405,7 @@
               (journalctl -u rustdesk-api.service | grep 'Admin Password Is') before signing in.</p>
 
             <button class="btn btn-primary" data-testid="finish" @click="finish()" :disabled="busy"
-                    x-text="changePassword ? 'Change password and finish' : 'Finish'"></button>
+                    x-text="busy ? 'Working…' : (changePassword ? 'Change password and finish' : 'Finish')"></button>
             <p class="text-danger mb-0" data-testid="pw-error"
                x-text="(pwErrors.password || '') + ' ' + (pwErrors.confirm || '')"></p>
             <p data-testid="finished" x-show="finished">Setup finished.</p>
@@ -393,7 +413,10 @@
 
           <div class="mt-3">
             <button class="btn btn-outline-secondary" data-testid="back" @click="back()">Back</button>
-            <button class="btn btn-outline-primary" data-testid="next" @click="next()">Next</button>
+            <!-- nextStep() clamps at the end, so on the last step this did
+                 nothing at all and read as a broken button. -->
+            <button class="btn btn-outline-primary" data-testid="next" @click="next()"
+                    :disabled="isLastStep()">Next</button>
           </div>
         </div>
         <div x-show="tab === 'devices'"     id="pilot-devices"></div>
