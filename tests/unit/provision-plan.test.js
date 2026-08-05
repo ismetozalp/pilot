@@ -327,10 +327,94 @@ test('unrecognised arch strings are rejected as ARCH_UNSUPPORTED', () => {
 
 // ------------------------------------------------------------- C17 facts
 
-test('C17: the tarball is unpacked with --strip-components=1', () => {
+test('C17: the tarball is unpacked with --strip-components=2', () => {
+    // CORRECTED from 1, against the real v2.7 assets (both arm64 and amd64).
+    // Every member is named "./release/<x>" -- TWO leading components, not one.
+    // Verified by extracting the actual releases:
+    //   --strip-components=1 -> /opt/rustdesk-api/release/apimain
+    //   --strip-components=2 -> /opt/rustdesk-api/apimain
+    // The unit's ExecStart is /opt/rustdesk-api/apimain, so stripping one left
+    // it pointing at nothing: systemd crash-looped with status=203/EXEC while
+    // `systemctl enable --now` still exited 0, and the failure surfaced ten
+    // steps later as `verify` refusing to connect to 21114.
     const plan = P.build(detAdopt(), choices());
     assert.deepEqual(byId(plan, 'install').argv,
-        ['tar', 'xzf', '/var/cache/pilot/linux-amd64.tar.gz', '-C', '/opt/rustdesk-api', '--strip-components=1']);
+        ['tar', 'xzf', '/var/cache/pilot/linux-amd64.tar.gz', '-C', '/opt/rustdesk-api', '--strip-components=2']);
+});
+
+test('the unpack step and the unit must agree on where the binary lands', () => {
+    // The defect was not the number 1 by itself -- it was that TWO steps
+    // disagreed about one path and nothing compared them. This is that
+    // comparison, so the pair cannot drift apart again silently.
+    const plan = P.build(detAdopt(), choices());
+    const unit = byId(plan, 'unit').write.content;
+    const execStart = /\nExecStart=(\S+)\n/.exec(unit);
+    assert.ok(execStart, 'the unit must have an ExecStart');
+    const binary = execStart[1];
+
+    // A verification STEP, not a `check`: `check` is a pre-condition idempotency
+    // guard (satisfied means SKIP), so it can never verify what a step produced.
+    const verify = byId(plan, 'install-verify');
+    assert.ok(verify, 'the unpack must be followed by a step that proves it worked');
+    assert.equal(verify.mutating, false);
+    assert.deepEqual(verify.argv, ['test', '-x', binary],
+        'the verification must test the EXACT path the unit will exec, or a layout ' +
+        'change becomes a mystery connection failure ten steps later');
+    // And it must come after the unpack, or it proves nothing.
+    const ids = plan.steps.map((x) => x.id);
+    assert.ok(ids.indexOf('install') < ids.indexOf('install-verify'));
+    assert.ok(ids.indexOf('install-verify') < ids.indexOf('unit-enable'),
+        'catching it before the service is started is the whole point');
+
+    // And the binary must sit directly in the working directory the unit pins,
+    // because config.yaml, resources/ and data/ are all resolved relative to it.
+    const wd = /\nWorkingDirectory=(\S+)\n/.exec(unit);
+    assert.ok(wd);
+    assert.equal(binary, wd[1] + '/apimain');
+});
+
+test('the unpack must come BEFORE the config write, because the tarball ships one too', () => {
+    // --strip-components=2 lands the archive's own ./release/conf/config.yaml at
+    // exactly the path Pilot writes: /opt/rustdesk-api/conf/config.yaml. With
+    // strip=1 it landed under release/ and could never collide, so this ordering
+    // was free before and is load-bearing now. If `configure` ever moved above
+    // `install`, the archive's stock config (show-swagger: 0, no hbbs wiring)
+    // would silently replace Pilot's -- and the `verify` step, which fetches
+    // /admin/swagger/doc.json and only works because Pilot writes
+    // show-swagger: 1, would 404 with nothing explaining why.
+    const ids = P.build(detAdopt(), choices()).steps.map((x) => x.id);
+    assert.ok(ids.indexOf('install') < ids.indexOf('configure'),
+        'the config write must come after the unpack that would otherwise overwrite it');
+    assert.ok(ids.indexOf('configure') < ids.indexOf('verify'),
+        'and before the step that depends on what it configured');
+});
+
+test('the config Pilot writes is what makes the verify step possible', () => {
+    // verify fetches /admin/swagger/doc.json. VERIFIED against the real v2.7
+    // server: that path 404s with show-swagger: 0 (the archive's default) and
+    // returns 200 with show-swagger: 1. The two are one fact, in two files.
+    const plan = P.build(detAdopt(), choices());
+    const cfg = byId(plan, 'configure').write.content;
+    assert.match(cfg, /\n  show-swagger: 1\n/,
+        'without this the verify step below cannot succeed');
+    assert.ok(byId(plan, 'verify').argv.some((a) => /\/admin\/swagger\/doc\.json$/.test(a)),
+        'verify must probe the document show-swagger enables');
+});
+
+test('enable --now is not trusted on its own: the service must really be active', () => {
+    // `systemctl enable --now` exits 0 for a unit that started and immediately
+    // died -- with Restart=on-failure it sits in "activating (auto-restart)",
+    // which systemd reports as a successful start. A crash-looping service was
+    // therefore recorded as "ok exit=0".
+    const plan = P.build(detAdopt(), choices());
+    const enable = byId(plan, 'unit-enable');
+    assert.deepEqual(enable.argv, ['systemctl', 'enable', '--now', 'rustdesk-api.service']);
+    const active = byId(plan, 'unit-active');
+    assert.ok(active, 'starting a service and never asking whether it runs is not a check');
+    assert.equal(active.mutating, false);
+    assert.deepEqual(active.argv, ['systemctl', 'is-active', '--quiet', 'rustdesk-api.service']);
+    const ids = plan.steps.map((x) => x.id);
+    assert.ok(ids.indexOf('unit-enable') < ids.indexOf('unit-active'));
 });
 
 test('C17: the generated unit sets WorkingDirectory=/opt/rustdesk-api', () => {

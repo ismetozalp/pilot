@@ -354,9 +354,24 @@
                 why: 'The API server must not run as root.',
                 argv: ['useradd', '--system', '--home-dir', API_DIR, '--shell', '/usr/sbin/nologin', API_USER],
                 check: { argv: ['id', '-u', API_USER], expect: 'zero' } }));
+            // VERIFIED against the real v2.7 assets, both arm64 and amd64: every
+            // member is named "./release/<x>", so there are TWO leading components
+            // to strip, not one. Stripping one left everything under
+            // <API_DIR>/release/, so ExecStart=<API_DIR>/apimain pointed at
+            // nothing and the unit crash-looped with status=203/EXEC.
             steps.push(step({ id: 'install', title: 'Unpack the API server into ' + API_DIR, mutating: true,
-                why: 'Every entry in the tarball is under ./release/, so one leading path component is stripped.',
-                argv: ['tar', 'xzf', tgz, '-C', API_DIR, '--strip-components=1'] }));
+                why: 'Every entry in the tarball is named ./release/<x>, so the two leading path components are stripped.',
+                argv: ['tar', 'xzf', tgz, '-C', API_DIR, '--strip-components=2'] }));
+            // A step of its own, NOT a `check`: `check` is a pre-condition
+            // idempotency guard -- satisfied means SKIP -- so it can never verify
+            // what a step produced. Without this the wrong strip depth surfaced
+            // ten steps later as `verify` refusing to connect to 21114, with
+            // nothing on screen naming the cause. Now the step that got it wrong
+            // is the step that fails.
+            steps.push(step({ id: 'install-verify', title: 'Confirm the API binary landed where the unit expects',
+                mutating: false,
+                why: 'The unit execs ' + API_DIR + '/apimain; if the archive layout ever changes, this is where it is caught.',
+                argv: ['test', '-x', API_DIR + '/apimain'] }));
             steps.push(step({ id: 'install-data', title: 'Create ' + API_DIR + '/data', mutating: true,
                 why: 'The SQLite database is created at ./data/rustdeskapi.db relative to the working directory.',
                 argv: ['install', '-d', '-m', '0750', API_DIR + '/data'] }));
@@ -379,6 +394,16 @@
             steps.push(step({ id: 'unit-enable', title: 'Enable and start rustdesk-api', mutating: true,
                 why: 'enable --now starts the service and survives a reboot; it does not restart an already-running service.',
                 argv: ['systemctl', 'enable', '--now', 'rustdesk-api.service'] }));
+            // `systemctl enable --now` exits 0 for a unit that started and then
+            // died: with Restart=on-failure it sits in "activating
+            // (auto-restart)", which systemd reports as a successful start. That
+            // is how a service crash-looping on a missing binary was recorded as
+            // "ok exit=0". Type=simple means a healthy unit is active the moment
+            // start returns, so asking immediately is fair.
+            steps.push(step({ id: 'unit-active', title: 'Confirm rustdesk-api is actually running',
+                mutating: false,
+                why: 'enable --now reports success for a service that started and immediately died.',
+                argv: ['systemctl', 'is-active', '--quiet', 'rustdesk-api.service'] }));
         } else {
             // detection.api.install is 'binary' (found at the same /opt/rustdesk-api
             // layout Pilot itself installs to — the detect script's only positive
