@@ -886,3 +886,21 @@ test('index.html loads provision-plan.js after tls.js', () => {
     assert.ok(srcs.indexOf('js/core/tls.js') < srcs.indexOf('js/core/provision-plan.js'),
         'provision-plan.js must load after tls.js');
 });
+
+test('the verify step is a health check, not a document download', () => {
+    // It printed the whole swagger document: 221 KB, ~6000 lines, which Pilot
+    // then truncated at 2000 -- burying every other step in the transcript the
+    // operator has to read and paste into bug reports. All the step needs is
+    // "did it answer 200".
+    const v = byId(P.build(detAdopt(), choices()), 'verify');
+    assert.ok(v.argv.indexOf('-o') !== -1, 'the body must be discarded');
+    assert.equal(v.argv[v.argv.indexOf('-o') + 1], '/dev/null');
+    const w = v.argv.indexOf('-w');
+    assert.ok(w !== -1, 'and something must be printed, or the step says nothing at all');
+    assert.match(v.argv[w + 1], /%\{http_code\}/);
+    // libexec/pilot-exec refuses any argv element containing a control
+    // character, so a trailing \n in the -w format is rejected at envelope
+    // validation and takes the whole run with it.
+    v.argv.forEach((a) => assert.ok(!/[\x00-\x1f\x7f]/.test(a),
+        'argv element carries a control character: ' + JSON.stringify(a)));
+});

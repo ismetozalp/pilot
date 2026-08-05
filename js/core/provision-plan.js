@@ -473,7 +473,17 @@
         steps.push(step({ id: 'verify', title: 'Wait for the API server to answer', mutating: false,
             why: 'The Swagger document is served only because Pilot writes show-swagger: 1, so this proves both the service and the generated config. ' +
                 'Probes the port the server is actually on: the already-running port when adopted, the chosen port when freshly installed.',
+            // -o /dev/null and -w: this is a HEALTH CHECK -- all it needs is
+            // "did the server answer 200". Without them curl printed the whole
+            // document: 221 KB and ~6000 lines of swagger JSON, which Pilot then
+            // truncated at 2000 lines, drowning every other step in the
+            // transcript the user has to read (and paste into bug reports).
             argv: ['curl', '-fsS', '--retry', '10', '--retry-delay', '2', '--retry-connrefused', '--max-time', '60',
+                // No trailing newline in the format: libexec/pilot-exec refuses
+                // any argv element containing a control character, so a literal
+                // \n here would have been rejected at envelope validation and
+                // taken the whole run with it.
+                '-o', '/dev/null', '-w', 'api answered HTTP %{http_code} in %{time_total}s',
                 'http://127.0.0.1:' + apiPort + '/admin/swagger/doc.json'] }));
         steps.push(step({ id: 'verify-admin', title: 'Capture the generated admin password', mutating: false, secret: true,
             why: 'The API server prints its generated admin password once, into the journal.',

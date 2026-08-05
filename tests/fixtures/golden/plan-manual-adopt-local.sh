@@ -112,7 +112,7 @@ ss -ltun
 
 # [17/18] Wait for the API server to answer
 # The Swagger document is served only because Pilot writes show-swagger: 1, so this proves both the service and the generated config. Probes the port the server is actually on: the already-running port when adopted, the chosen port when freshly installed.
-curl -fsS --retry 10 --retry-delay 2 --retry-connrefused --max-time 60 http://127.0.0.1:21114/admin/swagger/doc.json
+curl -fsS --retry 10 --retry-delay 2 --retry-connrefused --max-time 60 -o /dev/null -w 'api answered HTTP %{http_code} in %{time_total}s' http://127.0.0.1:21114/admin/swagger/doc.json
 
 # [18/18] Capture the generated admin password
 # The API server prints its generated admin password once, into the journal.

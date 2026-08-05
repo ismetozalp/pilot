@@ -43,6 +43,7 @@ import json
 import os
 import re
 import shlex
+import socket
 import subprocess
 import sys
 import tempfile
@@ -65,7 +66,13 @@ EXIT_TRANSPORT = 7
 RUNS_DIR = os.environ.get("PILOT_RUNS_DIR", "/var/lib/pilot/runs")
 KNOWN_HOSTS = os.environ.get("PILOT_KNOWN_HOSTS", "/etc/pilot/known_hosts")
 
-MODES = ("--run", "--detect", "--check-hostkey", "--print-plan", "--selftest-redact")
+# A blocked port must not hold the wizard for long: six ports at 4s each is
+# the worst case, and a security group drops rather than refuses, so the
+# timeout is what is actually measured.
+PROBE_TIMEOUT = 4.0
+
+MODES = ("--run", "--detect", "--check-hostkey", "--print-plan", "--selftest-redact",
+         "--probe-ports")
 
 # Handlers are registered at the bottom of the file as they are implemented.
 # Nothing ever replaces an entry — each mode is registered exactly once.
@@ -1437,6 +1444,75 @@ def cmd_detect(stdin, out):
     return EXIT_OK
 
 
+PROBE_KEYS = ("host", "ports")
+PROBE_PORT_KEYS = ("port", "proto")
+
+
+def cmd_probe_ports(stdin, out):
+    """Can THIS host reach those ports on that target?
+
+    The provisioning plan's `reachability` step runs `ss -ltun` ON THE TARGET,
+    which proves only that something is listening there. The wizard then claimed
+    "Every required port is reachable" -- a claim nothing ever tested, because
+    the transcript scanner looked for the words blocked/unreachable/closed and
+    `ss` never says any of them. So the verdict was vacuously true, and stayed
+    true on a host whose cloud security group blocked the API port outright.
+
+    A listening socket and a reachable one are different facts, and only the
+    second matters to a console that has to talk to it. This measures the second,
+    from where Pilot actually runs. A plain TCP connect needs no privilege; it
+    lives here because it must run on the Cockpit host rather than the target,
+    and this helper is what runs there.
+
+    UDP is reported "unknown", never "reachable": a connectionless probe cannot
+    distinguish open from silently dropped, and guessing would recreate exactly
+    the false confidence this exists to remove.
+    """
+    src = _obj(read_stdin_json(stdin), "request", PROBE_KEYS)
+    host = _text(src["host"], "request.host", 255)
+    if not HOST_RE.match(host):
+        raise Fail(EXIT_BAD_STDIN, "GENERIC",
+                   "request.host is not a valid hostname or address")
+    raw = src["ports"]
+    if not isinstance(raw, list) or not raw:
+        raise Fail(EXIT_BAD_STDIN, "GENERIC", "request.ports must be a non-empty array")
+    if len(raw) > 64:
+        raise Fail(EXIT_BAD_STDIN, "GENERIC", "request.ports has more than 64 entries")
+
+    results = []
+    for index, item in enumerate(raw):
+        entry = _obj(item, "request.ports[%d]" % index, PROBE_PORT_KEYS)
+        port = _int(entry["port"], "request.ports[%d].port" % index, 1, 65535)
+        proto = _text(entry["proto"], "request.ports[%d].proto" % index, 8).lower()
+        if proto not in ("tcp", "udp"):
+            raise Fail(EXIT_BAD_STDIN, "GENERIC",
+                       "request.ports[%d].proto must be 'tcp' or 'udp'" % index)
+        if proto == "udp":
+            results.append({"port": port, "proto": "udp",
+                            "reachable": None, "detail": "udp cannot be probed by connecting"})
+            continue
+        sock = None
+        try:
+            sock = socket.create_connection((host, port), timeout=PROBE_TIMEOUT)
+            results.append({"port": port, "proto": "tcp", "reachable": True, "detail": ""})
+        except socket.timeout:
+            results.append({"port": port, "proto": "tcp", "reachable": False,
+                            "detail": "timed out after %ss" % PROBE_TIMEOUT})
+        except OSError as exc:
+            results.append({"port": port, "proto": "tcp", "reachable": False,
+                            "detail": str(exc)})
+        finally:
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+
+    out.write(json.dumps({"host": host, "results": results}) + "\n")
+    out.flush()
+    return EXIT_OK
+
+
 def cmd_check_hostkey(stdin, out):
     src = _obj(read_stdin_json(stdin), "request", HOSTKEY_KEYS)
     host = _text(src["host"], "request.host", 255)
@@ -1497,6 +1573,7 @@ MODE_HANDLERS["--selftest-redact"] = cmd_selftest_redact
 MODE_HANDLERS["--run"] = cmd_run
 MODE_HANDLERS["--detect"] = cmd_detect
 MODE_HANDLERS["--check-hostkey"] = cmd_check_hostkey
+MODE_HANDLERS["--probe-ports"] = cmd_probe_ports
 
 if __name__ == "__main__":
     sys.exit(main(sys.argv[1:], sys.stdin, sys.stdout, sys.stderr))

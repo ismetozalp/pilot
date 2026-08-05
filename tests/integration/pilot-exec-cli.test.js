@@ -103,10 +103,24 @@ test('every one of the five C3 mode flags is recognised by the parser', () => {
     }
 });
 
-test('the mode list is exactly the five modes C3 pins', () => {
+test('the mode list is exactly the six modes the CLI pins', () => {
+    // C3 pinned five. --probe-ports is the sixth, added deliberately: the
+    // wizard's handover claimed "Every required port is reachable" on the
+    // strength of `ss -ltun` run ON THE TARGET, which proves only that
+    // something is bound there. A listening socket and a reachable one are
+    // different facts, and the reference host proved it -- every port
+    // listening, the API port dropped by a cloud security group, and the
+    // wizard calling that a clean finish. Measuring it requires connecting
+    // FROM the Cockpit host, which is where this helper runs, so this is the
+    // right home for it even though a TCP connect needs no privilege.
     const modes = pyEval(['print(json.dumps(list(px.MODES)))']);
     assert.deepEqual(modes.slice().sort(),
-        ['--check-hostkey', '--detect', '--print-plan', '--run', '--selftest-redact']);
+        ['--check-hostkey', '--detect', '--print-plan', '--probe-ports', '--run', '--selftest-redact']);
+    // Still exactly one handler per mode, registered once -- the property the
+    // original five-mode pin was really protecting.
+    const handlers = pyEval(['print(json.dumps(sorted(px.MODE_HANDLERS.keys())))']);
+    assert.deepEqual(handlers, modes.slice().sort(),
+        'every mode must have a handler, and no handler may exist without a mode');
 });
 
 // --- the redactor self-test (C3) -----------------------------------------

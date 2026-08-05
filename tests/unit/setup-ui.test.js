@@ -2449,3 +2449,147 @@ test('index.html: the target pane offers the resume path, only when there is one
         /x-show="hasRegistered\(\)"/, 'and it must not appear on a first run');
     assert.match(pane, /data-testid="resume-handover"[\s\S]{0,120}resumeHandover\(\)/);
 });
+
+// --------------------------- "every required port is reachable" was untested
+
+test('reachFrom() finds nothing in ss output — which is why the claim was vacuous', () => {
+    // The evidence for the whole fix: `reachability` runs `ss -ltun` ON THE
+    // TARGET, and the transcript scanner looks for blocked/unreachable/closed.
+    // `ss` says none of those, so the scan always returned [] and the handover
+    // always reported success -- on a host whose cloud security group was
+    // dropping the API port outright.
+    const exec = { steps: [{ id: 'reachability', title: 'x', status: 'ok', exit: 0, lines: [
+        { stream: 'stdout', text: 'tcp   LISTEN 0 4096 *:21114  *:*' },
+        { stream: 'stdout', text: 'tcp   LISTEN 0 128  *:21115  *:*' }
+    ] }] };
+    assert.deepEqual(UI.reachFrom(exec), [], 'listening is not reachable');
+    assert.match(UI.handover({ status: 'ok', kind: null, steps: exec.steps }, UI.reachFrom(exec)).message,
+        /Every required port is reachable/,
+        'guard: this is the false claim the probe now prevents');
+});
+
+test('mergeReach: a measured row beats an inferred one, and both are kept', () => {
+    const probed = [{ port: 21114, proto: 'tcp', reachable: false, scope: 'cloud', detail: 'timed out' }];
+    const transcript = [
+        { port: 21114, proto: 'tcp', reachable: true, scope: 'host' },   // must NOT win
+        { port: 21117, proto: 'tcp', reachable: false, scope: 'host' }   // kept: nothing measured it
+    ];
+    const merged = UI.mergeReach(transcript, probed);
+    const row = merged.filter((r) => r.port === 21114);
+    assert.equal(row.length, 1, 'one verdict per port');
+    assert.equal(row[0].reachable, false, 'the connection wins over the guess');
+    assert.equal(row[0].detail, 'timed out');
+    assert.ok(merged.some((r) => r.port === 21117), 'an unmeasured port keeps its transcript verdict');
+
+    for (const bad of [null, undefined, 'x', 7, {}])
+        assert.deepEqual(UI.mergeReach(bad, bad), [], JSON.stringify(bad));
+    assert.deepEqual(UI.mergeReach([{ proto: 'tcp' }], [{ port: 'nope' }]), [],
+        'a row with no usable port is dropped, never counted as blocked');
+});
+
+test('a blocked port makes the handover say so instead of claiming success', () => {
+    const merged = UI.mergeReach([], [
+        { port: 21114, proto: 'tcp', reachable: false, scope: 'cloud', detail: 'timed out after 4.0s' },
+        { port: 21115, proto: 'tcp', reachable: true, scope: 'cloud', detail: '' }
+    ]);
+    const h = UI.handover({ status: 'ok', kind: null, steps: [] }, merged);
+    assert.match(h.message, /21114\/tcp/);
+    assert.ok(!/Every required port is reachable/.test(h.message));
+    assert.deepEqual(h.blocked, [{ port: 21114, proto: 'tcp', scope: 'cloud' }]);
+});
+
+test('probeReach(): a real probe result becomes reach rows; udp is never called reachable', async () => {
+    const c = UI.pilotSetupUi();
+    c.choices.target = 'ssh';
+    c.choices.host = 'rd.example.com';
+    c.required = [{ port: 21114, proto: 'tcp' }, { port: 21116, proto: 'udp' }];
+    let sent = null;
+    const rows = await withFakeCockpit({
+        spawn() {
+            const p = Promise.resolve(JSON.stringify({ host: 'rd.example.com', results: [
+                { port: 21114, proto: 'tcp', reachable: false, detail: 'timed out after 4.0s' },
+                { port: 21116, proto: 'udp', reachable: null, detail: 'udp cannot be probed by connecting' }
+            ] }) + '\n');
+            p.input = (x) => { sent = JSON.parse(x); return p; };
+            p.stream = () => p;
+            return p;
+        }
+    }, () => c.probeReach());
+
+    assert.equal(sent.host, 'rd.example.com', 'a remote target must be probed at its own address');
+    assert.deepEqual(sent.ports, [{ port: 21114, proto: 'tcp' }, { port: 21116, proto: 'udp' }]);
+    assert.equal(rows.length, 1, 'udp yields no verdict at all — unknown is not blocked, and not reachable');
+    assert.deepEqual(rows[0], { port: 21114, proto: 'tcp', reachable: false, scope: 'cloud',
+        detail: 'timed out after 4.0s' });
+});
+
+test('probeReach(): failing to probe is not the same as failing to reach', async () => {
+    // An unavailable helper must not invent a blocked port and turn a good
+    // install into a reported failure.
+    const c = UI.pilotSetupUi();
+    c.choices.target = 'local';
+    c.required = [{ port: 21114, proto: 'tcp' }];
+    const rows = await withFakeCockpit({
+        spawn() {
+            const p = Promise.reject(Object.assign(new Error('not-found'), { problem: 'not-found' }));
+            p.input = () => p; p.stream = () => p;
+            return p;
+        }
+    }, () => c.probeReach());
+    assert.deepEqual(rows, []);
+    // And with nothing required, or no bridge at all, it asks nothing.
+    c.required = [];
+    assert.deepEqual(await withFakeCockpit({ spawn() { throw new Error('must not be called'); } },
+        () => c.probeReach()), []);
+});
+
+test('start(): the reachability probe really runs, and its verdict reaches the handover', async () => {
+    // Mutation proved the helpers prove nothing about the wiring: deleting the
+    // probeReach() call from start() left every other test green -- which is
+    // precisely how "Every required port is reachable" survived being based on
+    // no measurement at all. This drives the real start().
+    const RUN_OK = [
+        '{"t":"run-start","run_id":"20260805T000000Z","transport":"ssh","steps":1}',
+        '{"t":"step-start","id":"reachability","title":"List the ports","cmd":"ss -ltun"}',
+        '{"t":"output","id":"reachability","stream":"stdout","line":"tcp LISTEN 0 4096 *:21114 *:*"}',
+        '{"t":"step-end","id":"reachability","status":"ok","exit":0,"ms":5}',
+        '{"t":"run-end","status":"ok","kind":null}'
+    ].join('\n') + '\n';
+    const PROBE = JSON.stringify({ host: 'rd.example.com', results: [
+        { port: 21114, proto: 'tcp', reachable: false, detail: 'timed out after 4.0s' }
+    ] }) + '\n';
+
+    const spawned = [];
+    const c = await withFakeCockpit({
+        spawn(argv) {
+            const line = Array.isArray(argv) ? argv.join(' ') : String(argv);
+            spawned.push(line);
+            const payload = /--probe-ports/.test(line) ? PROBE : RUN_OK;
+            let onChunk = null;
+            const p = Promise.resolve().then(() => { if (onChunk) onChunk(payload); return payload; });
+            p.input = () => p;
+            p.stream = (fn) => { onChunk = fn; return p; };
+            return p;
+        },
+        file() { return { read: () => Promise.resolve(null), replace: () => Promise.resolve(), close() {} }; }
+    }, async () => {
+        const ui = UI.pilotSetupUi();
+        ui.choices.target = 'ssh';
+        ui.choices.host = 'rd.example.com';
+        ui.required = [{ port: 21114, proto: 'tcp' }];
+        ui.plan = { target: 'ssh', host: 'rd.example.com',
+            steps: [{ id: 'reachability', title: 'List the ports', argv: ['ss', '-ltun'] }] };
+        await ui.start();
+        return ui;
+    });
+
+    assert.ok(spawned.some((l) => /--probe-ports/.test(l)),
+        'start() never probed reachability from this host at all');
+    // The run itself succeeded, and `ss` reported the port as listening -- the
+    // exact situation that used to be called a clean finish.
+    assert.equal(c.exec.status, 'ok');
+    assert.match(c.handoverResult.message, /21114\/tcp/,
+        'the blocked port must reach the verdict: ' + c.handoverResult.message);
+    assert.ok(!/Every required port is reachable/.test(c.handoverResult.message));
+    assert.deepEqual(c.handoverResult.blocked, [{ port: 21114, proto: 'tcp', scope: 'cloud' }]);
+});

@@ -798,6 +798,26 @@
         return str(f.reason) ? head + ': ' + str(f.reason) : head;
     }
 
+    // Rows measured here win over rows inferred from the transcript: one is a
+    // connection, the other is a guess about someone else's words.
+    function mergeReach(fromTranscript, probed) {
+        const out = [];
+        const seen = {};
+        const add = function (r) {
+            if (!r || typeof r !== 'object') return;
+            const p = typeof r.port === 'number' && isFinite(r.port) ? Math.floor(r.port) : null;
+            if (p === null) return;
+            const proto = str(r.proto).toLowerCase() === 'udp' ? 'udp' : 'tcp';
+            const key = proto + ':' + p;
+            if (Object.prototype.hasOwnProperty.call(seen, key)) return;
+            seen[key] = true;
+            out.push(r);
+        };
+        (Array.isArray(probed) ? probed : []).forEach(add);
+        (Array.isArray(fromTranscript) ? fromTranscript : []).forEach(add);
+        return out;
+    }
+
     function progress(exec) {
         const e = (exec && typeof exec === 'object') ? exec : blankExec();
         const steps = Array.isArray(e.steps) ? e.steps : [];
@@ -1545,6 +1565,50 @@
                 }
             },
 
+            // The measurement the handover verdict was always supposed to rest
+            // on: can THIS host open a connection to the ports the plan says are
+            // required? Failure to probe is not failure to reach -- an
+            // unavailable helper yields [] and the verdict falls back to the
+            // transcript, rather than inventing a blocked port.
+            async probeReach() {
+                const want = Array.isArray(this.required) ? this.required : [];
+                if (!want.length || !hasSpawn()) return [];
+                const host = str(this.choices.target) === 'ssh' ? str(this.choices.host) : '127.0.0.1';
+                if (!host) return [];
+                const ports = want
+                    .filter(function (r) { return r && typeof r.port === 'number'; })
+                    .map(function (r) {
+                        return { port: r.port, proto: str(r.proto).toLowerCase() === 'udp' ? 'udp' : 'tcp' };
+                    });
+                if (!ports.length) return [];
+                try {
+                    const p = cockpit.spawn([EXEC, '--probe-ports'],
+                        { superuser: 'require', err: 'message' });
+                    if (typeof p.input === 'function') p.input(JSON.stringify({ host: host, ports: ports }));
+                    const out = await p;
+                    const parsed = JSON.parse(str(out).trim());
+                    const rows = (parsed && Array.isArray(parsed.results)) ? parsed.results : [];
+                    return rows
+                        // `null` means "not probeable" (udp), which is not the
+                        // same as blocked and must not be reported as either.
+                        .filter(function (r) { return r && r.reachable !== null && r.reachable !== undefined; })
+                        .map(function (r) {
+                            return {
+                                port: r.port,
+                                proto: str(r.proto).toLowerCase() === 'udp' ? 'udp' : 'tcp',
+                                reachable: r.reachable === true,
+                                // The plan opened the host firewall itself, so a
+                                // port still unreachable from here is upstream:
+                                // a cloud security group or an edge device.
+                                scope: 'cloud',
+                                detail: str(r.detail)
+                            };
+                        });
+                } catch (e) {
+                    return [];
+                }
+            },
+
             async detect() {
                 if (this.busy) return false;
                 this.busy = true;
@@ -1752,7 +1816,17 @@
                     this.error = describe(fail('GENERIC', failureMessage(failed)));
 
                 await this.persist(this.runId, raw);
-                this.reach = reachFrom(this.exec);
+                // reachFrom() scans the transcript for a port the TARGET called
+                // blocked. `ss -ltun` never uses that word, so it always found
+                // nothing and the handover always said "Every required port is
+                // reachable" -- true of no measurement whatsoever. A listening
+                // socket is not a reachable one: on the reference host every
+                // port was listening while the cloud security group dropped the
+                // API port outright, and the wizard called that a clean finish.
+                // So the transcript scan stays (a target that DOES report a
+                // blocked port is still believed) and a real probe from this
+                // host is merged over it.
+                this.reach = mergeReach(reachFrom(this.exec), await this.probeReach());
                 this.handoverResult = handover(this.exec, this.reach);
                 // A failed tls-* step is classified into a C6 kind rather than
                 // left as "exit 1": a rate limit, a DNS mismatch and a generic
@@ -2029,7 +2103,7 @@
         validateTarget, portRows, awsCommand,
         parseLine, reduce, progress, transcriptText, runPath,
         firstFailure, failureMessage, capturePassword, scrubSecret, scrubLines, SECRET_MASK,
-        handover, passwordGate, manualFor,
+        handover, passwordGate, manualFor, mergeReach,
         runIdFor, splitStream, detectRequest, envelopeCtx, planChoicesFor, requiredPorts, reachFrom,
         notifyServerChanged,
         pilotSetupUi

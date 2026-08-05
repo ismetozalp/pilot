@@ -42,7 +42,7 @@ let unavailable = MISSING.length ? 'not on PATH: ' + MISSING.join(', ') : false;
 const CONTAINERFILE = [
     'FROM docker.io/library/debian:12-slim',
     'RUN apt-get update && apt-get install -y --no-install-recommends \\',
-    '      openssh-server python3 procps coreutils ca-certificates sudo \\',
+    '      openssh-server python3 procps coreutils ca-certificates sudo iproute2 \\',
     '    && rm -rf /var/lib/apt/lists/*',
     'RUN mkdir -p /run/sshd && ssh-keygen -A \\',
     "    && sed -i 's/^#*PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config",
@@ -939,4 +939,73 @@ test('ssh: sudo that demands a password uses it, and it never reaches argv',
     // transcript is something users paste into bug reports.
     assert.ok(!run.raw.includes(SECRET), 'the sudo password leaked into the transcript');
     assert.ok(!run.err.includes(SECRET), 'the sudo password leaked into stderr');
+});
+
+// --- --probe-ports: reachable is not the same as listening -----------------
+//
+// The provisioning plan's `reachability` step runs `ss -ltun` ON THE TARGET,
+// which proves only that something is bound there. The wizard nonetheless
+// reported "Every required port is reachable" -- a claim nothing tested. On the
+// reference host every port was listening while the cloud security group
+// dropped the API port outright, and that was called a clean finish.
+//
+// A container gives both facts in one place: a published port really is
+// reachable from here, an unpublished one really is not, and both are the
+// SAME container listening on the SAME interface.
+
+test('--probe-ports tells a reachable port from a merely listening one',
+    { skip: SKIP }, (t) => {
+    t.after(destroyAll);
+    const name = 'pilot-probe-ports';
+    const port = startContainer(name, true);      // 22 published, nothing else
+    assert.equal(waitForSshd(port), true, 'sshd never came up');
+
+    // Something is listening on 9. Nothing forwards it, so it is unreachable
+    // from here -- exactly the shape of a cloud firewall.
+    assert.equal(sh('podman', ['exec', '-d', name,
+        'python3', '-m', 'http.server', '9', '--bind', '0.0.0.0']).status, 0);
+    for (let i = 0; i < 20; i += 1) {
+        if (/^[1-9]/.test(String(sh('podman', ['exec', name, 'sh', '-c',
+            'ss -ltn | grep -c ":9 " || true']).stdout).trim())) break;
+        sleepMs(250);
+    }
+
+    // The container really is listening on 9 -- so `ss` would have said yes.
+    const ss = sh('podman', ['exec', name, 'sh', '-c', 'ss -ltn | grep -c ":9 " || true']);
+    assert.match(String(ss.stdout).trim(), /^[1-9]/, 'the container is not listening on 9 after all');
+
+    const r = runOnHost({ host: '127.0.0.1', ports: [
+        { port: port, proto: 'tcp' },     // published -> reachable
+        { port: 9, proto: 'tcp' },        // listening, not published -> NOT reachable
+        { port: 21116, proto: 'udp' }     // never probeable
+    ] }, { PILOT_RUNS_DIR: fs.mkdtempSync(path.join(os.tmpdir(), 'pilot-probe-')) }, '--probe-ports');
+
+    assert.equal(r.code, 0, r.err);
+    const byPort = {};
+    r.lines[0].results.forEach((x) => { byPort[x.proto + ':' + x.port] = x; });
+
+    assert.equal(byPort['tcp:' + port].reachable, true, 'a published port must be reachable');
+    assert.equal(byPort['tcp:9'].reachable, false,
+        'a port that is LISTENING but not routable must not be called reachable — ' +
+        'that is the exact false positive this mode exists to remove');
+    assert.ok(byPort['tcp:9'].detail.length > 0, 'and it must say why');
+    assert.equal(byPort['udp:21116'].reachable, null,
+        'udp cannot be probed by connecting, and guessing would restore the false confidence');
+});
+
+test('--probe-ports refuses a malformed request rather than reporting a blocked port',
+    { skip: SKIP }, () => {
+    const env = { PILOT_RUNS_DIR: fs.mkdtempSync(path.join(os.tmpdir(), 'pilot-probe-bad-')) };
+    for (const bad of [
+        { host: '127.0.0.1', ports: [] },
+        { host: '127.0.0.1', ports: 'nope' },
+        { host: 'not a host', ports: [{ port: 22, proto: 'tcp' }] },
+        { host: '127.0.0.1', ports: [{ port: 0, proto: 'tcp' }] },
+        { host: '127.0.0.1', ports: [{ port: 22, proto: 'sctp' }] },
+        { host: '127.0.0.1', ports: [{ port: 22 }] }
+    ]) {
+        const r = runOnHost(bad, env, '--probe-ports');
+        assert.notEqual(r.code, 0, 'accepted a malformed request: ' + JSON.stringify(bad));
+        assert.match(String(r.err), /"t": "fatal"/);
+    }
 });
