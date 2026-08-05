@@ -62,15 +62,15 @@ const STUB = {
         // show-swagger is 0 on a stock install (C17) — absent is the expected,
         // ordinary case, not an error.
         'GET /admin/swagger/doc.json': { status: 404, body: '404 page not found' },
-        'GET /api/currentUser2': PROBE_OK,
-        'GET /admin/peer': { code: 0, message: '', data: { list: [], page: 1, total: 0, page_size: 0 } },
-        'GET /api/ab/shared/profiles': PROBE_OK,
-        'GET /api/ab/peers': PROBE_OK,
-        'GET /admin/user': PROBE_OK,
-        'GET /admin/group': PROBE_OK,
-        'GET /admin/audit_conn': PROBE_OK,
-        'GET /admin/audit_file': PROBE_OK,
-        'GET /admin/login_log': PROBE_OK
+        'GET /api/currentUser': PROBE_OK,
+        'GET /api/admin/peer/list': { code: 0, message: '', data: { list: [], page: 1, total: 0, page_size: 0 } },
+        'POST /api/ab/shared/profiles': PROBE_OK,
+        'POST /api/ab/peers': PROBE_OK,
+        'GET /api/admin/user/list': PROBE_OK,
+        'GET /api/admin/group/list': PROBE_OK,
+        'GET /api/admin/audit_conn/list': PROBE_OK,
+        'GET /api/admin/audit_file/list': PROBE_OK,
+        'GET /api/admin/login_log/list': PROBE_OK
     }
 };
 
@@ -120,7 +120,7 @@ export default async function run(ctx) {
         await check("startup wiring: a real PilotApi call reaches the stub with prod's address", async () => {
             const result = await page.evaluate(() => window.PilotApi.devices.list());
             assertOk(result, 'devices.list() produced no result — the transport is not really wired');
-            const address = await lastHttpAddress(page, '/admin/peer');
+            const address = await lastHttpAddress(page, '/api/admin/peer/list');
             assertEqual(address, 'prod.example.com',
                 'the transport PilotApi actually used did not carry the active server\'s address');
         });
@@ -132,7 +132,7 @@ export default async function run(ctx) {
 
             const result = await page.evaluate(() => window.PilotApi.devices.list());
             assertOk(result, 'devices.list() produced no result after switching server');
-            const address = await lastHttpAddress(page, '/admin/peer');
+            const address = await lastHttpAddress(page, '/api/admin/peer/list');
             assertEqual(address, 'staging.example.com',
                 'switchServer() did not really re-wire the transport to the new server');
         });

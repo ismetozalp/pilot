@@ -54,7 +54,7 @@ test('PilotApi exposes exactly the C12 surface', () => {
         ['addPeer', 'addTag', 'books', 'peers', 'removePeer', 'removeTag', 'renameTag',
             'tags', 'updatePeer']);
     assert.deepEqual(Object.keys(Api.users).sort(),
-        ['create', 'groups', 'list', 'resetPassword', 'setEnabled', 'setGroup', 'update']);
+        ['create', 'groups', 'list', 'login', 'resetPassword', 'setEnabled', 'setGroup', 'update']);
     assert.deepEqual(Object.keys(Api.audit).sort(), ['conn', 'file', 'login']);
 });
 
@@ -355,19 +355,28 @@ test('devices.list sends GET to the devices endpoint with admin auth and paginat
     assert.deepEqual(out, { list: [{ id: 'a' }], page: 1, total: 1, pageSize: 20 });
 });
 
-test('devices.rename puts the id in the path safely and the name in the body', async () => {
+// CORRECTED against the server's own admin_swagger.json: the admin API has no
+// /{id} routes and no PUT or DELETE at all. The target goes in the BODY, and
+// the device's name field is `alias` -- `name` is not a field admin.PeerForm
+// has, so the old body would have been silently ignored even if the path had
+// existed.
+test('devices.rename POSTs {id, alias} to /peer/update, with the id nowhere near the path', async () => {
     const calls = recorder({ status: 200, body: { code: 0, data: null } });
     await Api.devices.rename('../../etc', 'lobby-pi');
-    assert.equal(calls[0].method, 'PUT');
-    assert.equal(calls[0].path.indexOf('..%2F..%2Fetc') > 0, true, calls[0].path);
-    assert.equal(calls[0].path.indexOf('/../'), -1);
-    assert.deepEqual(JSON.parse(calls[0].body), { id: '../../etc', name: 'lobby-pi' });
+    assert.equal(calls[0].method, 'POST');
+    assert.equal(calls[0].path, '/api/admin/peer/update');
+    // The id is data now, so it cannot smuggle a path segment at all -- a
+    // stronger property than escaping it.
+    assert.equal(calls[0].path.indexOf('etc'), -1, calls[0].path);
+    assert.deepEqual(JSON.parse(calls[0].body), { id: '../../etc', alias: 'lobby-pi' });
 });
 
-test('devices.remove issues a DELETE and refuses an empty id', async () => {
+test('devices.remove POSTs {id} to /peer/delete and refuses an empty id', async () => {
     const calls = recorder({ status: 200, body: { code: 0, data: null } });
     await Api.devices.remove('abc');
-    assert.equal(calls[0].method, 'DELETE');
+    assert.equal(calls[0].method, 'POST');
+    assert.equal(calls[0].path, '/api/admin/peer/delete');
+    assert.deepEqual(JSON.parse(calls[0].body), { id: 'abc' });
     await assert.rejects(Api.devices.remove(''), (e) => e.kind === Errors.KIND.GENERIC);
 });
 
@@ -390,8 +399,10 @@ test('users.setEnabled and resetPassword send the documented fields', async () =
     const calls = recorder({ status: 200, body: { code: 0, data: null } });
     await Api.users.setEnabled('7', false);
     await Api.users.resetPassword('7', 'hunter2');
-    assert.deepEqual(JSON.parse(calls[0].body), { id: '7', status: 0 });
-    assert.deepEqual(JSON.parse(calls[1].body), { id: '7', password: 'hunter2' });
+    // Numeric ids: both admin.UserForm and admin.UserPasswordForm type id as an
+    // integer, and the server's binder rejects a string.
+    assert.deepEqual(JSON.parse(calls[0].body), { id: 7, status: 0 });
+    assert.deepEqual(JSON.parse(calls[1].body), { id: 7, password: 'hunter2' });
     calls.forEach((c) => assert.equal(c.auth, C.AUTH.admin));
 });
 
@@ -414,7 +425,7 @@ test('users.list sends GET /admin/user with admin auth, and paginates the {list,
         { code: 0, message: '', data: { list: [{ id: 'u1', name: 'ada' }], page: 3, total: 91, page_size: 20 } } });
     const out = await Api.users.list({ page: 3, pageSize: 20, keyword: 'ada' });
     assert.equal(calls[0].method, 'GET');
-    assert.equal(calls[0].path, '/admin/user?keyword=ada&page=3&page_size=20');
+    assert.equal(calls[0].path, '/api/admin/user/list?keyword=ada&page=3&page_size=20');
     assert.equal(calls[0].auth, C.AUTH.admin);
     assert.deepEqual(out, { list: [{ id: 'u1', name: 'ada' }], page: 3, total: 91, pageSize: 20 });
 });
@@ -424,7 +435,7 @@ test('users.groups sends GET /admin/group and resolves to a bare array (not {lis
         { code: 0, message: '', data: { list: [{ id: 'g1', name: 'Support' }], page: 1, total: 1, page_size: 50 } } });
     const out = await Api.users.groups();
     assert.equal(calls[0].method, 'GET');
-    assert.equal(calls[0].path, '/admin/group');
+    assert.equal(calls[0].path, '/api/admin/group/list');
     assert.equal(calls[0].auth, C.AUTH.admin);
     assert.deepEqual(out, [{ id: 'g1', name: 'Support' }], 'groups() must unwrap to a plain array via asList()');
 });
@@ -439,28 +450,59 @@ test('users.create POSTs the account object as-is to /admin/user', async () => {
     const calls = recorder({ status: 200, body: { code: 0, data: null } });
     await Api.users.create({ name: 'ada', email: 'ada@example.com', password: 'correct horse' });
     assert.equal(calls[0].method, 'POST');
-    assert.equal(calls[0].path, '/admin/user');
+    assert.equal(calls[0].path, '/api/admin/user/create');
     assert.equal(calls[0].auth, C.AUTH.admin);
     assert.deepEqual(JSON.parse(calls[0].body), { name: 'ada', email: 'ada@example.com', password: 'correct horse' });
     await assert.rejects(Api.users.create(null), (e) => e.kind === Errors.KIND.GENERIC);
     await assert.rejects(Api.users.create('nope'), (e) => e.kind === Errors.KIND.GENERIC);
 });
 
-test('users.update PUTs to /admin/user/{id} using the object\'s own id', async () => {
+test('users.update POSTs the account to /user/update, id in the body', async () => {
     const calls = recorder({ status: 200, body: { code: 0, data: null } });
-    await Api.users.update({ id: 'u1', name: 'ada2' });
-    assert.equal(calls[0].method, 'PUT');
-    assert.equal(calls[0].path, '/admin/user/u1');
-    assert.deepEqual(JSON.parse(calls[0].body), { id: 'u1', name: 'ada2' });
+    await Api.users.update({ id: 1, name: 'ada2' });
+    assert.equal(calls[0].method, 'POST');
+    assert.equal(calls[0].path, '/api/admin/user/update');
+    assert.deepEqual(JSON.parse(calls[0].body), { id: 1, name: 'ada2' });
 });
 
-test('users.setGroup PUTs {id,group_id} to /admin/user/{id}', async () => {
+test('users.setGroup POSTs {id,group_id} to /user/update, with a NUMERIC id', async () => {
     const calls = recorder({ status: 200, body: { code: 0, data: null } });
-    await Api.users.setGroup('u1', 'g2');
-    assert.equal(calls[0].method, 'PUT');
-    assert.equal(calls[0].path, '/admin/user/u1');
-    assert.deepEqual(JSON.parse(calls[0].body), { id: 'u1', group_id: 'g2' });
+    await Api.users.setGroup('7', 'g2');
+    assert.equal(calls[0].method, 'POST');
+    assert.equal(calls[0].path, '/api/admin/user/update');
+    // admin.UserForm types id as an integer; "7" is rejected by the server's
+    // binder, so it is converted once in the client rather than at each site.
+    assert.deepEqual(JSON.parse(calls[0].body), { id: 7, group_id: 'g2' });
     await assert.rejects(Api.users.setGroup('', 'g2'), (e) => e.kind === Errors.KIND.GENERIC);
+    await assert.rejects(Api.users.setGroup('not-a-number', 'g2'), (e) => e.kind === Errors.KIND.GENERIC);
+});
+
+test('users.resetPassword uses the DEDICATED endpoint, not /user/update', async () => {
+    // admin.UserForm has no password field at all, so the old call sent a
+    // password to a route that ignores it -- and reported success.
+    //
+    // The endpoint is changePwd, NOT updatePassword: admin_swagger.json declares
+    // updatePassword, but v2.7 does not route it (measured 404 with a valid
+    // admin token, while changePwd answered and named its required fields). The
+    // shipped swagger over-declares, so the running server is the contract --
+    // which is what tests/e2e/live-api-contract.live.mjs enforces.
+    const calls = recorder({ status: 200, body: { code: 0, data: null } });
+    await Api.users.resetPassword('1', 'a-brand-new-password');
+    assert.equal(calls[0].method, 'POST');
+    assert.equal(calls[0].path, '/api/admin/user/changePwd');
+    assert.deepEqual(JSON.parse(calls[0].body), { id: 1, password: 'a-brand-new-password' });
+});
+
+test('users.login exchanges a username and password for an admin token', async () => {
+    const calls = recorder({ status: 200, body:
+        { code: 0, message: 'success', data: { token: 'deadbeef', username: 'admin' } } });
+    const out = await Api.users.login('admin', 'generated-one');
+    assert.equal(calls[0].method, 'POST');
+    assert.equal(calls[0].path, '/api/admin/login');
+    assert.deepEqual(JSON.parse(calls[0].body), { username: 'admin', password: 'generated-one' });
+    assert.equal(out.token, 'deadbeef');
+    await assert.rejects(Api.users.login('', 'x'), (e) => e.kind === Errors.KIND.GENERIC);
+    await assert.rejects(Api.users.login('admin', ''), (e) => e.kind === Errors.KIND.GENERIC);
 });
 
 test('users.setEnabled and setGroup refuse an empty id even without an explicit guarded() wrapper', async () => {
@@ -529,11 +571,14 @@ test('devices.rename: a pre-encoded traversal id is also neutralised, never a re
     assert.equal(calls[0].path.split('/').indexOf('..'), -1);
 });
 
-test('devices.rename: an id containing a bare "/" cannot smuggle in an extra path segment', async () => {
+test('devices.rename: a hostile id cannot reach the path at all', async () => {
+    // Stronger than the escaping this used to assert: the real admin API takes
+    // the id in the body, so there is no path for it to smuggle a segment into.
     const calls = recorder({ status: 200, body: { code: 0, data: null } });
     await Api.devices.rename('a/../../etc/passwd', 'name');
-    assert.equal(calls[0].path, '/admin/peer/a%2F..%2F..%2Fetc%2Fpasswd');
-    assert.equal(calls[0].path.split('/').length, 4, 'the id must not introduce new segments');
+    assert.equal(calls[0].path, '/api/admin/peer/update');
+    assert.equal(calls[0].path.indexOf('passwd'), -1, 'the id must not appear in the path');
+    assert.deepEqual(JSON.parse(calls[0].body), { id: 'a/../../etc/passwd', alias: 'name' });
 });
 
 test('encodeQuery: a value containing "#" cannot truncate the query string', () => {
@@ -556,12 +601,12 @@ test('devices.list and audit.* accept a null or undefined query and still hit th
 });
 
 test('a surface failure is typed and independent — one endpoint erroring says which', async () => {
-    Api.setTransport((req) => Promise.resolve(req.path.indexOf('/admin/audit') === 0
+    Api.setTransport((req) => Promise.resolve(req.path.indexOf('/api/admin/audit') === 0
         ? { status: 404, body: '404 page not found' }
         : { status: 200, body: { code: 0, data: { list: [] } } }));
     await assert.rejects(Api.audit.conn({}), (e) => {
         assert.equal(e.kind, Errors.KIND.API_VERSION_MISMATCH);
-        assert.match(e.message, /\/admin\/audit/);
+        assert.match(e.message, /\/api\/admin\/audit/);
         return true;
     });
     assert.deepEqual((await Api.devices.list({})).list, []);
@@ -628,7 +673,7 @@ test("addressbook.addTag/renameTag/removeTag/addPeer/updatePeer/removePeer all a
     assert.equal(calls.length, 6);
     assert.deepEqual(calls.map((c) => c.path), [
         '/api/ab/tag/add/', '/api/ab/tag/rename/', '/api/ab/tag/',
-        '/api/ab/peer/add/', '/api/ab/peer/update/', '/api/ab/peer/'
+        '/api/ab/peer/add/', '/api/ab/peer/update/', '/api/ab/peer/add/'
     ]);
 });
 
@@ -668,10 +713,23 @@ test('probeTargets: every probe target is a side-effect-free GET with no placeho
     });
 });
 
-test('probeTargets: covers all four surfaces so a mismatch cannot hide in one of them', () => {
-    const ids = C.probeTargets().map((e) => e.id).join(' ');
-    ['devices.', 'ab.', 'users.', 'audit.'].forEach((prefix) =>
+test('probeTargets: covers both auth surfaces, and never anything that mutates', () => {
+    const targets = C.probeTargets();
+    const ids = targets.map((e) => e.id).join(' ');
+    // The three admin surfaces, each a parameterless GET.
+    ['devices.', 'users.', 'audit.'].forEach((prefix) =>
         assert.ok(ids.indexOf(prefix) >= 0, 'no probe target for ' + prefix));
+    // And the client surface, which is what validates the Bearer half of the
+    // auth seam -- previously "covered" by ab.books/ab.peers, which the server
+    // does not serve as GET at all. They are POST-shaped reads, and the probe's
+    // rule is that it issues nothing but parameterless GETs, so the address
+    // book is deliberately not probed; session.current stands in for it.
+    assert.ok(targets.some((e) => e.id === 'session.current' && e.admin === false),
+        'the client API must be probed too, or a Bearer mismatch hides');
+    targets.forEach((e) => {
+        assert.equal(e.method, 'GET', e.id + ' is probed but is not a GET');
+        assert.equal(e.path.indexOf('{'), -1, e.id + ' is probed but takes a path parameter');
+    });
 });
 
 // ---------------------------------------------------------------- module shape ---
@@ -698,5 +756,45 @@ test('index.html loads js/core/api-client.js in its C7 position', () => {
     C7.slice(at + 1).forEach((m) => {
         const i = srcs.indexOf(m);
         if (i >= 0) assert.ok(i > me, m + ' must load after js/core/api-client.js');
+    });
+});
+
+test('ENDPOINTS: the exact routes, pinned — every one measured against a real v2.7 server', () => {
+    // Mutation showed a route could be changed to anything without a single
+    // test failing, because the assertions referenced EP[...].path rather than
+    // the literal. That is how a whole table of 404s survived: the tests agreed
+    // with whatever it said. These are the paths tests/e2e/live-api-contract
+    // confirmed the server actually serves.
+    const actual = {};
+    C.ENDPOINTS.forEach((e) => { actual[e.id] = e.method + ' ' + e.path; });
+    assert.deepEqual(actual, {
+        'session.current': 'GET /api/peers',
+        'devices.list': 'GET /api/admin/peer/list',
+        'devices.rename': 'POST /api/admin/peer/update',
+        'devices.remove': 'POST /api/admin/peer/delete',
+        'ab.books': 'POST /api/ab/shared/profiles',
+        'ab.peers': 'POST /api/ab/peers',
+        'ab.addPeer': 'POST /api/ab/peer/add/{ab}',
+        'ab.updatePeer': 'PUT /api/ab/peer/update/{ab}',
+        'ab.removePeer': 'DELETE /api/ab/peer/add/{ab}',
+        'ab.tags': 'POST /api/ab/tags/{ab}',
+        'ab.addTag': 'POST /api/ab/tag/add/{ab}',
+        'ab.renameTag': 'PUT /api/ab/tag/rename/{ab}',
+        'ab.removeTag': 'DELETE /api/ab/tag/{ab}',
+        'users.list': 'GET /api/admin/user/list',
+        'users.create': 'POST /api/admin/user/create',
+        'users.update': 'POST /api/admin/user/update',
+        'users.password': 'POST /api/admin/user/changePwd',
+        'users.groups': 'GET /api/admin/group/list',
+        'audit.conn': 'GET /api/admin/audit_conn/list',
+        'audit.file': 'GET /api/admin/audit_file/list',
+        'audit.login': 'GET /api/admin/login_log/list',
+        'admin.login': 'POST /api/admin/login'
+    });
+    // The two shapes that were wrong everywhere, as standing rules.
+    C.ENDPOINTS.forEach((e) => {
+        assert.ok(e.path.indexOf('/api/') === 0, e.id + ' is missing the /api base path: ' + e.path);
+        if (e.admin) assert.ok(e.method === 'GET' || e.method === 'POST',
+            e.id + ' uses ' + e.method + ', but the admin surface has no PUT or DELETE');
     });
 });

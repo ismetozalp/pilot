@@ -897,6 +897,57 @@
         };
     }
 
+    // The API server prints its generated admin password once, into the journal,
+    // and the verify-admin step reads it back. Two things were wrong with that:
+    // the password arrived in the browser IN CLEARTEXT -- rendered into the
+    // transcript, written to the persisted run file and included in "Copy full
+    // transcript" -- and nothing ever captured it, so `generatedPassword` stayed
+    // '' and the "don't keep the generated password" guard below could never
+    // fire. Capturing it here fixes both: the value is held in memory for the
+    // handover step, and scrubbed from everything that is displayed or stored.
+    const ADMIN_PW_RE = /Admin Password Is:\s*(\S+)/;
+    // rustdesk-api seeds exactly one account on first boot: admin, id 1
+    // (verified against a real v2.7 install -- /api/admin/user/list returns a
+    // single row, id=1, username=admin, is_admin=true).
+    const ADMIN_USER = 'admin';
+    const ADMIN_ID = 1;
+
+    function capturePassword(exec) {
+        const e = (exec && typeof exec === 'object') ? exec : blankExec();
+        const steps = Array.isArray(e.steps) ? e.steps : [];
+        for (let i = 0; i < steps.length; i++) {
+            const lines = Array.isArray(steps[i].lines) ? steps[i].lines : [];
+            for (let j = 0; j < lines.length; j++) {
+                const m = ADMIN_PW_RE.exec(str(lines[j].text));
+                if (m && m[1]) return m[1];
+            }
+        }
+        return '';
+    }
+
+    // Replaces every occurrence in place. Applied to the transcript the user
+    // sees AND to the raw lines handed to persist(), so the secret exists in
+    // exactly one place: the field the handover step reads.
+    function scrubSecret(exec, secret) {
+        if (!secret || typeof secret !== 'string') return exec;
+        const e = (exec && typeof exec === 'object') ? exec : blankExec();
+        const steps = Array.isArray(e.steps) ? e.steps : [];
+        for (let i = 0; i < steps.length; i++) {
+            const lines = Array.isArray(steps[i].lines) ? steps[i].lines : [];
+            for (let j = 0; j < lines.length; j++)
+                lines[j].text = str(lines[j].text).split(secret).join(SECRET_MASK);
+        }
+        return e;
+    }
+
+    function scrubLines(raw, secret) {
+        if (!secret || typeof secret !== 'string' || !Array.isArray(raw)) return raw;
+        for (let i = 0; i < raw.length; i++) raw[i] = str(raw[i]).split(secret).join(SECRET_MASK);
+        return raw;
+    }
+
+    const SECRET_MASK = '\u2022\u2022\u2022\u2022\u2022\u2022';
+
     function passwordGate(form, generated) {
         const f = (form && typeof form === 'object') ? form : {};
         const pw = str(f.password);
@@ -1214,6 +1265,10 @@
             // default and deliberately fails closed — a wizard that pretends it
             // changed the admin password is worse than one that says it cannot.
             passwordWriter: null,
+            // Opt-in, and on by default: a freshly generated password nobody
+            // chose is a bad thing to leave in place, but it is the user's call.
+            changePassword: true,
+            showGenerated: false,
 
             // Set by start()/checkDns() only. tlsFailure carries
             // acmeFailureFrom()'s classified verdict for a failed tls-* step.
@@ -1615,6 +1670,16 @@
                 // must survive. A run that "succeeded" at the process level
                 // while a step failed had no banner at all -- that is what the
                 // !this.error arm covers.
+                // Before anything is persisted or rendered: lift the generated
+                // admin password out of the transcript and mask every trace of
+                // it. persist() below writes `raw` to disk, so the order here
+                // is load-bearing.
+                this.generatedPassword = capturePassword(this.exec);
+                if (this.generatedPassword) {
+                    scrubSecret(this.exec, this.generatedPassword);
+                    scrubLines(raw, this.generatedPassword);
+                }
+
                 const failed = firstFailure(this.exec);
                 if (failed && (!this.error || this.error.kind === 'GENERIC' ||
                         this.error.kind === 'UNKNOWN'))
@@ -1784,19 +1849,71 @@
                 return false;
             },
 
+            // The default writer: log into the API server Pilot has just
+            // installed using the password IT generated, then set the chosen
+            // one. There is no configured token at this point -- the server is
+            // seconds old and nobody has signed in -- so the login is the only
+            // way to obtain one. passwordWriter stays overridable because the
+            // unit tests inject a recorder; production leaves it null and gets
+            // this.
+            async writeAdminPassword(newPassword) {
+                const Api = root ? root.PilotApi : null;
+                if (!Api || !Api.users || typeof Api.users.login !== 'function')
+                    throw fail('API_UNREACHABLE', 'The API client is not loaded, so the password cannot be changed.');
+                if (!this.generatedPassword)
+                    throw fail('API_UNREACHABLE',
+                        'Pilot did not capture the generated administrator password, so it cannot sign in to change it. ' +
+                        'Set it yourself in the RustDesk admin console.');
+                // /api/admin/login needs no token, so the anonymous transport
+                // app.js already wired is enough to obtain one.
+                const session = await Api.users.login(ADMIN_USER, this.generatedPassword);
+                const token = session && (session.token || (session.data && session.data.token));
+                if (!token)
+                    throw fail('API_AUTH_FAILED', 'The API server did not accept the generated administrator password.');
+
+                // The token is baked into a transport at construction (api-io.js
+                // keeps it out of every other module by design), so using it
+                // means building one. The server's address comes from the record
+                // just registered, never from the form.
+                const Io = root ? root.PilotApiIo : null;
+                const Servers = servers();
+                if (!Io || typeof Io.transport !== 'function' || !Servers)
+                    throw fail('API_UNREACHABLE', 'The API transport is not loaded.');
+                const id = str(this.registeredServerId) || idForChoices(this.choices);
+                const rec = await Servers.read(id);
+                if (!rec) throw fail('API_UNREACHABLE',
+                    'No server record for ' + id + ', so Pilot does not know where to send the change.');
+                Api.setTransport(Io.transport(
+                    { address: rec.host, port: rec.apiPort, tls: rec.tls, token: token }));
+                try {
+                    await Api.users.resetPassword(ADMIN_ID, str(newPassword));
+                } finally {
+                    // Put the shell back in charge of the transport whatever
+                    // happened: this one carries a token minted from a password
+                    // that no longer exists.
+                    notifyServerChanged(this.doc || (root ? root.document : null), id);
+                }
+                return true;
+            },
+
             async finish() {
+                // Opt-in (spec §7.3 in spirit: never do something irreversible
+                // to a user's server because a form happened to be on screen).
+                // Skipping leaves the generated password in place, which is why
+                // the pane shows it.
+                if (!this.changePassword) { this.finished = true; return true; }
                 const gate = passwordGate(this.pw, this.generatedPassword);
                 this.pwErrors = gate.errors;
                 if (!gate.ok) return false;
-                if (typeof this.passwordWriter !== 'function') {
-                    this.error = describe(fail('API_UNREACHABLE',
-                        'Pilot could not change the administrator password — nothing is wired to write it.'));
-                    return false;
-                }
+                const writer = typeof this.passwordWriter === 'function'
+                    ? this.passwordWriter
+                    : this.writeAdminPassword.bind(this);
                 this.busy = true;
                 try {
-                    await this.passwordWriter(str(this.pw.password));
+                    await writer(str(this.pw.password));
                     this.pw = { password: '', confirm: '' };
+                    // Once changed, the generated one is dead: stop showing it.
+                    this.generatedPassword = '';
                     this.finished = true;
                     return true;
                 } catch (e) {
@@ -1818,7 +1935,7 @@
         idForChoices, hbbsInfoFrom, apiPortFrom, recordForRegistration,
         validateTarget, portRows, awsCommand,
         parseLine, reduce, progress, transcriptText, runPath,
-        firstFailure, failureMessage,
+        firstFailure, failureMessage, capturePassword, scrubSecret, scrubLines, SECRET_MASK,
         handover, passwordGate, manualFor,
         runIdFor, splitStream, detectRequest, envelopeCtx, planChoicesFor, requiredPorts, reachFrom,
         notifyServerChanged,

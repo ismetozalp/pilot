@@ -38,7 +38,7 @@ const AUDIT_FAIL = { status: 200, body: { code: 7, message: 'permission denied',
 const AUTH_FAIL = { status: 401, body: 'unauthorized' };
 
 function baseRoutes(over) {
-    return Object.assign({ 'GET /admin/audit_conn': listOk(CONN) }, over || {});
+    return Object.assign({ 'GET /api/admin/audit_conn/list': listOk(CONN) }, over || {});
 }
 
 async function openAudit(ctx, routes) {
@@ -102,7 +102,7 @@ export default async function run(ctx) {
     });
 
     await check('audit: switching to logins issues a new request and re-renders', async () => {
-        const page = await openAudit(ctx, baseRoutes({ 'GET /admin/login_log': listOk(LOGIN) }));
+        const page = await openAudit(ctx, baseRoutes({ 'GET /api/admin/login_log/list': listOk(LOGIN) }));
         try {
             await page.click('#pilot-audit [data-testid="audit-refresh"]');
             await waitRowCount(page, 2);
@@ -111,7 +111,7 @@ export default async function run(ctx) {
             assertOk((await page.locator('#pilot-audit [data-testid="audit-row"]').first().innerText()).includes('dev-1'),
                 'the login record did not render');
             const calls = await transportCalls(page);
-            assertOk(calls.some((c) => c.path.indexOf('/admin/login_log') === 0),
+            assertOk(calls.some((c) => c.path.indexOf('/api/admin/login_log') === 0),
                 'switching tabs must issue a request to the login log');
         } finally { await page.ctx.close(); }
     });
@@ -124,7 +124,7 @@ export default async function run(ctx) {
             await page.click('#pilot-audit [data-testid="audit-refresh"]');
             await waitRowCount(page, 2);
             const calls = await transportCalls(page);
-            const last = calls.filter((c) => c.path.indexOf('/admin/audit_conn') === 0).pop();
+            const last = calls.filter((c) => c.path.indexOf('/api/admin/audit_conn') === 0).pop();
             assertOk(last, 'no request reached audit_conn');
             assertOk(last.path.indexOf('user=ada') !== -1, 'the user filter did not reach the request: ' + last.path);
             assertOk(last.path.indexOf('device=111111111') !== -1,
@@ -153,7 +153,7 @@ export default async function run(ctx) {
             await page.click('#pilot-audit [data-testid="audit-refresh"]');
             await waitRowCount(page, 2);
             const calls = await transportCalls(page);
-            const last = calls.filter((c) => c.path.indexOf('/admin/audit_conn') === 0).pop();
+            const last = calls.filter((c) => c.path.indexOf('/api/admin/audit_conn') === 0).pop();
             assertOk(last.path.indexOf('from=' + Math.floor(Date.UTC(2026, 7, 1) / 1000)) !== -1,
                 'from was not converted to epoch seconds: ' + last.path);
             assertOk(last.path.indexOf('to=' + Math.floor(Date.UTC(2026, 7, 3, 23, 59, 59) / 1000)) !== -1,
@@ -162,7 +162,7 @@ export default async function run(ctx) {
     });
 
     await check('audit: an unconfigured system and a filtered-to-nothing result get different empty states', async () => {
-        const page = await openAudit(ctx, baseRoutes({ 'GET /admin/audit_conn': listOk([]) }));
+        const page = await openAudit(ctx, baseRoutes({ 'GET /api/admin/audit_conn/list': listOk([]) }));
         try {
             await page.click('#pilot-audit [data-testid="audit-refresh"]');
             assertOk(await visible(page, '#pilot-audit [data-testid="audit-empty"]'),
@@ -185,7 +185,7 @@ export default async function run(ctx) {
             // filter actually reaches the request is proven by the earlier
             // "filtering by user and device" check) -- this simulates what a
             // real server answers once a filter matches no records.
-            await ctx.useTransport(page, baseRoutes({ 'GET /admin/audit_conn': listOk([]) }));
+            await ctx.useTransport(page, baseRoutes({ 'GET /api/admin/audit_conn/list': listOk([]) }));
             await page.fill('#pilot-audit [data-testid="audit-user"]', 'nobody-such-user');
             await page.click('#pilot-audit [data-testid="audit-refresh"]');
             await waitRowCount(page, 0);
@@ -202,7 +202,7 @@ export default async function run(ctx) {
     });
 
     await check('audit: a failing log names the reason and an auth failure recommends signing in again', async () => {
-        const page = await openAudit(ctx, baseRoutes({ 'GET /admin/audit_conn': AUDIT_FAIL }));
+        const page = await openAudit(ctx, baseRoutes({ 'GET /api/admin/audit_conn/list': AUDIT_FAIL }));
         try {
             await page.click('#pilot-audit [data-testid="audit-refresh"]');
             assertOk(await visible(page, '#pilot-audit [data-testid="audit-alert"]'), 'the error banner appears');
@@ -211,7 +211,7 @@ export default async function run(ctx) {
             assertMatch(alert, /permission denied/, 'the specific reason must be shown, not a generic message');
             assertEqual(await rowCount(page), 0, 'stale rows survived a failure');
 
-            await ctx.useTransport(page, baseRoutes({ 'GET /admin/audit_conn': AUTH_FAIL }));
+            await ctx.useTransport(page, baseRoutes({ 'GET /api/admin/audit_conn/list': AUTH_FAIL }));
             await page.click('#pilot-audit [data-testid="audit-refresh"]');
             await page.waitForFunction(() => {
                 const el = document.querySelector('#pilot-audit [data-testid="audit-alert-action"]');
@@ -229,7 +229,7 @@ export default async function run(ctx) {
               from_peer: '<script>window.__xss2=1</script>', to_peer: 'p'.repeat(600),
               type: 'a\x00b', ip: '../../etc/shadow', note: 'isil ' + '\u202Eevil\u202C' }
         ];
-        const page = await openAudit(ctx, baseRoutes({ 'GET /admin/audit_conn': listOk(hostile) }));
+        const page = await openAudit(ctx, baseRoutes({ 'GET /api/admin/audit_conn/list': listOk(hostile) }));
         try {
             await page.click('#pilot-audit [data-testid="audit-refresh"]');
             await waitRowCount(page, 1);
@@ -257,9 +257,9 @@ export default async function run(ctx) {
         try {
             await page.waitForSelector('[data-tab="users"]', { state: 'attached', timeout: WAIT });
             await ctx.useTransport(page, {
-                'GET /admin/audit_conn': AUDIT_FAIL,
-                'GET /admin/user': listOk(USERS),
-                'GET /admin/group': listOk([])
+                'GET /api/admin/audit_conn/list': AUDIT_FAIL,
+                'GET /api/admin/user/list': listOk(USERS),
+                'GET /api/admin/group/list': listOk([])
             });
             await page.click('[data-tab="audit"]');
             await page.waitForSelector('#pilot-audit [data-testid="audit-refresh"]', { state: 'attached', timeout: WAIT });
@@ -312,15 +312,15 @@ export default async function run(ctx) {
             },
             http: {
                 'GET /admin/swagger/doc.json': { status: 404, body: '404 page not found' },
-                'GET /api/currentUser2': PROBE_OK,
-                'GET /api/ab/shared/profiles': PROBE_OK,
-                'GET /api/ab/peers': PROBE_OK,
-                'GET /admin/peer': PROBE_OK,
-                'GET /admin/group': PROBE_OK,
-                'GET /admin/user': PROBE_OK,
-                'GET /admin/audit_file': PROBE_OK,
-                'GET /admin/login_log': PROBE_OK,
-                'GET /admin/audit_conn': listOk(prodConn)
+                'GET /api/currentUser': PROBE_OK,
+                'POST /api/ab/shared/profiles': PROBE_OK,
+                'POST /api/ab/peers': PROBE_OK,
+                'GET /api/admin/peer/list': PROBE_OK,
+                'GET /api/admin/group/list': PROBE_OK,
+                'GET /api/admin/user/list': PROBE_OK,
+                'GET /api/admin/audit_file/list': PROBE_OK,
+                'GET /api/admin/login_log/list': PROBE_OK,
+                'GET /api/admin/audit_conn/list': listOk(prodConn)
             }
         };
     }
@@ -362,7 +362,7 @@ export default async function run(ctx) {
                 'prod\'s connection log is shown on load with no manual refresh click');
 
             await page.evaluate((list) => {
-                window.__pilotStub.http['GET /admin/audit_conn'] = { status: 200, body:
+                window.__pilotStub.http['GET /api/admin/audit_conn/list'] = { status: 200, body:
                     { code: 0, message: '', data: { list, page: 1, total: list.length, page_size: 50 } } };
             }, STAGING_CONN);
 

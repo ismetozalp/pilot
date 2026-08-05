@@ -344,9 +344,48 @@
             <div class="alert alert-warning" data-testid="credential-error" x-show="credentialSaveError">
               <span x-text="credentialSaveError ? credentialSaveError.message : ''"></span>
             </div>
-            <input class="form-control mb-1" data-testid="new-password" type="password" x-model="pw.password">
-            <input class="form-control mb-1" data-testid="confirm-password" type="password" x-model="pw.confirm">
-            <button class="btn btn-primary" data-testid="finish" @click="finish()">Change password and finish</button>
+            <!-- The two boxes used to be unlabelled and unexplained, and the
+                 button behind them could never work: passwordWriter was null and
+                 assigned nowhere, so "Change password and finish" always failed.
+                 It is opt-in now because changing it is a real, irreversible
+                 action on the user's server -- and if they decline, the pane has
+                 to tell them the password they will actually need. -->
+            <hr>
+            <h3 class="h6">Administrator password</h3>
+            <div class="form-check mb-2">
+              <input class="form-check-input" type="checkbox" id="pl-change-pw"
+                     data-testid="change-password" x-model="changePassword">
+              <label class="form-check-label" for="pl-change-pw">
+                Set a new administrator password now</label>
+            </div>
+
+            <div x-show="changePassword" data-testid="pw-fields">
+              <label class="form-label mb-1" for="pl-new-pw">New password</label>
+              <input class="form-control mb-2" id="pl-new-pw" data-testid="new-password"
+                     type="password" autocomplete="new-password" x-model="pw.password">
+              <label class="form-label mb-1" for="pl-confirm-pw">Confirm new password</label>
+              <input class="form-control mb-2" id="pl-confirm-pw" data-testid="confirm-password"
+                     type="password" autocomplete="new-password" x-model="pw.confirm">
+            </div>
+
+            <!-- Declining leaves the generated password in place, so it has to
+                 be readable SOMEWHERE. Behind a click, not in the transcript:
+                 the transcript is copied into bug reports and written to disk. -->
+            <div x-show="!changePassword && generatedPassword" data-testid="generated-block">
+              <p class="mb-1">Pilot will leave the password RustDesk generated. You will need it to sign in:</p>
+              <button class="btn btn-sm btn-outline-secondary mb-1" data-testid="reveal-generated"
+                      @click="showGenerated = !showGenerated"
+                      x-text="showGenerated ? 'Hide password' : 'Show password'"></button>
+              <pre class="mb-1" data-testid="generated-password" x-show="showGenerated"
+                   x-text="generatedPassword"></pre>
+            </div>
+            <p class="text-warning mb-1" data-testid="generated-missing"
+               x-show="!changePassword && !generatedPassword">
+              Pilot did not capture a generated password. Read it from the API server's journal
+              (journalctl -u rustdesk-api.service | grep 'Admin Password Is') before signing in.</p>
+
+            <button class="btn btn-primary" data-testid="finish" @click="finish()" :disabled="busy"
+                    x-text="changePassword ? 'Change password and finish' : 'Finish'"></button>
             <p class="text-danger mb-0" data-testid="pw-error"
                x-text="(pwErrors.password || '') + ' ' + (pwErrors.confirm || '')"></p>
             <p data-testid="finished" x-show="finished">Setup finished.</p>

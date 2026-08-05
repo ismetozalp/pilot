@@ -47,12 +47,12 @@ const WRITE_OK = ok({});
 // override the entries they care about via ctx.useTransport()'s own table.
 function baseRoutes(over) {
     return Object.assign({
-        'GET /api/ab/shared/profiles': BOOKS_OK,
-        'GET /api/ab/peers': peersOk(PEERS),
-        'GET /api/ab/tags/': tagsOk(['office']),
+        'POST /api/ab/shared/profiles': BOOKS_OK,
+        'POST /api/ab/peers': peersOk(PEERS),
+        'POST /api/ab/tags/': tagsOk(['office']),
         'POST /api/ab/peer/add/': WRITE_OK,
         'PUT /api/ab/peer/update/': WRITE_OK,
-        'DELETE /api/ab/peer/': WRITE_OK,
+        'DELETE /api/ab/peer/add/': WRITE_OK,
         'POST /api/ab/tag/add/': WRITE_OK,
         'PUT /api/ab/tag/rename/': WRITE_OK,
         'DELETE /api/ab/tag/': WRITE_OK
@@ -102,7 +102,7 @@ export default async function run(ctx) {
     const { check, assertEqual, assertOk, assertMatch, shot, transportCalls } = ctx;
 
     await check('addressbook: peers render even when the tag endpoint fails, with a real remediation shown', async () => {
-        const page = await openAddressBook(ctx, baseRoutes({ 'GET /api/ab/tags/': TAGS_FAIL }));
+        const page = await openAddressBook(ctx, baseRoutes({ 'POST /api/ab/tags/': TAGS_FAIL }));
         try {
             await page.click('#pilot-addressbook [data-pilot="reload"]');
             await waitRowCount(page, 2);
@@ -284,7 +284,7 @@ export default async function run(ctx) {
     });
 
     await check('addressbook: an address book with no peers offers a real import action, not a dead end', async () => {
-        const page = await openAddressBook(ctx, baseRoutes({ 'GET /api/ab/peers': peersOk([]) }));
+        const page = await openAddressBook(ctx, baseRoutes({ 'POST /api/ab/peers': peersOk([]) }));
         try {
             await page.click('#pilot-addressbook [data-pilot="reload"]');
             assertOk(await visible(page, '#pilot-addressbook [data-pilot="peers-empty"] p'),
@@ -336,8 +336,8 @@ export default async function run(ctx) {
             tags: ['<script>window.__xss2=1</script>']
         }];
         const page = await openAddressBook(ctx, baseRoutes({
-            'GET /api/ab/peers': peersOk(hostile),
-            'GET /api/ab/tags/': tagsOk(['<script>window.__xss2=1</script>'])
+            'POST /api/ab/peers': peersOk(hostile),
+            'POST /api/ab/tags/': tagsOk(['<script>window.__xss2=1</script>'])
         }));
         try {
             await page.click('#pilot-addressbook [data-pilot="reload"]');
@@ -384,15 +384,15 @@ export default async function run(ctx) {
             },
             http: {
                 'GET /admin/swagger/doc.json': { status: 404, body: '404 page not found' },
-                'GET /api/currentUser2': WRITE_OK,
-                'GET /api/ab/shared/profiles': BOOKS_OK,
-                'GET /api/ab/peers': peersOk(prodPeers),
-                'GET /admin/user': WRITE_OK,
-                'GET /admin/group': WRITE_OK,
-                'GET /admin/audit_conn': WRITE_OK,
-                'GET /admin/audit_file': WRITE_OK,
-                'GET /admin/login_log': WRITE_OK,
-                'GET /admin/peer': WRITE_OK
+                'GET /api/currentUser': WRITE_OK,
+                'POST /api/ab/shared/profiles': BOOKS_OK,
+                'POST /api/ab/peers': peersOk(prodPeers),
+                'GET /api/admin/user/list': WRITE_OK,
+                'GET /api/admin/group/list': WRITE_OK,
+                'GET /api/admin/audit_conn/list': WRITE_OK,
+                'GET /api/admin/audit_file/list': WRITE_OK,
+                'GET /api/admin/login_log/list': WRITE_OK,
+                'GET /api/admin/peer/list': WRITE_OK
             }
         };
     }
@@ -437,7 +437,7 @@ export default async function run(ctx) {
             // switchServer() genuinely triggered a NEW fetch that observed the
             // swap, not a coincidental re-render of data already in memory.
             await page.evaluate((list) => {
-                window.__pilotStub.http['GET /api/ab/peers'] = { status: 200, body:
+                window.__pilotStub.http['POST /api/ab/peers'] = { status: 200, body:
                     { code: 0, message: '', data: { peers: list } } };
             }, STAGING_PEERS);
 

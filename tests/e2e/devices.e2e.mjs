@@ -80,7 +80,7 @@ export default async function run(ctx) {
     const { check, assertEqual, assertOk, assertMatch, shot, transportCalls } = ctx;
 
     await check('devices: the inventory renders online state, last seen, IP, platform and version', async () => {
-        const page = await openDevices(ctx, { 'GET /admin/peer': listOk(DEVICES) });
+        const page = await openDevices(ctx, { 'GET /api/admin/peer/list': listOk(DEVICES) });
         try {
             await page.click('#pilot-devices [data-test="refresh"]');
             await waitRowCount(page, 2);
@@ -114,7 +114,7 @@ export default async function run(ctx) {
     });
 
     await check('devices: the filter narrows the table without another request', async () => {
-        const page = await openDevices(ctx, { 'GET /admin/peer': listOk(DEVICES) });
+        const page = await openDevices(ctx, { 'GET /api/admin/peer/list': listOk(DEVICES) });
         try {
             await page.click('#pilot-devices [data-test="refresh"]');
             await waitRowCount(page, 2);
@@ -123,7 +123,7 @@ export default async function run(ctx) {
             // Device LIST requests specifically: a Refresh also re-fetches the
             // address books, which is a different call and not what this asserts.
             const calls = (await transportCalls(page))
-                .filter((c) => c.path.indexOf('/admin/peer') === 0);
+                .filter((c) => c.path.indexOf('/api/admin/peer') === 0);
             assertEqual(calls.length, 1, 'filtering is client-side on the page we already have');
         } finally {
             await page.ctx.close();
@@ -132,8 +132,8 @@ export default async function run(ctx) {
 
     await check('devices: rename writes through PilotApi and updates the row', async () => {
         const page = await openDevices(ctx, {
-            'GET /admin/peer': listOk(DEVICES),
-            'PUT /admin/peer/111111111': { code: 0, message: '', data: {} }
+            'GET /api/admin/peer/list': listOk(DEVICES),
+            'POST /api/admin/peer/update': { code: 0, message: '', data: {} }
         });
         try {
             await page.click('#pilot-devices [data-test="refresh"]');
@@ -148,9 +148,15 @@ export default async function run(ctx) {
                 return !!el && /Pantry Pi/.test(el.textContent);
             }, null, { timeout: WAIT });
             const calls = await transportCalls(page);
-            const wrote = calls.filter((c) => c.method !== 'GET');
+            // books() is a POST on the real API, so "not a GET" is no longer a
+            // synonym for "a write". Filter by the route that was under test.
+            const wrote = calls.filter((c) => c.path.indexOf('/api/admin/peer/update') === 0);
             assertOk(wrote.length >= 1, 'the rename went through PilotApi');
-            assertEqual(wrote[0].path, '/admin/peer/111111111', 'the rename addressed the right device');
+            // The real admin API carries the target in the body, not the path.
+            assertEqual(wrote[0].path, '/api/admin/peer/update', 'the rename used the real update route');
+            assertEqual(JSON.parse(wrote[0].body).id, '111111111', 'and addressed the right device');
+            assertEqual(JSON.parse(wrote[0].body).alias, 'Pantry Pi',
+                'the server field is `alias`; `name` is not a field it has');
         } finally {
             await page.ctx.close();
         }
@@ -158,8 +164,8 @@ export default async function run(ctx) {
 
     await check('devices: delete asks first, then removes the row', async () => {
         const page = await openDevices(ctx, {
-            'GET /admin/peer': listOk(DEVICES),
-            'DELETE /admin/peer/222222222': { code: 0, message: '', data: {} }
+            'GET /api/admin/peer/list': listOk(DEVICES),
+            'POST /api/admin/peer/delete': { code: 0, message: '', data: {} }
         });
         try {
             await page.click('#pilot-devices [data-test="refresh"]');
@@ -176,7 +182,7 @@ export default async function run(ctx) {
     });
 
     await check('devices: an API failure states the reason and offers a retry', async () => {
-        const page = await openDevices(ctx, { 'GET /admin/peer': LIST_FAIL });
+        const page = await openDevices(ctx, { 'GET /api/admin/peer/list': LIST_FAIL });
         try {
             await page.click('#pilot-devices [data-test="refresh"]');
             assertOk(await visible(page, '#pilot-devices [data-test="error"]'), 'the error banner appears');
@@ -186,7 +192,7 @@ export default async function run(ctx) {
 
             // Re-install a working transport, then retry through the SAME page --
             // proves error-retry re-fetches rather than merely hiding the banner.
-            await ctx.useTransport(page, { 'GET /admin/peer': listOk(DEVICES) });
+            await ctx.useTransport(page, { 'GET /api/admin/peer/list': listOk(DEVICES) });
             await page.click('#pilot-devices [data-test="error-retry"]');
             await waitRowCount(page, 2);
             await shot(page, 'devices-error-recovered');
@@ -196,7 +202,7 @@ export default async function run(ctx) {
     });
 
     await check('devices: an empty inventory says so, with a real next action, not a blank table (spec 7.3)', async () => {
-        const page = await openDevices(ctx, { 'GET /admin/peer': listOk([]) });
+        const page = await openDevices(ctx, { 'GET /api/admin/peer/list': listOk([]) });
         try {
             await page.click('#pilot-devices [data-test="refresh"]');
             assertOk(await visible(page, '#pilot-devices [data-test="empty"]'), 'the empty state appears');
@@ -216,7 +222,7 @@ export default async function run(ctx) {
     });
 
     await check('devices: a filter with no matches offers its own next action, distinct from "no devices at all"', async () => {
-        const page = await openDevices(ctx, { 'GET /admin/peer': listOk(DEVICES) });
+        const page = await openDevices(ctx, { 'GET /api/admin/peer/list': listOk(DEVICES) });
         try {
             await page.click('#pilot-devices [data-test="refresh"]');
             await waitRowCount(page, 2);
@@ -236,8 +242,8 @@ export default async function run(ctx) {
 
     await check('devices: add-to-address-book stays disabled while there is genuinely no book, ' +
         'with the reason on screen rather than only in a tooltip', async () => {
-        const page = await openDevices(ctx, { 'GET /admin/peer': listOk(DEVICES),
-            'GET /api/ab/shared/profiles': { reject: true, message: 'no address book service' } });
+        const page = await openDevices(ctx, { 'GET /api/admin/peer/list': listOk(DEVICES),
+            'POST /api/ab/shared/profiles': { reject: true, message: 'no address book service' } });
         try {
             await page.click('#pilot-devices [data-test="refresh"]');
             await waitRowCount(page, 2);
@@ -251,7 +257,7 @@ export default async function run(ctx) {
     });
 
     await check('devices: pagination states the total and says when the page is truncated', async () => {
-        const page = await openDevices(ctx, { 'GET /admin/peer': { status: 200, body:
+        const page = await openDevices(ctx, { 'GET /api/admin/peer/list': { status: 200, body:
             { code: 0, message: '', data: { list: DEVICES, page: 1, total: 9, page_size: 2 } } } });
         try {
             await page.click('#pilot-devices [data-test="refresh"]');
@@ -269,7 +275,7 @@ export default async function run(ctx) {
         // A raw HTTP 401 is what api-client.js's errorKindFor() maps to
         // API_AUTH_FAILED -- exercised at the transport level so the real
         // kind mapping runs, not a shortcut straight to a chosen kind.
-        const page = await openDevices(ctx, { 'GET /admin/peer': { status: 401, body: 'unauthorized' } });
+        const page = await openDevices(ctx, { 'GET /api/admin/peer/list': { status: 401, body: 'unauthorized' } });
         try {
             await page.click('#pilot-devices [data-test="refresh"]');
             assertOk(await visible(page, '#pilot-devices [data-test="error"]'), 'the error banner appears');
@@ -314,15 +320,15 @@ export default async function run(ctx) {
                 // behind. compatError is caught internally either way and does
                 // not gate notifyServerChanged(), which fires before the probe.
                 'GET /admin/swagger/doc.json': { status: 404, body: '404 page not found' },
-                'GET /api/currentUser2': PROBE_OK,
-                'GET /api/ab/shared/profiles': PROBE_OK,
-                'GET /api/ab/peers': PROBE_OK,
-                'GET /admin/user': PROBE_OK,
-                'GET /admin/group': PROBE_OK,
-                'GET /admin/audit_conn': PROBE_OK,
-                'GET /admin/audit_file': PROBE_OK,
-                'GET /admin/login_log': PROBE_OK,
-                'GET /admin/peer': listOk(prodDevices)
+                'GET /api/currentUser': PROBE_OK,
+                'POST /api/ab/shared/profiles': PROBE_OK,
+                'POST /api/ab/peers': PROBE_OK,
+                'GET /api/admin/user/list': PROBE_OK,
+                'GET /api/admin/group/list': PROBE_OK,
+                'GET /api/admin/audit_conn/list': PROBE_OK,
+                'GET /api/admin/audit_file/list': PROBE_OK,
+                'GET /api/admin/login_log/list': PROBE_OK,
+                'GET /api/admin/peer/list': listOk(prodDevices)
             }
         };
     }
@@ -373,7 +379,7 @@ export default async function run(ctx) {
             // switchServer() genuinely triggered a NEW fetch that observed the
             // swap -- not a coincidental re-render of data already in memory.
             await page.evaluate((list) => {
-                window.__pilotStub.http['GET /admin/peer'] = { status: 200, body:
+                window.__pilotStub.http['GET /api/admin/peer/list'] = { status: 200, body:
                     { code: 0, message: '', data: { list, page: 1, total: list.length, page_size: 50 } } };
             }, STAGING_DEVICES);
 
@@ -399,7 +405,7 @@ export default async function run(ctx) {
             { alias: 'no id at all' },
             null
         ];
-        const page = await openDevices(ctx, { 'GET /admin/peer': listOk(hostile) });
+        const page = await openDevices(ctx, { 'GET /api/admin/peer/list': listOk(hostile) });
         try {
             await page.click('#pilot-devices [data-test="refresh"]');
             await waitRowCount(page, 1);
@@ -433,8 +439,8 @@ export default async function run(ctx) {
     await check('FINDING 3: the address book selector is real, and "Add to address book" ' +
         'actually calls the API with the CHOSEN book', async () => {
         const page = await openDevices(ctx, {
-            'GET /admin/peer': listOk(DEVICES),
-            'GET /api/ab/shared/profiles': BOOKS_OK,
+            'GET /api/admin/peer/list': listOk(DEVICES),
+            'POST /api/ab/shared/profiles': BOOKS_OK,
             'POST /api/ab/peer/add/': { status: 200, body: { code: 0, message: '', data: {} } }
         });
         try {
@@ -469,8 +475,8 @@ export default async function run(ctx) {
     await check('FINDING 3: with no address book at all, §7.3 says render the empty state ' +
         'and its CTA -- never an empty <select>', async () => {
         const page = await openDevices(ctx, {
-            'GET /admin/peer': listOk(DEVICES),
-            'GET /api/ab/shared/profiles': { reject: true, message: 'no address book service' }
+            'GET /api/admin/peer/list': listOk(DEVICES),
+            'POST /api/ab/shared/profiles': { reject: true, message: 'no address book service' }
         });
         try {
             await page.click('#pilot-devices [data-test="refresh"]');

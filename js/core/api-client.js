@@ -29,27 +29,65 @@
 
     // probe: true means "GET it during the compatibility probe". Only parameterless
     // GETs qualify — the probe must never mutate anything.
+    // CORRECTED WHOLESALE against the two swagger documents the server itself
+    // ships and serves -- /opt/rustdesk-api/docs/admin/admin_swagger.json and
+    // docs/api/api_swagger.json, both declaring basePath: /api -- and then
+    // checked by HTTP against a live v2.7 instance.
+    //
+    // Every route in this table was previously wrong, in three independent
+    // ways, and EVERY console surface 404'd against a real server:
+    //   1. the /api base path was missing entirely from the admin half;
+    //   2. the admin API is action-style (/peer/list, /peer/update,
+    //      /peer/delete), not REST-style (/peer, /peer/{id});
+    //   3. its mutations are all POST -- there is no PUT or DELETE anywhere in
+    //      the admin surface.
+    // The client half had its own errors: currentUser2 does not exist (it is
+    // currentUser), and shared/profiles, peers and tags/{guid} are POST, not
+    // GET. Measured directly:
+    //   404 /admin/peer   404 /api/admin/peer   200 /api/admin/peer/list
+    //   404 /api/currentUser2                   200 /api/currentUser
+    // Nothing caught it because the e2e stub was written to serve whatever this
+    // table asked for, so client and stub agreed on routes that exist nowhere.
     const ENDPOINTS = [
-        { id: 'session.current', method: 'GET', path: '/api/currentUser2', admin: false, probe: true },
-        { id: 'devices.list', method: 'GET', path: '/admin/peer', admin: true, probe: true },
-        { id: 'devices.rename', method: 'PUT', path: '/admin/peer/{id}', admin: true, probe: false },
-        { id: 'devices.remove', method: 'DELETE', path: '/admin/peer/{id}', admin: true, probe: false },
-        { id: 'ab.books', method: 'GET', path: '/api/ab/shared/profiles', admin: false, probe: true },
-        { id: 'ab.peers', method: 'GET', path: '/api/ab/peers', admin: false, probe: true },
+        // The client-surface probe. NOT /api/currentUser: the shipped
+        // api_swagger.json declares it, but v2.7 does not route it -- measured
+        // 404 with a valid Bearer while /api/peers answered 200 on the same
+        // token. The swagger documents are a starting point, not the contract;
+        // the running server is the contract, which is what
+        // tests/e2e/live-api-contract.live.mjs exists to check.
+        { id: 'session.current', method: 'GET', path: '/api/peers', admin: false, probe: true },
+        { id: 'devices.list', method: 'GET', path: '/api/admin/peer/list', admin: true, probe: true },
+        { id: 'devices.rename', method: 'POST', path: '/api/admin/peer/update', admin: true, probe: false },
+        { id: 'devices.remove', method: 'POST', path: '/api/admin/peer/delete', admin: true, probe: false },
+        { id: 'ab.books', method: 'POST', path: '/api/ab/shared/profiles', admin: false, probe: false },
+        { id: 'ab.peers', method: 'POST', path: '/api/ab/peers', admin: false, probe: false },
         { id: 'ab.addPeer', method: 'POST', path: '/api/ab/peer/add/{ab}', admin: false, probe: false },
         { id: 'ab.updatePeer', method: 'PUT', path: '/api/ab/peer/update/{ab}', admin: false, probe: false },
-        { id: 'ab.removePeer', method: 'DELETE', path: '/api/ab/peer/{ab}', admin: false, probe: false },
-        { id: 'ab.tags', method: 'GET', path: '/api/ab/tags/{ab}', admin: false, probe: false },
+        // Not a typo: the server routes DELETE for a peer at .../peer/add/{guid},
+        // the same path as POST. Verified in api_swagger.json.
+        { id: 'ab.removePeer', method: 'DELETE', path: '/api/ab/peer/add/{ab}', admin: false, probe: false },
+        { id: 'ab.tags', method: 'POST', path: '/api/ab/tags/{ab}', admin: false, probe: false },
         { id: 'ab.addTag', method: 'POST', path: '/api/ab/tag/add/{ab}', admin: false, probe: false },
         { id: 'ab.renameTag', method: 'PUT', path: '/api/ab/tag/rename/{ab}', admin: false, probe: false },
         { id: 'ab.removeTag', method: 'DELETE', path: '/api/ab/tag/{ab}', admin: false, probe: false },
-        { id: 'users.list', method: 'GET', path: '/admin/user', admin: true, probe: true },
-        { id: 'users.create', method: 'POST', path: '/admin/user', admin: true, probe: false },
-        { id: 'users.update', method: 'PUT', path: '/admin/user/{id}', admin: true, probe: false },
-        { id: 'users.groups', method: 'GET', path: '/admin/group', admin: true, probe: true },
-        { id: 'audit.conn', method: 'GET', path: '/admin/audit_conn', admin: true, probe: true },
-        { id: 'audit.file', method: 'GET', path: '/admin/audit_file', admin: true, probe: true },
-        { id: 'audit.login', method: 'GET', path: '/admin/login_log', admin: true, probe: true }
+        { id: 'users.list', method: 'GET', path: '/api/admin/user/list', admin: true, probe: true },
+        { id: 'users.create', method: 'POST', path: '/api/admin/user/create', admin: true, probe: false },
+        { id: 'users.update', method: 'POST', path: '/api/admin/user/update', admin: true, probe: false },
+        // Also NOT what admin_swagger.json says: it declares
+        // /admin/user/updatePassword, which 404s. The routes v2.7 actually
+        // serves are changePwd (an admin setting any user's password, by id)
+        // and changeCurPwd (the caller's own, requiring the old one). changePwd
+        // is the one both callers need -- the Users surface resetting someone
+        // else's, and the setup wizard setting the admin's own straight after
+        // logging in with the generated one.
+        { id: 'users.password', method: 'POST', path: '/api/admin/user/changePwd', admin: true, probe: false },
+        { id: 'users.groups', method: 'GET', path: '/api/admin/group/list', admin: true, probe: true },
+        { id: 'audit.conn', method: 'GET', path: '/api/admin/audit_conn/list', admin: true, probe: true },
+        { id: 'audit.file', method: 'GET', path: '/api/admin/audit_file/list', admin: true, probe: true },
+        { id: 'audit.login', method: 'GET', path: '/api/admin/login_log/list', admin: true, probe: true },
+        // The handover step's password change: log in with the generated
+        // password to obtain an admin token, then set the chosen one.
+        { id: 'admin.login', method: 'POST', path: '/api/admin/login', admin: false, probe: false }
     ].map(Object.freeze);
 
     const EP = {};
@@ -57,6 +95,16 @@
 
     function fail(kind, message, detail) { return Errors.create(kind, message, detail || {}); }
     function str(v) { return v === null || v === undefined ? '' : String(v); }
+
+    // admin.UserForm and admin.UserPasswordForm both type `id` as an INTEGER.
+    // Sending "1" where 1 is expected is rejected by the server's binder, so a
+    // string id from the DOM is converted once, here, rather than at each site.
+    function numId(v) {
+        const n = typeof v === 'number' ? v : parseInt(str(v), 10);
+        if (!Number.isFinite(n) || n < 0 || Math.floor(n) !== n)
+            throw fail('GENERIC', 'a user id must be a non-negative integer', { value: str(v) });
+        return n;
+    }
 
     function probeTargets() { return ENDPOINTS.filter(function (ep) { return ep.probe; }); }
 
@@ -376,15 +424,28 @@
         request: request,
         devices: {
             list: function (q) { return listCall('devices.list', q); },
+            // The admin API carries the target in the BODY, not the path -- it
+            // has no /{id} routes and no PUT/DELETE at all. The device's own
+            // name field is `alias` (admin.PeerForm); `name` is not a field the
+            // server knows, so renaming used to write nothing even if the path
+            // had existed.
             rename: function (id, name) {
                 return guarded(function () {
                     return call('devices.rename', {
-                        params: { id: id },
-                        body: { id: text(String(id === null || id === undefined ? '' : id), 'a device id'), name: text(name, 'a device name') }
+                        body: {
+                            id: text(String(id === null || id === undefined ? '' : id), 'a device id'),
+                            alias: text(name, 'a device name')
+                        }
                     });
                 });
             },
-            remove: function (id) { return call('devices.remove', { params: { id: id } }); },
+            remove: function (id) {
+                return guarded(function () {
+                    return call('devices.remove', {
+                        body: { id: text(String(id === null || id === undefined ? '' : id), 'a device id') }
+                    });
+                });
+            },
             addToAddressBook: function (id, ab) {
                 return guarded(function () {
                     return call('ab.addPeer', {
@@ -463,29 +524,46 @@
             },
             update: function (u) {
                 return guarded(function () {
-                    const user = plain(u, 'a user');
-                    return call('users.update', { params: { id: user.id }, body: user });
+                    return call('users.update', { body: plain(u, 'a user') });
                 });
             },
+            // guarded(): numId() throws while BUILDING the body, before call()
+            // is ever entered, so its own try/catch cannot see it. Without this
+            // an empty id would be an uncaught synchronous exception out of a
+            // click handler rather than a typed rejection the surface renders.
             setEnabled: function (id, on) {
-                return call('users.update', {
-                    params: { id: id },
-                    body: { id: str(id), status: on ? 1 : 0 }
+                return guarded(function () {
+                    return call('users.update', { body: { id: numId(id), status: on ? 1 : 0 } });
                 });
             },
+            // A DEDICATED endpoint: /admin/user/update has no password field at
+            // all (admin.UserForm), so sending one there changed nothing and
+            // reported success. /admin/user/updatePassword is the only route
+            // that sets a password, and its id is an integer, not a string.
             resetPassword: function (id, pw) {
                 return guarded(function () {
-                    return call('users.update', {
-                        params: { id: id },
-                        body: { id: str(id), password: text(pw, 'a password') }
-                    });
+                    return call('users.password',
+                        { body: { id: numId(id), password: text(pw, 'a password') } });
                 });
             },
             groups: function () { return call('users.groups').then(asList); },
             setGroup: function (id, gid) {
-                return call('users.update', {
-                    params: { id: id },
-                    body: { id: str(id), group_id: gid }
+                return guarded(function () {
+                    return call('users.update', { body: { id: numId(id), group_id: gid } });
+                });
+            },
+            // Obtain an admin token from a username/password. Used by the setup
+            // wizard's handover step, which has no token yet: the server it just
+            // installed generated its own admin password and nothing has been
+            // configured.
+            login: function (username, password) {
+                return guarded(function () {
+                    return call('admin.login', {
+                        body: {
+                            username: text(username, 'a username'),
+                            password: text(password, 'a password')
+                        }
+                    });
                 });
             }
         },

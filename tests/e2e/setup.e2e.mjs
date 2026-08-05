@@ -238,9 +238,13 @@ async function runBody(ctx) {
             assertOk(await visible(page, '[data-testid="pane-hostkey"]'),
                 'an unconfirmed fingerprint must block the wizard');
             // Once refused, the red error carries the same instruction, so the
-            // grey hint stands down rather than saying it twice.
-            assertMatch(await page.textContent('[data-testid="hostkey-error"]'), /Confirm the host key/i);
-            assertOk(!(await visible(page, '[data-testid="hostkey-pending"]')),
+            // grey hint stands down rather than saying it twice. Wait for the
+            // error to actually render before reading the hint: visible() polls
+            // and would otherwise catch the frame before Alpine re-renders,
+            // which is a race, not a result.
+            assertMatch(await waitForText(page, '[data-testid="hostkey-error"]',
+                (t) => /Confirm the host key/i.test(t), 'hostkey-error'), /Confirm the host key/i);
+            assertOk(!(await page.isVisible('[data-testid="hostkey-pending"]')),
                 'the hint and the error must not both say the same thing');
             const call = await spawnedCheckHostkey(page);
             assertOk(call, '--check-hostkey was never spawned by the real UI flow');
@@ -838,15 +842,15 @@ async function runBody(ctx) {
         files: {},
         http: {
             'GET /admin/swagger/doc.json': { status: 404, body: '404 page not found' },
-            'GET /api/currentUser2': PROBE_OK,
-            'GET /admin/peer': listOk([REGISTERED_DEVICE]),
-            'GET /api/ab/shared/profiles': PROBE_OK,
-            'GET /api/ab/peers': PROBE_OK,
-            'GET /admin/user': PROBE_OK,
-            'GET /admin/group': PROBE_OK,
-            'GET /admin/audit_conn': PROBE_OK,
-            'GET /admin/audit_file': PROBE_OK,
-            'GET /admin/login_log': PROBE_OK
+            'GET /api/currentUser': PROBE_OK,
+            'GET /api/admin/peer/list': listOk([REGISTERED_DEVICE]),
+            'POST /api/ab/shared/profiles': PROBE_OK,
+            'POST /api/ab/peers': PROBE_OK,
+            'GET /api/admin/user/list': PROBE_OK,
+            'GET /api/admin/group/list': PROBE_OK,
+            'GET /api/admin/audit_conn/list': PROBE_OK,
+            'GET /api/admin/audit_file/list': PROBE_OK,
+            'GET /api/admin/login_log/list': PROBE_OK
         }
     };
 
@@ -917,7 +921,7 @@ async function runBody(ctx) {
                 () => document.querySelectorAll('#pilot-devices [data-test="row"]').length === 1,
                 null, { timeout: WAIT });
             const peerCalls = (await page.evaluate(() => window.__pilotStub.calls))
-                .filter((c) => c.kind === 'http' && c.path.indexOf('/admin/peer') === 0);
+                .filter((c) => c.kind === 'http' && c.path.indexOf('/api/admin/peer') === 0);
             assertOk(peerCalls.length >= 1,
                 'Devices never actually queried the newly registered server');
             const names = await page.$$eval('#pilot-devices [data-test="name"] span[x-text]',

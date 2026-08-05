@@ -435,15 +435,15 @@ export default async function run(ctx) {
                 // does not leave an unrelated console error behind; it runs
                 // AFTER notifyServerChanged() and does not gate this check.
                 'GET /admin/swagger/doc.json': { status: 404, body: '404 page not found' },
-                'GET /api/currentUser2': PROBE_OK,
-                'GET /api/ab/shared/profiles': PROBE_OK,
-                'GET /api/ab/peers': PROBE_OK,
-                'GET /admin/user': PROBE_OK,
-                'GET /admin/group': PROBE_OK,
-                'GET /admin/audit_conn': PROBE_OK,
-                'GET /admin/audit_file': PROBE_OK,
-                'GET /admin/login_log': PROBE_OK,
-                'GET /admin/peer': listOk(alphaDevices)
+                'GET /api/currentUser': PROBE_OK,
+                'POST /api/ab/shared/profiles': PROBE_OK,
+                'POST /api/ab/peers': PROBE_OK,
+                'GET /api/admin/user/list': PROBE_OK,
+                'GET /api/admin/group/list': PROBE_OK,
+                'GET /api/admin/audit_conn/list': PROBE_OK,
+                'GET /api/admin/audit_file/list': PROBE_OK,
+                'GET /api/admin/login_log/list': PROBE_OK,
+                'GET /api/admin/peer/list': listOk(alphaDevices)
             }
         };
     }
@@ -466,7 +466,7 @@ export default async function run(ctx) {
 
     function peerCalls(page) {
         return page.evaluate(() => window.__pilotStub.calls
-            .filter((c) => c.kind === 'http' && c.method === 'GET' && c.path.indexOf('/admin/peer') === 0));
+            .filter((c) => c.kind === 'http' && c.method === 'GET' && c.path.indexOf('/api/admin/peer') === 0));
     }
 
     await check('CRITICAL: switching ONLY through the Overview control re-wires the real transport', async () => {
@@ -494,7 +494,7 @@ export default async function run(ctx) {
             // switch genuinely triggered a NEW fetch that observed the swap,
             // never a coincidental re-render of data already in memory.
             await page.evaluate((list) => {
-                window.__pilotStub.http['GET /admin/peer'] = { status: 200, body:
+                window.__pilotStub.http['GET /api/admin/peer/list'] = { status: 200, body:
                     { code: 0, message: '', data: { list, page: 1, total: list.length, page_size: 50 } } };
             }, BETA_DEVICES);
 
@@ -524,7 +524,7 @@ export default async function run(ctx) {
             await page.click('#pilot-overview [data-test="refresh"]');
             await page.waitForFunction(
                 (n) => window.__pilotStub.calls.filter((c) =>
-                    c.kind === 'http' && c.path.indexOf('/admin/peer') === 0).length > n,
+                    c.kind === 'http' && c.path.indexOf('/api/admin/peer') === 0).length > n,
                 after.length, { timeout: WAIT });
             const final = await peerCalls(page);
             assertEqual(final[final.length - 1].address, 'beta.example.com',

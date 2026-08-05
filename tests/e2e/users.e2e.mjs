@@ -24,9 +24,9 @@ const GROUPS = [
     { id: 'g2', name: 'Field', device_count: 0 }
 ];
 const USERS = [
-    { id: 'u1', name: 'ada', email: 'ada@example.com', group_id: 'g1', status: 1, is_admin: true },
-    { id: 'u2', name: 'bob', email: 'bob@example.com', group_id: 'g2', status: 0 },
-    { id: 'u3', name: 'cem', email: 'cem@example.com', group_id: '', status: 1 }
+    { id: 1, name: 'ada', email: 'ada@example.com', group_id: 'g1', status: 1, is_admin: true },
+    { id: 2, name: 'bob', email: 'bob@example.com', group_id: 'g2', status: 0 },
+    { id: 3, name: 'cem', email: 'cem@example.com', group_id: '', status: 1 }
 ];
 
 // C12: HTTP 200 even on failure, {code,message,data}; paginated data. Matches
@@ -40,8 +40,8 @@ const AUTH_FAIL = { status: 401, body: 'unauthorized' };
 
 function baseRoutes(over) {
     return Object.assign({
-        'GET /admin/group': listOk(GROUPS),
-        'GET /admin/user': listOk(USERS)
+        'GET /api/admin/group/list': listOk(GROUPS),
+        'GET /api/admin/user/list': listOk(USERS)
     }, over || {});
 }
 
@@ -131,7 +131,7 @@ export default async function run(ctx) {
     }
 
     await check('users: Disable calls the façade with the right id and status, then re-reads the list', async () => {
-        const page = await openUsers(ctx, baseRoutes({ 'PUT /admin/user/u1': { code: 0, message: '', data: {} } }));
+        const page = await openUsers(ctx, baseRoutes({ 'POST /api/admin/user/update': { code: 0, message: '', data: {} } }));
         try {
             await page.click('#pilot-users [data-testid="users-refresh"]');
             await waitRowCount(page, 3);
@@ -139,11 +139,13 @@ export default async function run(ctx) {
             await page.locator('#pilot-users [data-testid="users-row"]').first()
                 .locator('[data-testid="users-toggle"]').click();
             await page.waitForFunction(() => (window.__pilotTransport || { calls: [] }).calls
-                .some((c) => c.method === 'PUT'), null, { timeout: WAIT });
+                .some((c) => c.path.indexOf('/api/admin/user/update') === 0), null, { timeout: WAIT });
             const calls = await transportCalls(page);
-            const wrote = calls.find((c) => c.method === 'PUT');
+            const wrote = calls.find((c) => c.path.indexOf('/api/admin/user/update') === 0);
             assertOk(wrote, 'no write request was issued');
-            assertEqual(wrote.path, '/admin/user/u1', 'the toggle addressed the right account');
+            assertEqual(wrote.method, 'POST', 'the admin API has no PUT at all');
+            assertEqual(jsonBody(wrote) && jsonBody(wrote).id, 1,
+                'the toggle addressed the right account, with the integer id the server types');
             assertEqual(jsonBody(wrote) && jsonBody(wrote).status, 0, 'disabling must send status:0');
             const gets = calls.filter((c) => c.method === 'GET' && c.path.indexOf('/admin/user') !== -1);
             assertOk(gets.length >= 2, 'the list was not re-read after the write');
@@ -151,16 +153,17 @@ export default async function run(ctx) {
     });
 
     await check('users: assigning a different group calls setGroup with the right ids', async () => {
-        const page = await openUsers(ctx, baseRoutes({ 'PUT /admin/user/u3': { code: 0, message: '', data: {} } }));
+        const page = await openUsers(ctx, baseRoutes({ 'POST /api/admin/user/update': { code: 0, message: '', data: {} } }));
         try {
             await page.click('#pilot-users [data-testid="users-refresh"]');
             await waitRowCount(page, 3);
             const row = page.locator('#pilot-users [data-testid="users-row"]').nth(2);
             await row.locator('[data-testid="users-group"]').selectOption('g2');
             await page.waitForFunction(() => (window.__pilotTransport || { calls: [] }).calls
-                .some((c) => c.method === 'PUT'), null, { timeout: WAIT });
+                .some((c) => c.path.indexOf('/api/admin/user/update') === 0), null, { timeout: WAIT });
             const calls = await transportCalls(page);
-            const wrote = calls.find((c) => c.method === 'PUT' && c.path === '/admin/user/u3');
+            const wrote = calls.find((c) => c.path.indexOf('/api/admin/user/update') === 0 &&
+                jsonBody(c) && jsonBody(c).id === 3);
             assertOk(wrote, 'setGroup did not reach the façade');
             assertEqual(jsonBody(wrote) && jsonBody(wrote).group_id, 'g2', 'the wrong group id was sent');
         } finally { await page.ctx.close(); }
@@ -170,7 +173,7 @@ export default async function run(ctx) {
         // Groups is deliberately empty here, and u1's group_id ('g1') never
         // appears in it -- proves the <select> cannot silently fall back to
         // its default "Unassigned" option for an account that IS assigned.
-        const page = await openUsers(ctx, baseRoutes({ 'GET /admin/group': listOk([]) }));
+        const page = await openUsers(ctx, baseRoutes({ 'GET /api/admin/group/list': listOk([]) }));
         try {
             await page.click('#pilot-users [data-testid="users-refresh"]');
             await waitRowCount(page, 3);
@@ -182,7 +185,11 @@ export default async function run(ctx) {
 
     await check('users: resetting a password sends it once and it never lands in the DOM, a URL or storage', async () => {
         const SECRET = 'correct horse battery staple 42';
-        const page = await openUsers(ctx, baseRoutes({ 'PUT /admin/user/u2': { code: 0, message: '', data: {} } }));
+        // A password change is its OWN endpoint now: /user/update has no
+        // password field at all, so the old route would have accepted the call
+        // and changed nothing.
+        const page = await openUsers(ctx, baseRoutes({
+            'POST /api/admin/user/changePwd': { code: 0, message: '', data: {} } }));
         try {
             await page.click('#pilot-users [data-testid="users-refresh"]');
             await waitRowCount(page, 3);
@@ -202,7 +209,8 @@ export default async function run(ctx) {
             }, null, { timeout: WAIT });
 
             const calls = await transportCalls(page);
-            const wrote = calls.find((c) => c.method === 'PUT' && c.path === '/admin/user/u2');
+            const wrote = calls.find((c) => c.path === '/api/admin/user/changePwd' &&
+                jsonBody(c) && jsonBody(c).id === 2);
             assertOk(wrote, 'resetPassword did not reach the façade');
             assertEqual(jsonBody(wrote) && jsonBody(wrote).password, SECRET, 'the password did not reach the API body');
             assertOk(wrote.path.indexOf(SECRET) === -1, 'the password leaked into the request PATH');
@@ -236,7 +244,7 @@ export default async function run(ctx) {
     });
 
     await check('users: creating a valid account posts once and resets the form', async () => {
-        const page = await openUsers(ctx, baseRoutes({ 'POST /admin/user': { code: 0, message: '', data: {} } }));
+        const page = await openUsers(ctx, baseRoutes({ 'POST /api/admin/user/create': { code: 0, message: '', data: {} } }));
         try {
             await page.click('#pilot-users [data-testid="users-refresh"]');
             await waitRowCount(page, 3);
@@ -248,14 +256,14 @@ export default async function run(ctx) {
                 document.querySelector('#pilot-users [data-testid="users-new-name"]').value === '',
                 null, { timeout: WAIT });
             const calls = await transportCalls(page);
-            const posted = calls.filter((c) => c.method === 'POST' && c.path === '/admin/user');
+            const posted = calls.filter((c) => c.path === '/api/admin/user/create');
             assertEqual(posted.length, 1, 'exactly one account must be created');
             assertEqual(jsonBody(posted[0]) && jsonBody(posted[0]).name, 'newop', 'the wrong account was created');
         } finally { await page.ctx.close(); }
     });
 
     await check('users: an empty roster shows a real actionable empty state, not an error', async () => {
-        const page = await openUsers(ctx, baseRoutes({ 'GET /admin/user': listOk([]) }));
+        const page = await openUsers(ctx, baseRoutes({ 'GET /api/admin/user/list': listOk([]) }));
         try {
             await page.click('#pilot-users [data-testid="users-refresh"]');
             assertOk(await visible(page, '#pilot-users [data-testid="users-empty"]'), 'the empty state appears');
@@ -273,7 +281,7 @@ export default async function run(ctx) {
     });
 
     await check('users: a search with no matches gets its own empty state, distinct from "no accounts at all"', async () => {
-        const page = await openUsers(ctx, baseRoutes({ 'GET /admin/user?keyword=nomatch': listOk([]) }));
+        const page = await openUsers(ctx, baseRoutes({ 'GET /api/admin/user/list?keyword=nomatch': listOk([]) }));
         try {
             await page.click('#pilot-users [data-testid="users-refresh"]');
             await waitRowCount(page, 3);
@@ -291,7 +299,7 @@ export default async function run(ctx) {
     });
 
     await check('users: a failing list shows a specific reason and no rows', async () => {
-        const page = await openUsers(ctx, baseRoutes({ 'GET /admin/user': LIST_FAIL }));
+        const page = await openUsers(ctx, baseRoutes({ 'GET /api/admin/user/list': LIST_FAIL }));
         try {
             await page.click('#pilot-users [data-testid="users-refresh"]');
             assertOk(await visible(page, '#pilot-users [data-testid="users-alert"]'), 'the error banner appears');
@@ -303,7 +311,7 @@ export default async function run(ctx) {
     });
 
     await check('users: an auth failure recommends signing in again, not a generic "try again"', async () => {
-        const page = await openUsers(ctx, baseRoutes({ 'GET /admin/user': AUTH_FAIL }));
+        const page = await openUsers(ctx, baseRoutes({ 'GET /api/admin/user/list': AUTH_FAIL }));
         try {
             await page.click('#pilot-users [data-testid="users-refresh"]');
             assertOk(await visible(page, '#pilot-users [data-testid="users-alert"]'), 'the error banner appears');
@@ -314,7 +322,7 @@ export default async function run(ctx) {
     });
 
     await check('users: a groups failure is a warning; the accounts still render', async () => {
-        const page = await openUsers(ctx, baseRoutes({ 'GET /admin/group': { status: 200, body:
+        const page = await openUsers(ctx, baseRoutes({ 'GET /api/admin/group/list': { status: 200, body:
             { code: 7, message: 'group service unavailable', data: null } } }));
         try {
             await page.click('#pilot-users [data-testid="users-refresh"]');
@@ -339,7 +347,7 @@ export default async function run(ctx) {
         ];
         const hostileGroups = [{ id: 'g1', name: '<script>window.__xss2=1</script>', device_count: 1 }];
         const page = await openUsers(ctx, baseRoutes({
-            'GET /admin/user': listOk(hostile), 'GET /admin/group': listOk(hostileGroups)
+            'GET /api/admin/user/list': listOk(hostile), 'GET /api/admin/group/list': listOk(hostileGroups)
         }));
         try {
             await page.click('#pilot-users [data-testid="users-refresh"]');
@@ -390,15 +398,15 @@ export default async function run(ctx) {
             },
             http: {
                 'GET /admin/swagger/doc.json': { status: 404, body: '404 page not found' },
-                'GET /api/currentUser2': PROBE_OK,
-                'GET /api/ab/shared/profiles': PROBE_OK,
-                'GET /api/ab/peers': PROBE_OK,
-                'GET /admin/peer': PROBE_OK,
-                'GET /admin/audit_conn': PROBE_OK,
-                'GET /admin/audit_file': PROBE_OK,
-                'GET /admin/login_log': PROBE_OK,
-                'GET /admin/group': listOk(GROUPS),
-                'GET /admin/user': listOk(prodUsers)
+                'GET /api/currentUser': PROBE_OK,
+                'POST /api/ab/shared/profiles': PROBE_OK,
+                'POST /api/ab/peers': PROBE_OK,
+                'GET /api/admin/peer/list': PROBE_OK,
+                'GET /api/admin/audit_conn/list': PROBE_OK,
+                'GET /api/admin/audit_file/list': PROBE_OK,
+                'GET /api/admin/login_log/list': PROBE_OK,
+                'GET /api/admin/group/list': listOk(GROUPS),
+                'GET /api/admin/user/list': listOk(prodUsers)
             }
         };
     }
@@ -446,7 +454,7 @@ export default async function run(ctx) {
                 'prod\'s accounts are shown on load with no manual refresh click');
 
             await page.evaluate((list) => {
-                window.__pilotStub.http['GET /admin/user'] = { status: 200, body:
+                window.__pilotStub.http['GET /api/admin/user/list'] = { status: 200, body:
                     { code: 0, message: '', data: { list, page: 1, total: list.length, page_size: 50 } } };
             }, STAGING_USERS);
 

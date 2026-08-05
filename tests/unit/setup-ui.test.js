@@ -2099,3 +2099,162 @@ test('index.html: the PEM box is tall enough to show a whole key', () => {
     assert.ok(Number(rows[1]) >= 12, 'a whole key must be visible at once, got rows=' + rows[1]);
     assert.match(el, /font-monospace/, 'key material is fixed-width; wrapping it hides truncation');
 });
+
+// -------------------------------- the generated admin password (handover)
+
+test('capturePassword lifts the generated password out of the journal transcript', () => {
+    const exec = { steps: [
+        { id: 'verify', title: 'v', status: 'ok', exit: 0, lines: [{ stream: 'stdout', text: 'nothing here' }] },
+        { id: 'verify-admin', title: 'Capture', status: 'ok', exit: 0, lines: [
+            { stream: 'stdout', text: 'Aug 05 systemd[1]: Started rustdesk-api.service' },
+            { stream: 'stdout', text: 'apimain[42911]: [INFO] Admin Password Is: Eqi9slpH (/home/runner/work/x' }
+        ] }
+    ] };
+    assert.equal(UI.capturePassword(exec), 'Eqi9slpH');
+    assert.equal(UI.capturePassword({ steps: [] }), '');
+    for (const bad of [null, undefined, {}, { steps: 'no' }, 7])
+        assert.equal(UI.capturePassword(bad), '', JSON.stringify(bad));
+});
+
+test('the generated password is scrubbed from the transcript AND the persisted lines', () => {
+    // It arrived in cleartext: rendered into the DOM, written to the run file
+    // and included in "Copy full transcript" -- despite the step being marked
+    // secret, which only ever masked the COMMAND.
+    const exec = { steps: [{ id: 'verify-admin', title: 'x', status: 'ok', exit: 0, lines: [
+        { stream: 'stdout', text: 'Admin Password Is: Eqi9slpH (build path)' },
+        { stream: 'stdout', text: 'and again Eqi9slpH here' }
+    ] }] };
+    UI.scrubSecret(exec, 'Eqi9slpH');
+    for (const l of exec.steps[0].lines)
+        assert.ok(l.text.indexOf('Eqi9slpH') === -1, 'still leaking: ' + l.text);
+    assert.match(exec.steps[0].lines[0].text, /Admin Password Is: •+/);
+
+    const raw = ['{"line":"Admin Password Is: Eqi9slpH"}', 'unrelated'];
+    UI.scrubLines(raw, 'Eqi9slpH');
+    assert.ok(!raw.join('\n').includes('Eqi9slpH'), 'the persisted transcript still carries it');
+    // A missing secret must be a no-op, never a crash or a mass-replacement.
+    const before = raw.slice();
+    UI.scrubLines(raw, '');
+    assert.deepEqual(raw, before);
+});
+
+test('finish(): declining the change is honoured and never calls the API', async () => {
+    const c = UI.pilotSetupUi();
+    let called = 0;
+    c.passwordWriter = () => { called += 1; return Promise.resolve(); };
+    c.changePassword = false;
+    assert.equal(await c.finish(), true, 'declining must still finish the wizard');
+    assert.equal(called, 0, 'nothing may be written to the server when the user declined');
+    assert.equal(c.finished, true);
+});
+
+test('finish(): accepting still enforces the password rules before writing anything', async () => {
+    const c = UI.pilotSetupUi();
+    const written = [];
+    c.passwordWriter = (pw) => { written.push(pw); return Promise.resolve(); };
+    c.changePassword = true;
+    c.pw = { password: 'short', confirm: 'short' };
+    assert.equal(await c.finish(), false);
+    assert.match(c.pwErrors.password, /at least 12/);
+    assert.deepEqual(written, [], 'a rejected form must not reach the server');
+
+    c.pw = { password: 'a properly long password', confirm: 'mismatch' };
+    assert.equal(await c.finish(), false);
+    assert.match(c.pwErrors.confirm, /do not match/);
+    assert.deepEqual(written, []);
+
+    c.pw = { password: 'a properly long password', confirm: 'a properly long password' };
+    assert.equal(await c.finish(), true);
+    assert.deepEqual(written, ['a properly long password']);
+    assert.equal(c.finished, true);
+    assert.deepEqual(c.pw, { password: '', confirm: '' }, 'the form must not keep the password');
+});
+
+test('finish(): the generated password may not be kept as the new one', async () => {
+    const c = UI.pilotSetupUi();
+    c.passwordWriter = () => Promise.resolve();
+    c.changePassword = true;
+    c.generatedPassword = 'aGeneratedOne123';
+    c.pw = { password: 'aGeneratedOne123', confirm: 'aGeneratedOne123' };
+    assert.equal(await c.finish(), false, 'this guard was dead: generatedPassword was never captured');
+    assert.match(c.pwErrors.password, /still the generated/i);
+});
+
+test('finish(): once changed, the generated password stops being held or shown', async () => {
+    const c = UI.pilotSetupUi();
+    c.passwordWriter = () => Promise.resolve();
+    c.changePassword = true;
+    c.generatedPassword = 'oldGenerated1';
+    c.pw = { password: 'a properly long password', confirm: 'a properly long password' };
+    assert.equal(await c.finish(), true);
+    assert.equal(c.generatedPassword, '', 'a password that no longer works must not linger in memory');
+});
+
+test('index.html: the handover password fields are labelled, opt-in, and reveal-on-click', () => {
+    const html = fs.readFileSync(path.join(ROOT, 'index.html'), 'utf8');
+    const pane = html.slice(html.indexOf('data-testid="pane-handover"'));
+    // Two anonymous boxes with no labels is what shipped.
+    assert.match(pane, /<label[^>]*for="pl-new-pw"[^>]*>\s*New password/);
+    assert.match(pane, /<label[^>]*for="pl-confirm-pw"[^>]*>\s*Confirm new password/);
+    assert.match(pane, /data-testid="change-password"[\s\S]{0,160}x-model="changePassword"/);
+    // Attribute order is not a contract; presence on the right element is.
+    const fieldsAt = pane.indexOf('data-testid="pw-fields"');
+    assert.ok(fieldsAt > 0, 'the password fields need their own gated container');
+    assert.match(pane.slice(pane.lastIndexOf('<', fieldsAt), pane.indexOf('>', fieldsAt) + 1),
+        /x-show="changePassword"/, 'the fields must be hidden when the user declines');
+    // Declining must tell the user the password they will actually need, and
+    // only behind a click -- never in the transcript, which gets copied and
+    // written to disk.
+    assert.match(pane, /data-testid="reveal-generated"/);
+    assert.match(pane, /data-testid="generated-password"[\s\S]{0,80}x-show="showGenerated"/);
+});
+
+test('start(): the generated password never survives in the transcript or the persisted run', async () => {
+    // Mutation showed the helpers above prove nothing about the wiring:
+    // deleting the scrubSecret() call from start() left every other test green.
+    // This drives the real start() and reads what a user would copy.
+    const SECRET = 'Eqi9slpH';
+    const TRANSCRIPT = [
+        '{"t":"run-start","run_id":"20260805T000000Z","transport":"local","steps":1}',
+        '{"t":"step-start","id":"verify-admin","title":"Capture the generated admin password","cmd":"\\u2022\\u2022\\u2022"}',
+        '{"t":"output","id":"verify-admin","stream":"stdout",' +
+            '"line":"apimain[1]: [INFO] Admin Password Is: ' + SECRET + ' (/home/runner/work)"}',
+        '{"t":"step-end","id":"verify-admin","status":"ok","exit":0,"ms":9}',
+        '{"t":"run-end","status":"ok","kind":null}'
+    ].join('\n') + '\n';
+
+    const written = [];
+    const c = await withFakeCockpit({
+        spawn() {
+            let onChunk = null;
+            const p = Promise.resolve().then(() => { if (onChunk) onChunk(TRANSCRIPT); return TRANSCRIPT; });
+            p.input = () => p;
+            p.stream = (fn) => { onChunk = fn; return p; };
+            return p;
+        },
+        file(path) {
+            return {
+                read: () => Promise.resolve(null),
+                replace: (content) => { written.push({ path: path, content: String(content) }); return Promise.resolve(); },
+                close() {}
+            };
+        }
+    }, async () => {
+        const ui = UI.pilotSetupUi();
+        ui.choices.target = 'local';
+        ui.plan = { target: 'local', host: null,
+            steps: [{ id: 'verify-admin', title: 'Capture the generated admin password', argv: ['journalctl'] }] };
+        await ui.start();
+        return ui;
+    });
+
+    // Captured for the handover step...
+    assert.equal(c.generatedPassword, SECRET, 'the wizard must capture it, or the change flow cannot sign in');
+    // ...and present NOWHERE else.
+    assert.ok(!UI.transcriptText(c.exec).includes(SECRET),
+        'the transcript the user copies still contains the password');
+    for (const w of written)
+        assert.ok(!w.content.includes(SECRET),
+            'the persisted run file at ' + w.path + ' still contains the password');
+    assert.ok(written.length > 0, 'guard: nothing was persisted, so this proved nothing');
+});
