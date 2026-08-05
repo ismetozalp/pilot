@@ -2376,3 +2376,76 @@ test('isLastStep(): true only on the final visible step, for both targets', () =
     c.step = 'handover';
     assert.equal(c.isLastStep(), true);
 });
+
+// ------------------------------------------- coming back after a reload
+
+test('loadRegistered/hasRegistered: the wizard notices servers it already set up', async () => {
+    const c = UI.pilotSetupUi();
+    assert.equal(c.hasRegistered(), false, 'nothing registered yet');
+    // PilotServers.list() answers RECORDS, not ids -- the shape this test
+    // originally stubbed. Driving the real page printed "[object Object]",
+    // which is what the wrong stub had hidden.
+    await withFakeServers({ list: () => Promise.resolve([
+        { id: 'prod.example.com', host: 'prod.example.com', apiPort: 21114 },
+        { id: 'local', host: 'localhost', apiPort: 21114 }
+    ]) }, () => c.loadRegistered());
+    assert.deepEqual(c.registeredIds, ['prod.example.com', 'local'],
+        'the ids must be strings, or the page renders [object Object] and the ' +
+        'password change addresses nothing');
+    c.registeredIds.forEach((x) => assert.equal(typeof x, 'string'));
+    assert.equal(c.hasRegistered(), true);
+});
+
+test('loadRegistered: an unreadable registry offers nothing rather than throwing', async () => {
+    // init() calls this fire-and-forget, so a throw would be an unhandled
+    // rejection at mount, and the whole wizard would be the casualty.
+    const c = UI.pilotSetupUi();
+    await withFakeServers({ list: () => Promise.reject(new Error('permission denied')) },
+        () => c.loadRegistered());
+    assert.deepEqual(c.registeredIds, []);
+    assert.equal(c.hasRegistered(), false);
+    // Hostile shapes must not become a truthy "yes there are servers".
+    for (const bad of [null, undefined, 'nope', 7, {}, [null], [{}], [{ id: '' }], [{ id: 7 }]]) {
+        await withFakeServers({ list: () => Promise.resolve(bad) }, () => c.loadRegistered());
+        assert.deepEqual(c.registeredIds, [], JSON.stringify(bad));
+    }
+});
+
+test('resumeHandover: jumps straight to the password, ready to ask for the current one', async () => {
+    // THE REPORT: "when i reload i cant go to handover i have to start from the
+    // beginning". The password change only ever existed at the end of a full
+    // run, and the wizard keeps no state across a reload.
+    const c = UI.pilotSetupUi();
+    assert.equal(c.resumeHandover(), false, 'with nothing registered there is nothing to resume');
+    assert.equal(c.step, 'target');
+
+    await withFakeServers({ list: () => Promise.resolve([{ id: 'prod.example.com', host: 'p' }]) },
+        () => c.loadRegistered());
+    assert.equal(c.resumeHandover(), true);
+    assert.equal(c.step, 'handover');
+    assert.equal(c.registeredServerId, 'prod.example.com',
+        'the change has to be addressed at a real server record');
+    // On a return visit the generated password is long gone, so go straight to
+    // asking rather than making the user discover it by being refused.
+    assert.equal(c.needCurrentPassword, true);
+});
+
+test('resumeHandover: a freshly captured generated password is not thrown away', async () => {
+    const c = UI.pilotSetupUi();
+    c.generatedPassword = 'freshFromThisRun';
+    await withFakeServers({ list: () => Promise.resolve([{ id: 'local', host: 'localhost' }]) },
+        () => c.loadRegistered());
+    assert.equal(c.resumeHandover(), true);
+    assert.equal(c.needCurrentPassword, false,
+        'we have a password that should work; do not ask for one needlessly');
+});
+
+test('index.html: the target pane offers the resume path, only when there is one', () => {
+    const html = fs.readFileSync(path.join(ROOT, 'index.html'), 'utf8');
+    const pane = html.slice(html.indexOf('data-testid="pane-target"'), html.indexOf('data-testid="pane-hostkey"'));
+    const at = pane.indexOf('data-testid="resume-block"');
+    assert.ok(at > 0, 'there must be a way back to the handover step');
+    assert.match(pane.slice(pane.lastIndexOf('<', at), pane.indexOf('>', at) + 1),
+        /x-show="hasRegistered\(\)"/, 'and it must not appear on a first run');
+    assert.match(pane, /data-testid="resume-handover"[\s\S]{0,120}resumeHandover\(\)/);
+});

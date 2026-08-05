@@ -1272,6 +1272,7 @@
             // Filled in by the user when the captured one is stale or absent.
             currentPassword: '',
             needCurrentPassword: false,
+            registeredIds: [],
 
             // Set by start()/checkDns() only. tlsFailure carries
             // acmeFailureFrom()'s classified verdict for a failed tls-* step.
@@ -1283,6 +1284,52 @@
                     ? STEP_TITLES[str(id)] : str(id);
             },
             isStep(id) { return this.step === id; },
+            // The wizard keeps NO state across a reload -- by design, since a
+            // half-restored transcript would be a lie. But that stranded anyone
+            // who came back to finish: the administrator password lives on the
+            // handover step, and the only way there was a full re-run of a
+            // 26-step install that had already succeeded. 'handover' is a
+            // perfectly valid step to stand on with no run behind it (the pane
+            // degrades to just the password section), so when a server is
+            // already registered, offer the jump.
+            async loadRegistered() {
+                const S = servers();
+                if (!S || typeof S.list !== 'function') return [];
+                try {
+                    // list() answers RECORDS, not ids -- reading their `id` is
+                    // what this needs. Rendering the records themselves put
+                    // "[object Object]" on the page and made registeredServerId
+                    // an object, which would then have addressed the password
+                    // change at nothing. Caught by driving the real page; the
+                    // unit test had stubbed list() with strings, so it agreed
+                    // with the mistake.
+                    const rows = await S.list();
+                    this.registeredIds = (Array.isArray(rows) ? rows : [])
+                        .map(function (r) {
+                            if (typeof r === 'string') return r;
+                            // typeof, not str(): coercing a non-string id would
+                            // invent a record identifier out of malformed data,
+                            // and this value goes on to address a password
+                            // change at a specific server.
+                            return (r && typeof r === 'object' && typeof r.id === 'string') ? r.id : '';
+                        })
+                        .filter(function (x) { return x !== ''; });
+                } catch (e) {
+                    this.registeredIds = [];
+                }
+                return this.registeredIds;
+            },
+            hasRegistered() { return this.registeredIds.length > 0; },
+            resumeHandover() {
+                if (!this.hasRegistered()) return false;
+                // The generated password is long gone on a returning visit, so
+                // go straight to asking for the current one rather than making
+                // the user discover that by being refused.
+                if (!this.generatedPassword) this.needCurrentPassword = true;
+                if (!this.registeredServerId) this.registeredServerId = this.registeredIds[0];
+                this.step = 'handover';
+                return true;
+            },
             // nextStep() clamps at the end, so on the last step Next silently
             // did nothing -- indistinguishable from a broken button.
             isLastStep() {
@@ -1305,6 +1352,16 @@
             // shell's tab switch in js/app.js's openWizard() — this is the
             // half of GAP B's fix that only this component can do).
             onOpenWizard(detail) { this.step = applyWizardStep(this, detail); return this.step; },
+
+            // Alpine calls this once on mount. Deliberate fire-and-forget for
+            // the same reason checkHostKey() is: init() stays synchronous, and
+            // loadRegistered() owns its own failure (an empty list, never a
+            // throw), so a registry that cannot be read leaves the wizard
+            // exactly as it was before -- offering nothing rather than breaking.
+            init() {
+                this.loadRegistered();
+                return true;
+            },
             // §7.3: the execute pane's progress bar, "Copy full transcript" and
             // transcript region are all views OF A RUN. Before Start there is no
             // run, so they rendered as a 0% bar, a button that copies nothing

@@ -83,6 +83,19 @@
           </ol>
 
           <div x-show="isStep('target')" data-testid="pane-target">
+            <!-- The wizard keeps no state across a reload, so anyone coming back
+                 to finish -- most often to set the administrator password, which
+                 only lives on the last step -- faced re-running a 26-step
+                 install that had already succeeded. -->
+            <div class="alert alert-secondary" data-testid="resume-block" x-show="hasRegistered()">
+              <p class="mb-1">
+                <span data-testid="resume-count" x-text="registeredIds.length"></span>
+                server(s) already registered
+                (<span data-testid="resume-ids" x-text="registeredIds.join(', ')"></span>).
+                You do not have to run setup again to change the administrator password.</p>
+              <button class="btn btn-sm btn-outline-dark" data-testid="resume-handover"
+                      @click="resumeHandover()">Go to the administrator password</button>
+            </div>
             <label class="form-label">Where should Pilot install?</label>
             <select class="form-select mb-2" data-testid="target" x-model="choices.target">
               <option value="local">This machine (localhost)</option>
