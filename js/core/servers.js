@@ -37,6 +37,11 @@
     const ID_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
     const CTRL = /[\x00-\x1f\x7f]/;
     const BAD_HOST = /[\x00-\x1f\x7f\s/\\?#@]/;
+    // A POSIX-ish account name. Rejects whitespace and every shell metacharacter
+    // because this value becomes an ssh destination (user@host) -- a name that
+    // could carry a space or a quote would be an argv-splitting bug waiting to
+    // happen, even though pilot-exec passes argv as a list.
+    const BAD_USER = /[^A-Za-z0-9._-]/;
     const ABS_PATH = /^\/[A-Za-z0-9._/-]*$/;
     const SWAGGER_PATH = '/admin/swagger/doc.json';
     const DEFAULT_INSTALL_DIR = '/opt/rustdesk-api';
@@ -133,6 +138,15 @@
             id: validateId(obj.id),
             host: requiredText(obj.host, 'host', 255, BAD_HOST),
             sshPort: port(obj.sshPort, 'sshPort', 22),
+            // The account the wizard actually connected as. Without this, day-2
+            // operations guessed "root" -- and most cloud images disable root
+            // SSH outright, so on a real AWS target every Server Ops action hung
+            // until its alarm fired and reported
+            // "cannot determine the remote user: id -u exited 142".
+            // Old records predate the field; '' means "unknown", and the caller
+            // decides what to do about that rather than being handed a guess
+            // dressed as a fact.
+            sshUser: optionalText(obj.sshUser, 'sshUser', 64, BAD_USER),
             apiPort: port(obj.apiPort, 'apiPort', 21114),
             tls: obj.tls === true,
             domain: optionalText(obj.domain, 'domain', 253, BAD_HOST),

@@ -1053,3 +1053,63 @@ test('confirmOp survives the confirmation being cleared mid-render', () => {
     assert.deepEqual(op.impact, []);
     assert.equal(op.reversible, true, 'an unknown op must not be described as irreversible');
 });
+
+
+// ================ FIELD REPORT: the ssh user, and "show loading animation"
+//
+// "service status still not working":
+//   Uncaught PilotError: cannot determine the remote user: id -u exited 142
+//
+// 142 is 128+14, SIGALRM -- the probe timed out. envelopeFor() hardcoded
+// user: 'root', the server record never carried the account the wizard actually
+// connected as, and most cloud images disable root SSH outright. So every op on
+// a remote target hung until the alarm fired. pilot-exec escalates with sudo
+// once connected, so a non-root account is the normal case, not the exception.
+
+test('the envelope connects as the account the wizard recorded', () => {
+    const srv = { id: 's', transport: 'ssh', host: 'h', sshPort: 22, hasCredential: true, sshUser: 'ubuntu' };
+    assert.equal(S.envelopeFor('status', srv, { authType: 'pem', secret: 'k' }).ssh.user, 'ubuntu');
+});
+
+test('a record predating sshUser still connects as root, which is what it was provisioned with', () => {
+    for (const u of [null, undefined, '', '   ']) {
+        const srv = { id: 's', transport: 'ssh', host: 'h', sshPort: 22, hasCredential: true, sshUser: u };
+        assert.equal(S.envelopeFor('status', srv, { authType: 'pem', secret: 'k' }).ssh.user, 'root',
+            'legacy record with sshUser=' + JSON.stringify(u));
+    }
+});
+
+test('the ssh user is never hardcoded -- changing the record changes the envelope', () => {
+    // The defect was a literal 'root' that no record could influence.
+    const mk = (u) => S.envelopeFor('restart-hbbs',
+        { id: 's', transport: 'ssh', host: 'h', sshPort: 22, hasCredential: true, sshUser: u },
+        { authType: 'password', secret: 'p' }).ssh.user;
+    assert.equal(mk('ec2-user'), 'ec2-user');
+    assert.equal(mk('debian'), 'debian');
+    assert.notEqual(mk('ec2-user'), mk('debian'));
+});
+
+test('a running op shows a spinner and says what is running', () => {
+    const c = S.serverOpsUi({});
+    assert.equal(c.isBusy('status'), false);
+    assert.equal(c.opLabel({ id: 'status', label: 'Service status' }), 'Service status');
+    c.opBusy = { status: true };
+    assert.equal(c.isBusy('status'), true);
+    assert.equal(c.opLabel({ id: 'status', label: 'Service status' }), 'Service status…',
+        'the label must say it is running, for anyone who cannot see a spinner');
+    assert.equal(c.opLabel({ id: 'doctor', label: 'Run diagnostics' }), 'Run diagnostics',
+        'only the running op changes');
+    assert.equal(c.opLabel(null), '', 'never throws mid-render');
+});
+
+test('the spinner is x-if, not x-show -- a display utility would override it', () => {
+    const t = S.TEMPLATE;
+    assert.match(t, /spinner-border/, 'a busy button must show a spinner');
+    assert.match(t, /x-if="isBusy\(op\.id\)"/, 'the spinner is conditionally RENDERED');
+    // The bug this repo already shipped once: x-show sets an inline display,
+    // which a Bootstrap utility class marked !important beats.
+    const spinnerTag = /<span class="spinner-border[^>]*>/.exec(t);
+    assert.ok(spinnerTag, 'spinner span not found');
+    assert.ok(!/x-show/.test(spinnerTag[0]), 'x-show cannot hide a display-utility element');
+    assert.match(t, /:aria-busy="isBusy\(op\.id\)"/, 'the busy state must reach assistive tech');
+});

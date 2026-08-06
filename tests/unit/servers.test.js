@@ -114,7 +114,10 @@ function hostileFileCockpit(opts) {
 }
 
 const REC = {
-    id: 'prod', host: 'rd.example.com', sshPort: 22, apiPort: 21114, tls: true,
+    // sshUser is the account day-2 operations connect as. It is part of the
+    // record because guessing it broke every Server Ops action on any cloud
+    // image that disables root SSH.
+    id: 'prod', host: 'rd.example.com', sshPort: 22, sshUser: 'ubuntu', apiPort: 21114, tls: true,
     domain: 'rd.example.com', hbbsKey: 'AbC+/123=', hbbsPorts: [21115, 21116, 21117],
     installDir: '/opt/rustdesk-api', createdAt: '2026-08-03T20:45:00Z'
 };

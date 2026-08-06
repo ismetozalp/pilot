@@ -1253,7 +1253,8 @@ test('recordForRegistration: a brand new local record gets safe defaults, never 
     const state = { choices: { target: 'local', host: '' }, detection: null, exec: { steps: [] }, required: [] };
     const rec = UI.recordForRegistration(state, null, '2026-08-04T00:00:00.000Z');
     assert.deepEqual(rec, {
-        id: 'local', host: 'localhost', sshPort: 22, apiPort: 21114,
+        // A local target has no SSH user at all -- null, not a guessed 'root'.
+        id: 'local', host: 'localhost', sshPort: 22, sshUser: null, apiPort: 21114,
         tls: false, domain: null, hbbsKey: null, hbbsPorts: [],
         installDir: undefined, createdAt: '2026-08-04T00:00:00.000Z'
     });
@@ -2830,4 +2831,27 @@ test('index.html and app.js agree on the credentials-changed signal', () => {
     assert.match(app, /async reloadCredentials\(\)/, 'and the handler must exist');
     assert.match(app.slice(app.indexOf('async reloadCredentials()')), /this\.wireApi\(\)/,
         'reloading credentials means rebuilding the transport');
+});
+
+
+test('recordForRegistration persists the ssh account the wizard connected as', () => {
+    // Day-2 operations reuse this. It used to be dropped on the floor, so
+    // Server Ops guessed 'root' and hung on every cloud image that disables
+    // root SSH: "cannot determine the remote user: id -u exited 142".
+    const state = { choices: { target: 'ssh', host: 'rd.example.com', port: 22, user: 'ubuntu' },
+        detection: null, exec: { steps: [] }, required: [] };
+    assert.equal(UI.recordForRegistration(state, null, '2026-08-04T00:00:00.000Z').sshUser, 'ubuntu');
+});
+
+test('an ssh record with no user typed falls back to root, a local one to null', () => {
+    const ssh = (user) => UI.recordForRegistration(
+        { choices: { target: 'ssh', host: 'h', port: 22, user: user }, detection: null, exec: { steps: [] }, required: [] },
+        null, '2026-08-04T00:00:00.000Z').sshUser;
+    assert.equal(ssh(''), 'root');
+    assert.equal(ssh('   '), 'root');
+    assert.equal(ssh(undefined), 'root');
+    const local = UI.recordForRegistration(
+        { choices: { target: 'local', host: '' }, detection: null, exec: { steps: [] }, required: [] },
+        null, '2026-08-04T00:00:00.000Z');
+    assert.equal(local.sshUser, null, 'a local target has no ssh user to record');
 });

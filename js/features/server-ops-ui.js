@@ -169,6 +169,14 @@
     // The argv actually executed ON THE TARGET, inside one pilot-exec envelope
     // step — never the credential, which travels only in the envelope's
     // `credentials` block (stdin), never here.
+    // The SSH account for day-2 work on this server. Older records predate the
+    // field entirely, and those deployments were provisioned as root, so root is
+    // the honest fallback -- but only for them.
+    function sshUserFor(server) {
+        const u = str(server && server.sshUser).trim();
+        return u === '' ? 'root' : u;
+    }
+
     function opArgv(op, server) {
         const found = findOp(op);
         if (!found) return null;
@@ -529,7 +537,17 @@
             transport: remote ? 'ssh' : 'local',
             ssh: remote ? {
                 host: str(server.host), port: (typeof server.sshPort === 'number' ? server.sshPort : 22),
-                user: 'root', auth: authType, accept_fingerprint: null
+                // The account the wizard connected as, not a guess. Hardcoding
+                // 'root' here meant every op on a cloud image that disables root
+                // SSH hung until pilot-exec's alarm fired, and reported
+                // "cannot determine the remote user: id -u exited 142" -- an
+                // error about a probe, naming nothing an operator could act on.
+                // pilot-exec escalates with sudo once connected, so a non-root
+                // account is the normal case, not the exception.
+                // Records written before sshUser existed carry none; 'root'
+                // remains the fallback because that is what those deployments
+                // were actually provisioned with.
+                user: sshUserFor(server), auth: authType, accept_fingerprint: null
             } : null,
             credentials: remote ? {
                 password: authType === 'password' ? secret : null,
@@ -629,6 +647,14 @@
 
             isOpAllowed: function (opId) { return isOpAllowed(opId, this.server); },
             opDisabled: function (opId) { return !this.isOpAllowed(opId) || !!this.opBusy[opId]; },
+            isBusy: function (opId) { return !!this.opBusy[opId]; },
+            // The label says what is happening, not only that something is. A
+            // spinner alone is invisible to a screen reader and ambiguous next
+            // to seven other buttons.
+            opLabel: function (op) {
+                if (!op) return '';
+                return this.isBusy(op.id) ? op.label + '\u2026' : op.label;
+            },
             opAlert: function (opId) { return this.opAlerts[opId] || null; },
             opOutput: function (opId) { return this.output[opId] || ''; },
 
@@ -657,7 +683,8 @@
                         if (transport === 'local' || typeof Servers.readSecret !== 'function') {
                             self.server = {
                                 id: rec.id, host: rec.host, sshPort: rec.sshPort, apiPort: rec.apiPort,
-                                domain: rec.domain, transport: transport, hasCredential: true
+                                domain: rec.domain, transport: transport, hasCredential: true,
+                                sshUser: rec.sshUser || null
                             };
                             self.loading = false;
                             return true;
@@ -667,7 +694,7 @@
                             .then(function (secret) {
                                 self.server = {
                                     id: rec.id, host: rec.host, sshPort: rec.sshPort, apiPort: rec.apiPort,
-                                    domain: rec.domain, transport: transport,
+                                    domain: rec.domain, transport: transport, sshUser: rec.sshUser || null,
                                     hasCredential: typeof secret === 'string' && secret !== ''
                                 };
                                 self.loading = false;
@@ -841,9 +868,22 @@
         '          <div class="me-2 mb-2">',
         '            <button type="button" class="btn btn-sm"',
         '                    :class="op.danger ? \'btn-outline-danger\' : \'btn-outline-secondary\'"',
-        '                    :disabled="opDisabled(op.id)"',
+        '                    :disabled="opDisabled(op.id)" :aria-busy="isBusy(op.id)"',
         '                    :data-testid="\'op-\' + op.id" :title="op.why"',
-        '                    @click="request(op.id)" x-text="op.label"></button>',
+        '                    @click="request(op.id)">',
+        // These operations reach a remote host over SSH; several seconds is
+        // normal and a dozen is not unusual. A button that only greys out looks
+        // broken -- and the honest report was exactly that: "nothing happens".
+        // The spinner is a <template x-if>, never x-show: Bootstrap's spinner
+        // classes carry `display: inline-block`, and x-show sets an INLINE
+        // display, which a utility class marked !important overrides -- the bug
+        // that kept the "not connected" banner on screen earlier.
+        '              <template x-if="isBusy(op.id)">',
+        '                <span class="spinner-border spinner-border-sm me-1" role="status"',
+        '                      aria-hidden="true" :data-testid="\'op-\' + op.id + \'-spinner\'"></span>',
+        '              </template>',
+        '              <span x-text="opLabel(op)"></span>',
+        '            </button>',
         '            <div class="small text-secondary" x-show="!isOpAllowed(op.id)"',
         '                 :data-testid="\'op-\' + op.id + \'-reason\'" x-text="reasonBlocked(op.id)"></div>',
         '          </div>',

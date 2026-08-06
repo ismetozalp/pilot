@@ -463,6 +463,13 @@
             id: id,
             host: remote ? str(c.host) : 'localhost',
             sshPort: sshPort,
+            // The account this wizard ACTUALLY connected as, recorded so day-2
+            // operations reuse it instead of guessing. Guessing "root" is what
+            // shipped, and on any cloud image that disables root SSH -- which is
+            // most of them -- every Server Ops action hung until its alarm fired:
+            // "cannot determine the remote user: id -u exited 142".
+            // Local targets have no SSH user at all, hence null.
+            sshUser: remote ? (str(c.user).trim() || 'root') : null,
             apiPort: apiPortFrom(s),
             tls: tlsOk ? true : (base ? base.tls === true : false),
             domain: tlsHost || ((base && base.domain) ? base.domain : null),
