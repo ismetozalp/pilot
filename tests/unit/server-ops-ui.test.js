@@ -992,3 +992,64 @@ test('a danger op is marked mutating, a read-only one is not', () => {
     assert.equal(S.envelopeFor('restart-hbbs', OPS_SERVER, null).steps[0].mutating, true);
     assert.equal(S.envelopeFor('status', OPS_SERVER, null).steps[0].mutating, false);
 });
+
+
+// ============== "add are you sure dialog explaining what going to happen"
+//
+// A confirmation already existed, but it showed one sentence and two buttons:
+// no heading naming the action, no statement of what breaks, and no word on
+// whether it can be undone. "Are you sure?" is not a question anyone can answer
+// from that -- least of all for rotate-key, which irreversibly breaks every
+// deployed device at once.
+
+test('every destructive op carries an impact statement and a reversibility verdict', () => {
+    for (const op of S.OPS) {
+        if (!op.danger) continue;
+        assert.ok(Array.isArray(op.impact) && op.impact.length >= 3,
+            op.id + ' must spell out what happens, not just that something will');
+        assert.equal(typeof op.reversible, 'boolean', op.id + ' must state whether it can be undone');
+        for (const line of op.impact)
+            assert.ok(typeof line === 'string' && line.trim().length > 20,
+                op.id + ' has a filler impact line: ' + JSON.stringify(line));
+    }
+});
+
+test('a read-only op is never marked destructive, so the dialog never fires for one', () => {
+    for (const op of S.OPS) {
+        if (op.danger) continue;
+        assert.ok(!op.impact, op.id + ' is not destructive and needs no impact statement');
+    }
+});
+
+test('rotate-key is the only irreversible op, and says so', () => {
+    const irreversible = S.OPS.filter((o) => o.reversible === false).map((o) => o.id);
+    assert.deepEqual(irreversible, ['rotate-key'],
+        'if another op becomes irreversible its dialog must say so too');
+    const rot = S.OPS.find((o) => o.id === 'rotate-key');
+    // The specific thing an operator must understand before clicking: it is not
+    // "some devices might need attention", it is all of them, at once, by hand.
+    assert.ok(rot.impact.some((l) => /EVERY device/.test(l)), 'the blast radius must be explicit');
+    assert.ok(rot.impact.some((l) => /by hand|on the device itself/i.test(l)),
+        'the recovery cost must be explicit');
+});
+
+test('the dialog renders the name, the impact and the reversibility verdict', () => {
+    const t = S.TEMPLATE;
+    assert.match(t, /are you sure\?/, 'the dialog must actually ask');
+    assert.match(t, /data-testid="server-ops-confirm-title"/);
+    assert.match(t, /data-testid="server-ops-confirm-impact"/);
+    assert.match(t, /data-testid="server-ops-confirm-reversible"/);
+    assert.match(t, /x-for="line in confirmOp\(\)\.impact/, 'the impact lines are rendered, not summarised');
+    assert.match(t, /This cannot be undone\./);
+});
+
+test('confirmOp survives the confirmation being cleared mid-render', () => {
+    // x-if and the bindings inside it are separate Alpine effects; a null here
+    // would throw in the frame between them.
+    const c = S.serverOpsUi({});
+    c.confirm = null;
+    const op = c.confirmOp();
+    assert.equal(op.label, '');
+    assert.deepEqual(op.impact, []);
+    assert.equal(op.reversible, true, 'an unknown op must not be described as irreversible');
+});

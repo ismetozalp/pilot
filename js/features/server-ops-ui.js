@@ -75,15 +75,36 @@
         }),
         Object.freeze({
             id: 'restart-hbbs', label: 'Restart hbbs', danger: true, needsCredential: true,
-            why: 'Restarts the ID/rendezvous service. Every in-flight rendezvous is dropped.'
+            why: 'Restarts the ID/rendezvous service. Every in-flight rendezvous is dropped.',
+            // What the operator is actually agreeing to. `why` is one sentence
+            // for the button; this is the consequence, stated plainly, because
+            // "are you sure?" is not a question anyone can answer without it.
+            impact: Object.freeze([
+                'Devices cannot find each other for a few seconds while hbbs restarts.',
+                'Sessions already established keep running -- they no longer need hbbs.',
+                'Every device re-registers automatically; none needs reconfiguring.'
+            ]),
+            reversible: true
         }),
         Object.freeze({
             id: 'restart-hbbr', label: 'Restart hbbr', danger: true, needsCredential: true,
-            why: 'Restarts the relay service. Every in-flight relayed session is dropped.'
+            why: 'Restarts the relay service. Every in-flight relayed session is dropped.',
+            impact: Object.freeze([
+                'Any screen-sharing session currently going THROUGH the relay is cut immediately.',
+                'Directly connected sessions are unaffected -- they do not use the relay.',
+                'New sessions can relay again as soon as hbbr is back, within seconds.'
+            ]),
+            reversible: true
         }),
         Object.freeze({
             id: 'restart-api', label: 'Restart API server', danger: true, needsCredential: true,
-            why: 'Restarts rustdesk-api. The admin console and API are briefly unreachable.'
+            why: 'Restarts rustdesk-api. The admin console and API are briefly unreachable.',
+            impact: Object.freeze([
+                'This Pilot console loses its API for a few seconds and reconnects on its own.',
+                'Address book and login stop responding for that moment; signed-in clients stay signed in.',
+                'Screen-sharing sessions are NOT affected -- they never touch the API.'
+            ]),
+            reversible: true
         }),
         Object.freeze({
             id: 'relay-log', label: 'Recent relay sessions', danger: false, needsCredential: true,
@@ -101,7 +122,14 @@
             id: 'rotate-key', label: 'Rotate server keypair', danger: true, needsCredential: true,
             why: 'Regenerates the hbbs id_ed25519 keypair. Every already-deployed client ' +
                 'breaks until it is reconfigured with the new key — this cannot be undone ' +
-                'from here.'
+                'from here.',
+            impact: Object.freeze([
+                'EVERY device stops connecting the moment hbbs restarts -- not gradually, all at once.',
+                'Each one stays broken until someone edits its Key field by hand, on the device itself.',
+                'The old key is deleted, not archived: there is no undo button here and no rollback.',
+                'Pilot shows you the new key afterwards, but cannot push it to any device.'
+            ]),
+            reversible: false
         })
     ]);
 
@@ -670,6 +698,17 @@
 
             cancelConfirm: function () { this.confirm = null; },
 
+            // The op the open confirmation refers to. Returns a harmless empty
+            // shape rather than null so the dialog cannot throw mid-render if
+            // `confirm` is cleared between Alpine evaluating x-if and the
+            // bindings inside it -- the same batching gap that has bitten this
+            // codebase before.
+            confirmOp: function () {
+                const c = this.confirm;
+                const op = c ? findOp(c.opId) : null;
+                return op || { id: '', label: '', why: '', impact: [], reversible: true };
+            },
+
             confirmDisabled: function () {
                 const c = this.confirm;
                 if (!c) return true;
@@ -812,7 +851,27 @@
         '      </div>',
         '      <template x-if="confirm">',
         '        <div class="alert alert-warning" role="alertdialog" data-testid="server-ops-confirm">',
-        '          <p x-text="OPS.find(o => o.id === confirm.opId).why"></p>',
+        // Name the action being confirmed. "Are you sure?" over an unnamed
+        // operation is answerable only by whoever still remembers which button
+        // they pressed.
+        '          <h3 class="h6" data-testid="server-ops-confirm-title"',
+        '              x-text="confirmOp().label + \' — are you sure?\'"></h3>',
+        '          <p x-text="confirmOp().why"></p>',
+        // The consequences, itemised. This is the part the operator is
+        // actually agreeing to, and it is not derivable from the button label.
+        '          <ul class="mb-2" data-testid="server-ops-confirm-impact">',
+        '            <template x-for="line in confirmOp().impact || []" :key="line">',
+        '              <li x-text="line"></li>',
+        '            </template>',
+        '          </ul>',
+        // Reversibility is the single fact that decides whether someone should
+        // click, so it is stated outright rather than left to be inferred from
+        // the wording above.
+        '          <p class="mb-2" data-testid="server-ops-confirm-reversible">',
+        '            <strong x-text="confirmOp().reversible === false',
+        '                    ? \'This cannot be undone.\'',
+        '                    : \'This is reversible: the service comes back on its own.\'"></strong>',
+        '          </p>',
         '          <template x-if="confirm.opId === \'rotate-key\'">',
         '            <div class="mb-2">',
         '              <label class="form-label small" for="pilot-server-ops-confirm-id">',
