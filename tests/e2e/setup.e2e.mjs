@@ -1244,7 +1244,7 @@ async function runBody(ctx) {
             await page.click('#pilot-overview [data-test="refresh"]');
             await page.waitForFunction(() => {
                 const a = document.querySelector('#pilot-overview [data-test="web-client-link"]');
-                return !!a && a.getAttribute('href') === 'https://rd.example.com/';
+                return !!a && a.getAttribute('href') === 'https://rd.example.com/webclient/';
             }, null, { timeout: WAIT });
             await shot(page, 'overview-web-client-enabled');
         } finally {

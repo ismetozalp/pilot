@@ -100,7 +100,7 @@ test('webClientLink: TLS plus a domain gives a port-less https address', () => {
     const w = O.webClientLink(ALPHA);
     assert.equal(w.enabled, true);
     // C17: Caddy listens on 443 because the client appends no port.
-    assert.equal(w.url, 'https://rd.example.com/');
+    assert.equal(w.url, 'https://rd.example.com/webclient/');
     assert.equal(w.action, 'open');
     assert.equal(w.reason, '');
 });
@@ -109,7 +109,7 @@ test('webClientLink: every TLS tier that produces a certificate enables the link
     for (const tier of ['own', 'sslip', 'duckdns']) {
         const w = O.webClientLink({ id: 'a', domain: 'rd.example.com', tlsTier: tier });
         assert.equal(w.enabled, true, tier);
-        assert.equal(w.url, 'https://rd.example.com/', tier);
+        assert.equal(w.url, 'https://rd.example.com/webclient/', tier);
     }
 });
 
@@ -133,7 +133,7 @@ test('webClientLink: TLS with no domain and TLS with a broken domain say differe
 test('webClientLink: the domain may live under tls.domain', () => {
     const w = O.webClientLink({ id: 'a', tls: { tier: 'own', domain: 'rd.example.com' } });
     assert.equal(w.enabled, true);
-    assert.equal(w.url, 'https://rd.example.com/');
+    assert.equal(w.url, 'https://rd.example.com/webclient/');
 });
 
 test('webClientLink: hostile servers are disabled, never enabled with a broken URL', () => {
@@ -177,11 +177,16 @@ test('webClientLink: script markup, unicode and a very long domain are all badDo
     }
 });
 
-test('webClientLink: an enabled URL never carries a port, a path or a query', () => {
+test('webClientLink: an enabled URL carries no port and no query, and lands ON the web client', () => {
     const w = O.webClientLink({ tlsTier: 'own', domain: 'RD.Example.COM.' });
-    assert.equal(w.url, 'https://rd.example.com/');
-    assert.ok(!/:\d/.test(w.url.slice('https://'.length)));
-    assert.equal(w.url.split('/').length, 4);
+    // The path is REQUIRED. This used to assert there was none, which is how
+    // the link shipped pointing at the site root -- and the root 302s to
+    // /_admin/, so the button opened the admin console and looked like it
+    // worked. Verified on a live v2.7: /webclient/ is 200, / redirects to
+    // /_admin/, and /webclient2/ (the v2 preview) is a 404.
+    assert.equal(w.url, 'https://rd.example.com/webclient/');
+    assert.ok(!/:\d/.test(w.url.slice('https://'.length)), 'no port: the client appends none');
+    assert.ok(w.url.indexOf('?') === -1, 'no query');
 });
 
 // --- normalizeServers ----------------------------------------------------
@@ -649,7 +654,7 @@ test('the web client address comes from PilotTls.webClientUrl, not a local copy 
     assert.equal(link.enabled, true);
     assert.equal(link.url, Tls.webClientUrl('rd.example.com'),
         'the two must be the same string because there is only one rule');
-    assert.equal(link.url, 'https://rd.example.com/');
+    assert.equal(link.url, 'https://rd.example.com/webclient/');
     // And whatever PilotTls refuses to vouch for stays disabled rather than
     // rendering an href to nowhere: webClientUrl() answers '' for those.
     for (const bad of ['1.2.3.4', 'localhost', 'not a host', 'rd.example.com:8443', '*.example.com']) {

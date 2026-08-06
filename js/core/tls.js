@@ -293,9 +293,21 @@
         return '';
     }
 
+    // rustdesk-api serves the browser client under /webclient/ and redirects the
+    // site root to /_admin/. This returned the ROOT, so Pilot's "web client"
+    // link opened the admin console instead -- a working page, which is why it
+    // read as correct: nothing 404s, you simply never arrive at the web client.
+    //
+    // The trailing slash is required: /webclient (no slash) is a 404 on a real
+    // v2.7, and /webclient/ is a 200. Verified against a live server, both ways.
+    //
+    // NOT /webclient2/. That is the v2 preview client, which this API version
+    // does not ship: /webclient2/ is a 404 there.
+    const WEB_CLIENT_PATH = '/webclient/';
+
     function webClientUrl(host) {
         const d = normalizeDomain(host);
-        return isValidDomain(d) ? 'https://' + d + '/' : '';
+        return isValidDomain(d) ? 'https://' + d + WEB_CLIENT_PATH : '';
     }
 
     const TIER_NOTES = {
@@ -410,7 +422,7 @@
         dnsPreflight: dnsPreflight,
         classifyAcmeFailure: classifyAcmeFailure,
         apiServerUrl: apiServerUrl,
-        webClientUrl: webClientUrl,
+        webClientUrl: webClientUrl, WEB_CLIENT_PATH: WEB_CLIENT_PATH,
         advisory: advisory,
         caddyfile: caddyfile
     };

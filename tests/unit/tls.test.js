@@ -588,11 +588,27 @@ test('apiServerUrl yields nothing rather than a URL it cannot justify', () => {
         assert.equal(T.apiServerUrl(o), '', JSON.stringify(o));
 });
 
-test('webClientUrl exists only for a real hostname', () => {
-    assert.equal(T.webClientUrl('rd.example.com'), 'https://rd.example.com/');
-    assert.equal(T.webClientUrl('RD.Example.com.'), 'https://rd.example.com/');
+test('webClientUrl exists only for a real hostname, and points AT the web client', () => {
+    assert.equal(T.webClientUrl('rd.example.com'), 'https://rd.example.com/webclient/');
+    assert.equal(T.webClientUrl('RD.Example.com.'), 'https://rd.example.com/webclient/');
     for (const v of ['', null, undefined, '1.2.3.4', 'rd.example.com\n', 'localhost'])
         assert.equal(T.webClientUrl(v), '', JSON.stringify(String(v)));
+});
+
+test('the web client path is the one rustdesk-api actually serves', () => {
+    // Measured against a live v2.7, all three:
+    //   /webclient/   200, the Flutter client
+    //   /            302 -> /_admin/, the admin console
+    //   /webclient2/ 404, the v2 preview this version does not ship
+    // Returning the ROOT is what shipped, and it looked right because the
+    // admin console loads: nothing 404s, you just never reach the web client.
+    assert.equal(T.WEB_CLIENT_PATH, '/webclient/');
+    assert.ok(T.WEB_CLIENT_PATH.charAt(T.WEB_CLIENT_PATH.length - 1) === '/',
+        '/webclient without the trailing slash is a 404 on a real server');
+    assert.ok(T.WEB_CLIENT_PATH.indexOf('webclient2') === -1,
+        'webclient2 is the v2 preview and is not shipped by the pinned API version');
+    assert.ok(T.webClientUrl('rd.example.com').endsWith(T.WEB_CLIENT_PATH),
+        'the URL must be built from the path constant, not a second copy of it');
 });
 
 test('advisory says the one thing each tier needs the user to know', () => {

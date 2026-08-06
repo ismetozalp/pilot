@@ -197,7 +197,11 @@ export default async function run(ctx) {
                 return { href: a.getAttribute('href'), target: a.getAttribute('target'),
                     rel: a.getAttribute('rel') };
             });
-            assertEqual(link.href, 'https://rd.example.com/', 'the port-less https address');
+            // /webclient/ is where rustdesk-api serves the browser client. The
+            // site root 302s to /_admin/, so pointing there opened the ADMIN
+            // console -- a page that loads, which is why it read as working.
+            assertEqual(link.href, 'https://rd.example.com/webclient/',
+                'the port-less https address, ON the web client');
             assertEqual(link.target, '_blank', 'a new tab, never the plugin frame');
             assertOk(/noopener/.test(link.rel) && /noreferrer/.test(link.rel), 'the tab is isolated');
 
