@@ -13,6 +13,11 @@
     // mount is the id of the div in index.html this surface renders into. Keeping
     // it in the tab record means the skeleton test can prove every tab has somewhere
     // to render, rather than discovering it as an empty screen at runtime.
+    // Long enough for a slow registry read, short enough that a wedged channel
+    // does not leave the button spinning with no explanation.
+    const RECONNECT_TIMEOUT_MS = 15000;
+    // Exported so a test can prove the bound without waiting 15 seconds for it.
+
     const TABS = [
         { id: 'overview',    label: 'Overview',     mount: 'pilot-overview' },
         { id: 'setup',       label: 'Setup',        mount: 'pilot-setup' },
@@ -78,6 +83,9 @@
             activeServerId: null,
             apiReady: false,
             reconnecting: false,
+            reconnectError: null,
+            // Overridable so a test can prove the bound without waiting for it.
+            reconnectTimeoutMs: RECONNECT_TIMEOUT_MS,
             compatError: null,
             // Set only when the SECRET FILE ITSELF could not be read (e.g. a
             // permissions problem on the 0600 file) — never for the ordinary
@@ -270,9 +278,38 @@
                 return this.tab;
             },
 
+            // wireApi() reads the registry over Cockpit channels, and a channel
+            // that never opens also never errors -- so this button could sit on
+            // "Reconnecting…" forever with nothing in the console, which is
+            // exactly what a user reported. A page whose session was elevated
+            // after it loaded can hold exactly that kind of wedged channel.
+            //
+            // Bounded, therefore: if it has not resolved in RECONNECT_TIMEOUT_MS
+            // the button comes back and says what to do instead. The wireApi()
+            // call is not cancelled -- Cockpit channels have no cancel -- so if
+            // it does eventually land, its own assignments still take effect.
             async reconnect() {
+                const self = this;
                 this.reconnecting = true;
-                try { return await this.wireApi(); } finally { this.reconnecting = false; }
+                this.reconnectError = null;
+                let timer = null;
+                try {
+                    const timeout = new Promise(function (resolve) {
+                        timer = setTimeout(function () { resolve('timeout'); }, self.reconnectTimeoutMs);
+                    });
+                    const result = await Promise.race([this.wireApi().then(function (v) { return v; },
+                        function () { return null; }), timeout]);
+                    if (result === 'timeout' && !this.apiReady) {
+                        this.reconnectError = 'Pilot could not reach the system in ' +
+                            Math.round(self.reconnectTimeoutMs / 1000) + ' seconds. This usually means the ' +
+                            'page was open before administrative access was turned on — reload it ' +
+                            '(Ctrl+Shift+R) to start a fresh session.';
+                    }
+                    return this.apiReady ? result : null;
+                } finally {
+                    if (timer !== null) clearTimeout(timer);
+                    this.reconnecting = false;
+                }
             },
 
             async switchServer(id) {
@@ -358,7 +395,7 @@
         };
     }
 
-    const PilotApp = { TABS, pilotApp };
+    const PilotApp = { TABS, RECONNECT_TIMEOUT_MS, pilotApp };
     root.PilotApp = PilotApp;
     // Alpine's x-data="pilotApp()" resolves against the global scope.
     root.pilotApp = pilotApp;

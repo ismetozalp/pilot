@@ -608,3 +608,66 @@ test('wireApi: a dangling id with SEVERAL servers asks rather than guessing', as
     assert.ok(c.switchError, 'the user must be told which server to choose');
     assert.match(String(c.switchError.message), /not registered/i);
 });
+
+test('reconnect(): a wireApi that never settles releases the button and says what to do', async (t) => {
+    // FROM THE FIELD: the button sat on "Reconnecting…" indefinitely with NO
+    // error in the browser console -- because a Cockpit channel that never
+    // opens also never errors, so the await simply never returned. A page whose
+    // session was elevated after it loaded can hold exactly that kind of wedged
+    // channel. A control that can hang forever with no explanation is a bug in
+    // its own right, whatever wedged it.
+    fakeCockpit();
+    t.after(dropCockpit);
+    const c = App.pilotApp();
+    c.wireApi = () => new Promise(() => {});          // never settles, never rejects
+    c.reconnectTimeoutMs = 40;                        // prove the bound, do not wait for it
+
+    const done = c.reconnect();
+    assert.equal(c.reconnecting, true, 'the button reports work in progress');
+    await done;
+    assert.equal(c.reconnecting, false, 'and must come back, not spin forever');
+    assert.ok(App.RECONNECT_TIMEOUT_MS >= 5000 && App.RECONNECT_TIMEOUT_MS <= 60000,
+        'the bound must be long enough for a slow registry read and short enough to be useful');
+    assert.ok(c.reconnectError, 'a timeout must be explained, not silent');
+    assert.match(c.reconnectError, /reload/i, 'and must name the remedy: ' + c.reconnectError);
+    assert.equal(c.apiReady, false);
+});
+
+test('reconnect(): a wireApi that fails releases the button without inventing a timeout', async (t) => {
+    fakeCockpit();
+    t.after(dropCockpit);
+    const c = App.pilotApp();
+    c.wireApi = () => Promise.reject(new Error('boom'));
+    await c.reconnect();
+    assert.equal(c.reconnecting, false);
+    assert.equal(c.reconnectError, null, 'a fast failure is not a timeout');
+});
+
+test('reconnect(): success clears the button and the previous timeout message', async (t) => {
+    fakeCockpit();
+    t.after(dropCockpit);
+    const c = App.pilotApp();
+    c.reconnectError = 'stale message from a previous attempt';
+    c.wireApi = () => { c.apiReady = true; return Promise.resolve('ok'); };
+    assert.equal(await c.reconnect(), 'ok');
+    assert.equal(c.reconnecting, false);
+    assert.equal(c.reconnectError, null);
+});
+
+test('no x-show sits on a Bootstrap display utility — !important beats inline style', () => {
+    // FROM THE FIELD: the "not connected" banner stayed on screen while Pilot
+    // was connected and showing 4 devices. Alpine set style.display='none' and
+    // Bootstrap's .d-flex (display: flex !important) overrode it, so the element
+    // was hidden and forced visible at the same instant. Measured in the running
+    // page: style.display "none", offsetParent non-null.
+    //
+    // The trap is invisible in review and silent at runtime, so it is a rule:
+    // x-show belongs on a plain wrapper, never on the element carrying d-*.
+    const html = fs.readFileSync(path.join(__dirname, '../../index.html'), 'utf8');
+    const tags = html.match(/<[a-z]+\b[^>]*>/gi) || [];
+    const offenders = tags.filter((t) =>
+        /\bx-show\s*=/.test(t) &&
+        /class="[^"]*\bd-(flex|block|inline|inline-block|inline-flex|grid|table)\b/.test(t));
+    assert.deepEqual(offenders, [],
+        'x-show cannot hide an element whose display is set !important by a utility class');
+});

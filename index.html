@@ -50,12 +50,20 @@
          root-owned, so a plugin opened before administrative access was turned
          on can read nothing -- and every surface then says "no API transport is
          configured" with no hint that the fix is one click away. -->
-    <div class="alert alert-warning d-flex align-items-center gap-2" data-testid="not-connected"
-         x-show="!apiReady">
-      <span>Pilot is not connected to a server yet. If you have just turned on
-        administrative access in Cockpit, reconnect to pick it up.</span>
-      <button class="btn btn-sm btn-outline-dark" data-testid="reconnect" @click="reconnect()"
-              :disabled="reconnecting" x-text="reconnecting ? 'Reconnecting…' : 'Reconnect'"></button>
+    <!-- x-show is on a PLAIN wrapper, never on the .d-flex element: Bootstrap's
+         display utilities are `display: flex !important`, which beats the inline
+         `display: none` x-show sets. The banner stayed on screen while connected
+         -- hidden by Alpine and forced visible by CSS at the same time. -->
+    <div data-testid="not-connected" x-show="!apiReady">
+      <div class="alert alert-warning d-flex align-items-center gap-2">
+        <span>Pilot is not connected to a server yet. If you have just turned on
+          administrative access in Cockpit, reconnect to pick it up.</span>
+        <button class="btn btn-sm btn-outline-dark" data-testid="reconnect" @click="reconnect()"
+                :disabled="reconnecting" x-text="reconnecting ? 'Reconnecting…' : 'Reconnect'"></button>
+      </div>
+    </div>
+    <div class="alert alert-danger" data-testid="reconnect-error" x-show="reconnectError">
+      <span x-text="reconnectError"></span>
     </div>
 
     <!-- The control-plane strip. NOT the "global something went wrong" banner
