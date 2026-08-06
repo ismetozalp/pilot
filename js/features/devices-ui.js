@@ -172,6 +172,12 @@
         const heard = lastSeenMs > 0 && (nowMs - lastSeenMs) <= ONLINE_WINDOW_MS;
         return {
             id: id,
+            // The admin API identifies a peer for update/delete by row_id (its
+            // database primary key), NOT by the RustDesk id -- sending only the
+            // id answers "Params validation failed." and " is a required
+            // field". The surface never carried it, so Rename and Delete could
+            // not work at all.
+            rowId: pick(r, ['row_id', 'rowId']),
             name: clean(firstStr(r, ['alias', 'name', 'hostname', 'device_name', 'devicename'])) || id,
             online: (stated === undefined || stated === null || stated === '')
                 ? heard : booleanish(stated),
@@ -563,7 +569,9 @@
                 }
                 this.setBusy(id, true);
                 try {
-                    await this.api.devices.rename(id, v.value);
+                    // row.rowId, not id: the admin API matches on the database
+                    // primary key. See deviceRow().
+                    await this.api.devices.rename(row.rowId, id, v.value);
                     row.name = v.value;
                     this.state.rows = this.rows.slice();
                     this.actionError = null;
@@ -588,13 +596,15 @@
             async confirmDelete() {
                 const id = this.confirmingId;
                 if (!id) return false;
+                const row = this.rows.filter((r) => r.id === id)[0];
+                if (!row) return false;
                 if (!this.hasApi() || typeof this.api.devices.remove !== 'function') {
                     this.actionError = fail('GENERIC', 'The API client cannot delete devices.');
                     return false;
                 }
                 this.setBusy(id, true);
                 try {
-                    await this.api.devices.remove(id);
+                    await this.api.devices.remove(row.rowId);
                     this.rows = this.rows.filter((r) => r.id !== id);
                     this.total = Math.max(0, this.total - 1);
                     this.state.rows = this.rows.slice();

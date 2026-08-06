@@ -37,9 +37,12 @@ const C = require('../../js/core/api-client.js');
 
 export const name = 'live-api-contract';
 
-// Placeholders that are syntactically valid but match nothing, so a route that
-// EXISTS answers "not found in the database" rather than "no such route". Only
-// the latter is asserted on; business outcomes are none of this check's concern.
+// Placeholders. `ab` is resolved at run time from POST /api/ab/personal, which
+// is the only route that reveals the personal book's real guid ("1-1-0" on the
+// reference server). It used to be '' -- so six address-book routes could not
+// be told apart from missing ones and were reported UNVERIFIED every run. ''
+// was never a usable guid: the server answers /api/ab/peers?ab= with 400 and
+// /api/ab/tags/ with 404, which is exactly the bug that shipped.
 const PLACEHOLDER = { id: '0', ab: '' };
 
 function fill(path) {
@@ -96,8 +99,37 @@ export default async function run(ctx) {
         assertOk(bearer, 'client login failed against ' + base + ': ' +
             JSON.stringify(clientLogin).slice(0, 200));
 
+        // Resolve the real personal-book guid so the {ab} routes can be checked
+        // rather than skipped.
+        const personal = await postJson(base, '/api/ab/personal', {},
+            { Authorization: 'Bearer ' + bearer });
+        const abGuid = personal.body && typeof personal.body === 'object'
+            ? String(personal.body.guid || '') : '';
+        if (abGuid) {
+            PLACEHOLDER.ab = abGuid;
+            console.log('      personal address book guid: ' + abGuid);
+        } else {
+            console.log('      NOTE: /api/ab/personal gave no guid; the {ab} routes stay unverified');
+        }
+
+        // A check that changes the thing it is checking is not a check. Issuing
+        // POST/PUT/DELETE with a stub body to prove a route exists CREATED REAL
+        // DATA on the reference server -- an empty peer, id "", landed in the
+        // personal address book and had to be deleted by hand. Write routes are
+        // therefore skipped unless PILOT_API_ALLOW_WRITES=1 is set explicitly,
+        // and they are REPORTED as skipped, never silently counted as passing.
+        const allowWrites = process.env.PILOT_API_ALLOW_WRITES === '1';
+        const isWrite = (ep) => ep.method !== 'GET' && ep.method !== 'HEAD' &&
+            ep.id !== 'admin.login' && ep.id !== 'ab.personal' &&
+            ep.id !== 'ab.books' && ep.id !== 'ab.peers' && ep.id !== 'ab.tags';
+
         const results = [];
+        const skippedWrites = [];
         for (const ep of endpoints) {
+            if (isWrite(ep) && !allowWrites) {
+                skippedWrites.push(ep.method + ' ' + ep.path);
+                continue;
+            }
             if (ep.id === 'admin.login') {
                 results.push({ id: ep.id, method: 'POST', path: ep.path, status: 200,
                     text: '(used to authenticate above)' });
@@ -132,6 +164,12 @@ export default async function run(ctx) {
         // 404s an unmatched path segment exactly as it 404s an unknown route.
         // Those are reported as UNVERIFIED and listed, never quietly passed --
         // a check that hides what it could not test is worse than no check.
+        if (skippedWrites.length) {
+            console.log('      NOT CHECKED (would write to a live server; set ' +
+                'PILOT_API_ALLOW_WRITES=1 to include them):');
+            for (const w of skippedWrites) console.log('        ' + w);
+        }
+
         const parametrised = new Set(endpoints.filter((e) => /\{/.test(e.path)).map((e) => e.id));
         const missing = results.filter((r) => isMissingRoute(r.status, r.text) && !parametrised.has(r.id));
         const unverified = results.filter((r) => isMissingRoute(r.status, r.text) && parametrised.has(r.id));

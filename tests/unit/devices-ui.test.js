@@ -23,10 +23,13 @@ function payload(list, over) {
         { list, page: 1, total: list.length, page_size: 50 }, over || {}) };
 }
 
+// row_id is the database primary key every real peer row carries, and the one
+// the admin API matches on for update/delete. The fixtures lacked it, so the
+// suite could not have caught Rename and Delete addressing the wrong field.
 const RAW = [
-    { id: '123456789', alias: 'Kitchen Pi', online: true, last_online: 1754222400,
+    { row_id: 1, id: '123456789', alias: 'Kitchen Pi', online: true, last_online: 1754222400,
       ip: '10.0.0.7', platform: 'Linux', version: '1.3.7' },
-    { id: '987654321', hostname: 'reception', online: false, last_online: 1754136000,
+    { row_id: 2, id: '987654321', hostname: 'reception', online: false, last_online: 1754136000,
       ip: '10.0.0.9', platform: 'Windows', version: '1.3.6' }
 ];
 
@@ -373,8 +376,8 @@ function fakeApi(over) {
         calls,
         devices: {
             list: async (q) => { calls.push(['list', q]); return payload(RAW); },
-            rename: async (id, name) => { calls.push(['rename', id, name]); return { code: 0 }; },
-            remove: async (id) => { calls.push(['remove', id]); return { code: 0 }; },
+            rename: async (rowId, id, name) => { calls.push(['rename', rowId, id, name]); return { code: 0 }; },
+            remove: async (rowId) => { calls.push(['remove', rowId]); return { code: 0 }; },
             addToAddressBook: async (id, ab) => { calls.push(['addToAddressBook', id, ab]); return { code: 0 }; }
         }
     };
@@ -509,7 +512,8 @@ test('rename validates before it calls the API, and patches the row in place', a
 
     c.editName = '  Kitchen  ';
     assert.equal(await c.commitRename(), true);
-    assert.deepEqual(deviceCalls(api)[1], ['rename', '123456789', 'Kitchen']);
+    assert.deepEqual(deviceCalls(api)[1], ['rename', 1, '123456789', 'Kitchen'],
+        'row_id first: the admin API matches on the database primary key');
     assert.equal(c.rows[0].name, 'Kitchen');
     assert.equal(c.editingId, null);
     assert.equal(c.isBusy('123456789'), false);
@@ -535,7 +539,9 @@ test('a traversal-shaped rename is sent verbatim as a name, never as a path', as
     c.startRename(c.rows[0]);
     c.editName = '../../etc/shadow';
     assert.equal(await c.commitRename(), true);
-    assert.deepEqual(deviceCalls(api)[1], ['rename', '123456789', '../../etc/shadow']);
+    // rowId first: the admin API matches on the database primary key, and the
+    // RustDesk id alone answers "Params validation failed."
+    assert.deepEqual(deviceCalls(api)[1], ['rename', 1, '123456789', '../../etc/shadow']);
 });
 
 test('delete takes two clicks and removes exactly one row', async () => {
@@ -551,7 +557,7 @@ test('delete takes two clicks and removes exactly one row', async () => {
 
     c.askDelete(c.rows[1]);
     assert.equal(await c.confirmDelete(), true);
-    assert.deepEqual(deviceCalls(api)[1], ['remove', '987654321']);
+    assert.deepEqual(deviceCalls(api)[1], ['remove', 2], 'deleted by row_id, not by device id');
     assert.deepEqual(c.rows.map((r) => r.id), ['123456789']);
     assert.equal(c.total, 1);
 });

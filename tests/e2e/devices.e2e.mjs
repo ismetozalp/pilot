@@ -17,8 +17,13 @@ export const name = 'devices';
 
 const WAIT = 5000;
 
+// row_id is the database primary key every real peer row carries, and the field
+// the admin API matches on for update and delete -- {id} alone answers "Params
+// validation failed." and " is a required field". The fixtures lacked it, so
+// this tier could not have caught Rename and Delete addressing the wrong one.
 function device(over) {
     return Object.assign({
+        row_id: 1,
         id: '111111111', alias: 'Kitchen Pi', online: true, last_online: 1754222400,
         ip: '10.0.0.7', platform: 'Linux', version: '1.3.7'
     }, over || {});
@@ -26,7 +31,7 @@ function device(over) {
 
 const DEVICES = [
     device({}),
-    device({ id: '222222222', alias: undefined, hostname: 'reception', online: false,
+    device({ row_id: 2, id: '222222222', alias: undefined, hostname: 'reception', online: false,
         last_online: 1754136000, ip: '10.0.0.9', platform: 'Windows', version: '1.3.6' })
 ];
 
@@ -154,6 +159,8 @@ export default async function run(ctx) {
             assertOk(wrote.length >= 1, 'the rename went through PilotApi');
             // The real admin API carries the target in the body, not the path.
             assertEqual(wrote[0].path, '/api/admin/peer/update', 'the rename used the real update route');
+            assertEqual(JSON.parse(wrote[0].body).row_id, 1,
+                'the admin API matches on row_id, the database primary key');
             assertEqual(JSON.parse(wrote[0].body).id, '111111111', 'and addressed the right device');
             assertEqual(JSON.parse(wrote[0].body).alias, 'Pantry Pi',
                 'the server field is `alias`; `name` is not a field it has');

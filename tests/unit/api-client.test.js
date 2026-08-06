@@ -360,24 +360,29 @@ test('devices.list sends GET to the devices endpoint with admin auth and paginat
 // the device's name field is `alias` -- `name` is not a field admin.PeerForm
 // has, so the old body would have been silently ignored even if the path had
 // existed.
-test('devices.rename POSTs {id, alias} to /peer/update, with the id nowhere near the path', async () => {
+test('devices.rename POSTs {row_id, id, alias} — row_id is what the API matches on', async () => {
     const calls = recorder({ status: 200, body: { code: 0, data: null } });
-    await Api.devices.rename('../../etc', 'lobby-pi');
+    await Api.devices.rename(4, '../../etc', 'lobby-pi');
     assert.equal(calls[0].method, 'POST');
     assert.equal(calls[0].path, '/api/admin/peer/update');
     // The id is data now, so it cannot smuggle a path segment at all -- a
     // stronger property than escaping it.
     assert.equal(calls[0].path.indexOf('etc'), -1, calls[0].path);
-    assert.deepEqual(JSON.parse(calls[0].body), { id: '../../etc', alias: 'lobby-pi' });
+    // row_id is the database primary key. {id, alias} alone answers
+    // "Params validation failed." -- measured on a live v2.7 -- so Rename
+    // could not work at all.
+    assert.deepEqual(JSON.parse(calls[0].body), { row_id: 4, id: '../../etc', alias: 'lobby-pi' });
 });
 
-test('devices.remove POSTs {id} to /peer/delete and refuses an empty id', async () => {
+test('devices.remove POSTs {row_id} to /peer/delete and refuses a non-numeric row', async () => {
     const calls = recorder({ status: 200, body: { code: 0, data: null } });
-    await Api.devices.remove('abc');
+    await Api.devices.remove(4);
     assert.equal(calls[0].method, 'POST');
     assert.equal(calls[0].path, '/api/admin/peer/delete');
-    assert.deepEqual(JSON.parse(calls[0].body), { id: 'abc' });
+    // {id} answers " is a required field": the API deletes by row_id.
+    assert.deepEqual(JSON.parse(calls[0].body), { row_id: 4 });
     await assert.rejects(Api.devices.remove(''), (e) => e.kind === Errors.KIND.GENERIC);
+    await assert.rejects(Api.devices.remove('abc'), (e) => e.kind === Errors.KIND.GENERIC);
 });
 
 test('addressbook writes go to the client API so real clients see them', async () => {
@@ -568,10 +573,12 @@ test('audit.login unwraps a realistic paginated envelope, not just an empty list
 
 test('devices.rename: a pre-encoded traversal id is also neutralised, never a real path change', async () => {
     const calls = recorder({ status: 200, body: { code: 0, data: null } });
-    await Api.devices.rename('%2e%2e', 'name');
+    await Api.devices.rename(4, '%2e%2e', 'name');
     // encodeURIComponent escapes the literal "%" itself, so "%2e%2e" can never
     // decode back into ".." on the wire — it lands as a harmless opaque segment.
-    assert.equal(calls[0].path, C.EP['devices.rename'].path.replace('{id}', '%252e%252e'));
+    assert.equal(calls[0].path, C.EP['devices.rename'].path,
+        'the id is data now, so the path is fixed and cannot be steered at all');
+    assert.equal(JSON.parse(calls[0].body).id, '%2e%2e', 'and it survives verbatim in the body');
     assert.equal(calls[0].path.split('/').indexOf('..'), -1);
 });
 
@@ -579,10 +586,11 @@ test('devices.rename: a hostile id cannot reach the path at all', async () => {
     // Stronger than the escaping this used to assert: the real admin API takes
     // the id in the body, so there is no path for it to smuggle a segment into.
     const calls = recorder({ status: 200, body: { code: 0, data: null } });
-    await Api.devices.rename('a/../../etc/passwd', 'name');
+    await Api.devices.rename(4, 'a/../../etc/passwd', 'name');
     assert.equal(calls[0].path, '/api/admin/peer/update');
     assert.equal(calls[0].path.indexOf('passwd'), -1, 'the id must not appear in the path');
-    assert.deepEqual(JSON.parse(calls[0].body), { id: 'a/../../etc/passwd', alias: 'name' });
+    assert.deepEqual(JSON.parse(calls[0].body),
+        { row_id: 4, id: 'a/../../etc/passwd', alias: 'name' });
 });
 
 test('encodeQuery: a value containing "#" cannot truncate the query string', () => {
@@ -843,4 +851,36 @@ test('ENDPOINTS: the exact routes, pinned — every one measured against a real 
         if (e.admin) assert.ok(e.method === 'GET' || e.method === 'POST',
             e.id + ' uses ' + e.method + ', but the admin surface has no PUT or DELETE');
     });
+});
+
+test('devices.addToAddressBook sends ONE peer, exactly like addressbook.addPeer', async () => {
+    // THE BUG, reported twice: "Add to address book" failed with
+    // "the API request failed (/api/ab/peer/add/1-1-0)" -- and kept failing
+    // after addressbook.addPeer was fixed, because this method built its OWN
+    // ab.addPeer request with body [peer]. The server answers an array with
+    // 400 "cannot unmarshal array into Go value of type api.PeerForm". Nothing
+    // covered this body, so the suite stayed green through both rounds.
+    const calls = recorder({ status: 200, body: { code: 0, data: null } });
+    await Api.devices.addToAddressBook('100000002', '1-1-0');
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].method, 'POST');
+    assert.equal(calls[0].path, '/api/ab/peer/add/1-1-0');
+    const body = JSON.parse(calls[0].body);
+    assert.ok(!Array.isArray(body), 'an array is rejected outright by the server');
+    assert.deepEqual(body, { id: '100000002' });
+    // Same wire shape as the address-book surface's own call -- they are one
+    // operation and must not drift apart again.
+    const direct = recorder({ status: 200, body: { code: 0, data: null } });
+    await Api.addressbook.addPeer('1-1-0', { id: '100000002' });
+    assert.deepEqual(JSON.parse(direct[0].body), body);
+    assert.equal(direct[0].path, calls[0].path);
+});
+
+test('only ONE place builds an ab.addPeer request', () => {
+    // Two copies of one request is how the fix missed the second caller. The
+    // devices method delegates now, and this is what keeps it that way.
+    const src = fs.readFileSync(SRC, 'utf8').replace(/^\s*\/\/.*$/gm, '');
+    const hits = (src.match(/call\('ab\.addPeer'/g) || []).length;
+    assert.equal(hits, 1, "ab.addPeer must be built in exactly one place; " +
+        'call PilotApi.addressbook.addPeer() instead of re-issuing it');
 });

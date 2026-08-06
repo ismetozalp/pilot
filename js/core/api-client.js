@@ -437,29 +437,37 @@
             // name field is `alias` (admin.PeerForm); `name` is not a field the
             // server knows, so renaming used to write nothing even if the path
             // had existed.
-            rename: function (id, name) {
+            // row_id is the database primary key, and it is what the admin API
+            // matches on. Sending {id, alias} answers "Params validation
+            // failed."; sending {id} to delete answers " is a required field".
+            // Verified on a live v2.7: {row_id, id, alias} succeeds, and so
+            // does {row_id, alias} -- the id is sent anyway because it costs
+            // nothing and makes the request self-describing in a transcript.
+            rename: function (rowId, id, name) {
                 return guarded(function () {
                     return call('devices.rename', {
                         body: {
+                            row_id: numId(rowId),
                             id: text(String(id === null || id === undefined ? '' : id), 'a device id'),
                             alias: text(name, 'a device name')
                         }
                     });
                 });
             },
-            remove: function (id) {
+            remove: function (rowId) {
                 return guarded(function () {
-                    return call('devices.remove', {
-                        body: { id: text(String(id === null || id === undefined ? '' : id), 'a device id') }
-                    });
+                    return call('devices.remove', { body: { row_id: numId(rowId) } });
                 });
             },
+            // Delegates rather than re-implementing the call. This method built
+            // its own ab.addPeer request with body [peer], and fixing
+            // addressbook.addPeer left it sending the array the server rejects
+            // -- "Add to address book" kept failing after the fix. Two copies of
+            // one request is how that happens; there is now one.
             addToAddressBook: function (id, ab) {
                 return guarded(function () {
-                    return call('ab.addPeer', {
-                        params: { ab: ab },
-                        body: [{ id: text(String(id === null || id === undefined ? '' : id), 'a device id') }]
-                    });
+                    return PilotApi.addressbook.addPeer(ab,
+                        { id: text(String(id === null || id === undefined ? '' : id), 'a device id') });
                 });
             }
         },
