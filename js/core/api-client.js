@@ -69,9 +69,11 @@
         { id: 'ab.peers', method: 'POST', path: '/api/ab/peers', admin: false, probe: false },
         { id: 'ab.addPeer', method: 'POST', path: '/api/ab/peer/add/{ab}', admin: false, probe: false },
         { id: 'ab.updatePeer', method: 'PUT', path: '/api/ab/peer/update/{ab}', admin: false, probe: false },
-        // Not a typo: the server routes DELETE for a peer at .../peer/add/{guid},
-        // the same path as POST. Verified in api_swagger.json.
-        { id: 'ab.removePeer', method: 'DELETE', path: '/api/ab/peer/add/{ab}', admin: false, probe: false },
+        // api_swagger.json declares DELETE at .../peer/add/{guid}. The running
+        // server 404s that and routes it at .../peer/{guid} -- measured, both
+        // ways. Same lesson as /admin/user/updatePassword and /api/currentUser:
+        // the shipped swagger over-declares, and the server is the contract.
+        { id: 'ab.removePeer', method: 'DELETE', path: '/api/ab/peer/{ab}', admin: false, probe: false },
         { id: 'ab.tags', method: 'POST', path: '/api/ab/tags/{ab}', admin: false, probe: false },
         { id: 'ab.addTag', method: 'POST', path: '/api/ab/tag/add/{ab}', admin: false, probe: false },
         { id: 'ab.renameTag', method: 'PUT', path: '/api/ab/tag/rename/{ab}', admin: false, probe: false },
@@ -505,14 +507,18 @@
                     return call('ab.peers', { query: { ab: abText(ab) } });
                 });
             },
+            // A SINGLE peer object, not an array. The server answers an array
+            // with 400 "cannot unmarshal array into Go value of type
+            // api.PeerForm" -- which is what "Add to address book" reported.
             addPeer: function (ab, peer) {
                 return guarded(function () {
-                    return call('ab.addPeer', { params: { ab: ab }, body: [plain(peer, 'a peer')] });
+                    return call('ab.addPeer', { params: { ab: ab }, body: plain(peer, 'a peer') });
                 });
             },
             updatePeer: function (ab, peer) {
                 return guarded(function () {
-                    return call('ab.updatePeer', { params: { ab: ab }, body: [plain(peer, 'a peer')] });
+                    // Single object, like addPeer -- an array is a 400.
+                    return call('ab.updatePeer', { params: { ab: ab }, body: plain(peer, 'a peer') });
                 });
             },
             removePeer: function (ab, id) {
@@ -526,7 +532,9 @@
             tags: function (ab) { return call('ab.tags', { params: { ab: ab } }); },
             addTag: function (ab, tag) {
                 return guarded(function () {
-                    return call('ab.addTag', { params: { ab: ab }, body: [text(tag, 'a tag')] });
+                    // {name}, not an array and not a bare string: the server
+                    // rejects both with "cannot unmarshal ... into Go value".
+                    return call('ab.addTag', { params: { ab: ab }, body: { name: text(tag, 'a tag') } });
                 });
             },
             renameTag: function (ab, from, to) {

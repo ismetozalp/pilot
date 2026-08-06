@@ -954,3 +954,19 @@ test('the window is a stated constant, not a magic number buried in a comparison
     assert.ok(D.ONLINE_WINDOW_MS >= 90000 && D.ONLINE_WINDOW_MS <= 300000,
         'must absorb several missed 30-36s heartbeats without calling a dead peer online');
 });
+
+test('the Address column reads last_online_ip, which is the field v2.7 sends', () => {
+    // Every row showed a dash under Address even though the server had the
+    // address: the pick list named ip/last_ip/lastIp/remote_ip and the real row
+    // carries last_online_ip. Same shape as the online-field bug beside it --
+    // reading four names the server never sends and reporting "nothing".
+    const now = 1786007000000;
+    const rows = D.deviceRows({ code: 0, data: { list: [
+        { id: 'a', last_online_ip: '10.0.0.7' },
+        { id: 'b', ip: '10.0.0.8' },
+        { id: 'c' }
+    ], page: 1, total: 3, page_size: 50 } }, now);
+    assert.equal(rows[0].ip, '10.0.0.7');
+    assert.equal(rows[1].ip, '10.0.0.8', 'the older names still work');
+    assert.equal(rows[2].ip, DASH, 'and a device with no address is a dash, not "undefined"');
+});

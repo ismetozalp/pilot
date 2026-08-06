@@ -181,7 +181,9 @@
                 ? 'heartbeat' : 'server',
             lastSeenMs: lastSeenMs,
             lastSeenText: relativeTime(lastSeenMs, nowMs),
-            ip: clean(firstStr(r, ['ip', 'last_ip', 'lastIp', 'remote_ip'])) || DASH,
+            // last_online_ip is what v2.7 sends; without it the Address column
+            // was a dash on every row even though the server had the address.
+            ip: clean(firstStr(r, ['last_online_ip', 'ip', 'last_ip', 'lastIp', 'remote_ip'])) || DASH,
             platform: clean(firstStr(r, ['platform', 'os', 'osName'])) || DASH,
             version: clean(firstStr(r, ['version', 'client_version', 'clientVersion'])) || DASH
         };

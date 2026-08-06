@@ -707,10 +707,19 @@ test("addressbook.addTag/renameTag/removeTag/addPeer/updatePeer/removePeer all a
     await Api.addressbook.updatePeer('', { id: 'p1' });
     await Api.addressbook.removePeer('', 'p1');
     assert.equal(calls.length, 6);
+    // addPeer POSTs to .../peer/add/{guid}; removePeer DELETEs .../peer/{guid}.
+    // The swagger declares the delete at .../peer/add/{guid} and the running
+    // server 404s that -- measured both ways, like updatePassword before it.
     assert.deepEqual(calls.map((c) => c.path), [
         '/api/ab/tag/add/', '/api/ab/tag/rename/', '/api/ab/tag/',
-        '/api/ab/peer/add/', '/api/ab/peer/update/', '/api/ab/peer/add/'
+        '/api/ab/peer/add/', '/api/ab/peer/update/', '/api/ab/peer/'
     ]);
+    // And the BODY shapes the server actually accepts: a single peer object,
+    // never an array ("cannot unmarshal array into Go value of type
+    // api.PeerForm"), and a tag as {name}, never an array or a bare string.
+    assert.deepEqual(JSON.parse(calls[0].body), { name: 'x' }, 'addTag sends {name}');
+    assert.deepEqual(JSON.parse(calls[3].body), { id: 'p1' }, 'addPeer sends ONE peer, not [peer]');
+    assert.deepEqual(JSON.parse(calls[4].body), { id: 'p1' }, 'updatePeer sends ONE peer');
 });
 
 test("ab='' is still typed and control-character checked, only the non-empty rule is relaxed", async () => {
@@ -813,7 +822,7 @@ test('ENDPOINTS: the exact routes, pinned — every one measured against a real 
         'ab.peers': 'POST /api/ab/peers',
         'ab.addPeer': 'POST /api/ab/peer/add/{ab}',
         'ab.updatePeer': 'PUT /api/ab/peer/update/{ab}',
-        'ab.removePeer': 'DELETE /api/ab/peer/add/{ab}',
+        'ab.removePeer': 'DELETE /api/ab/peer/{ab}',
         'ab.tags': 'POST /api/ab/tags/{ab}',
         'ab.addTag': 'POST /api/ab/tag/add/{ab}',
         'ab.renameTag': 'PUT /api/ab/tag/rename/{ab}',
