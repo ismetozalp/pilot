@@ -1317,6 +1317,8 @@
             // Filled in by the user when the captured one is stale or absent.
             currentPassword: '',
             needCurrentPassword: false,
+            tokenSaveError: null,
+            signedIn: false,
             registeredIds: [],
 
             // Set by start()/checkDns() only. tlsFailure carries
@@ -2079,13 +2081,81 @@
                 Api.setTransport(Io.transport(Io.connFor(rec, token)));
                 try {
                     await Api.users.resetPassword(ADMIN_ID, str(newPassword));
+                    // Sign in AGAIN, with the password that now exists, and keep
+                    // that token. Every admin surface needs one: js/app.js reads
+                    // PilotServers.readSecret(id,'token') when it wires the
+                    // transport, SECRET_KINDS has carried a 'token' entry from
+                    // the start -- and nothing in the repo ever WROTE it. So the
+                    // console authenticated as nobody and every tab answered
+                    // "Please log in first", against a server that was working.
+                    // The token minted above cannot be reused: it was issued for
+                    // a password that no longer exists.
+                    await this.storeToken(id, str(newPassword));
                 } finally {
                     // Put the shell back in charge of the transport whatever
-                    // happened: this one carries a token minted from a password
-                    // that no longer exists.
-                    notifyServerChanged(this.doc || (root ? root.document : null), id);
+                    // happened -- and it now finds a token where there never was
+                    // one.
+                    notifyServerChanged(id, this.doc || (root ? root.document : null));
                 }
                 return true;
+            },
+
+            // Obtains a token for `password` and stores it as the server's
+            // 'token' secret (0600 root:root, like every other secret -- never
+            // in <id>.json). Returns false rather than throwing when there is
+            // nothing to store: a console that cannot sign in is a problem to
+            // report, not a reason to fail a password change that succeeded.
+            async storeToken(id, password) {
+                const Api = root ? root.PilotApi : null;
+                const Servers = servers();
+                if (!Api || !Api.users || typeof Api.users.login !== 'function' ||
+                    !Servers || typeof Servers.writeSecret !== 'function') return false;
+                try {
+                    const session = await Api.users.login(ADMIN_USER, str(password));
+                    const token = session && (session.token || (session.data && session.data.token));
+                    if (!token) { this.tokenSaveError = fail('API_AUTH_FAILED',
+                        'Signed in but the API server returned no token, so the console cannot authenticate.');
+                        return false; }
+                    await Servers.writeSecret(str(id), 'token', str(token));
+                    this.tokenSaveError = null;
+                    return true;
+                } catch (e) {
+                    this.tokenSaveError = describe(e);
+                    return false;
+                }
+            },
+
+            // Sign in WITHOUT touching the password. Uses whatever password is
+            // to hand, and asks for one if there is none -- the same fallback
+            // the change flow uses, for the same reason: the generated password
+            // is a first-boot artifact and is stale the moment anyone changes it.
+            async signInOnly() {
+                const pw = str(this.currentPassword) || str(this.generatedPassword);
+                if (!pw) {
+                    this.needCurrentPassword = true;
+                    this.error = describe(fail('API_AUTH_FAILED',
+                        'Enter the current administrator password to sign in.'));
+                    return false;
+                }
+                this.busy = true;
+                this.signedIn = false;
+                this.error = null;
+                try {
+                    const id = str(this.registeredServerId) ||
+                        (this.registeredIds.length ? this.registeredIds[0] : idForChoices(this.choices));
+                    const ok = await this.storeToken(id, pw);
+                    if (!ok) {
+                        this.needCurrentPassword = true;
+                        this.error = this.tokenSaveError ||
+                            describe(fail('API_AUTH_FAILED', 'Could not sign in to this server.'));
+                        return false;
+                    }
+                    notifyServerChanged(id, this.doc || (root ? root.document : null));
+                    this.signedIn = true;
+                    return true;
+                } finally {
+                    this.busy = false;
+                }
             },
 
             async finish() {
@@ -2093,7 +2163,20 @@
                 // to a user's server because a form happened to be on screen).
                 // Skipping leaves the generated password in place, which is why
                 // the pane shows it.
-                if (!this.changePassword) { this.finished = true; return true; }
+                if (!this.changePassword) {
+                    // Declining the change is not declining a working console.
+                    // Whatever password is in hand -- the one just captured from
+                    // the journal, or the one typed above -- is what the token
+                    // is minted from.
+                    const pw = str(this.currentPassword) || str(this.generatedPassword);
+                    if (pw) {
+                        const id = str(this.registeredServerId) || idForChoices(this.choices);
+                        await this.storeToken(id, pw);
+                        notifyServerChanged(id, this.doc || (root ? root.document : null));
+                    }
+                    this.finished = true;
+                    return true;
+                }
                 const gate = passwordGate(this.pw, this.generatedPassword);
                 this.pwErrors = gate.errors;
                 if (!gate.ok) return false;

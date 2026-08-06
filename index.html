@@ -428,7 +428,29 @@
                     x-text="busy ? 'Working…' : (changePassword ? 'Change password and finish' : 'Finish')"></button>
             <p class="text-danger mb-0" data-testid="pw-error"
                x-text="(pwErrors.password || '') + ' ' + (pwErrors.confirm || '')"></p>
+            <!-- A password change can succeed while the token write fails
+                 (unwritable /etc/pilot, a Limited-access session). The console
+                 would then be silently unauthenticated -- every tab answering
+                 "Please log in first" -- with the wizard reporting success. -->
+            <div class="alert alert-warning" data-testid="token-error" x-show="tokenSaveError">
+              <p class="mb-0">The password was set, but Pilot could not store an API token, so the
+                other tabs will not be able to sign in:
+                <span data-testid="token-error-message"
+                      x-text="tokenSaveError ? tokenSaveError.message : ''"></span></p>
+            </div>
             <p data-testid="finished" x-show="finished">Setup finished.</p>
+
+            <!-- Tokens expire (the generated config sets token-expire: 168h), so
+                 signing in has to be reachable without re-running anything. -->
+            <hr>
+            <h3 class="h6">Console sign-in</h3>
+            <p class="text-secondary mb-1">
+              The console signs in with a token that expires. If the tabs start saying
+              "Please log in first", get a new one here.</p>
+            <button class="btn btn-outline-primary" data-testid="signin" @click="signInOnly()"
+                    :disabled="busy" x-text="busy ? 'Signing in…' : 'Sign in to this server'"></button>
+            <p class="text-success mb-0" data-testid="signed-in" x-show="signedIn">
+              Signed in. The console has a fresh token.</p>
           </div>
 
           <div class="mt-3">

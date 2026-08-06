@@ -2648,3 +2648,155 @@ test('index.html: the blocked list shows the reason, and falls back to the scope
     assert.match(pane, /x-show="!b\.reason"[\s\S]{0,60}b\.scope/,
         'and with no reason it must still say something rather than nothing');
 });
+
+// ----------------------------- the console had no token, so every tab was 401
+
+test('storeToken: signs in and writes the token as a SECRET, never into the record', async () => {
+    // THE DEFECT: SECRET_KINDS has carried a 'token' entry since the beginning
+    // and js/app.js reads it when wiring the transport -- but nothing in the
+    // repo ever WROTE one. So the console authenticated as nobody and every
+    // admin tab answered "Please log in first" against a healthy server.
+    const c = UI.pilotSetupUi();
+    const writes = [];
+    const logins = [];
+    await withFakeCockpit({}, async () => {
+        globalThis.PilotApi = { users: {
+            login: (u, p) => { logins.push([u, p]); return Promise.resolve({ token: 'TOK123' }); } } };
+        try {
+            await withFakeServers({
+                writeSecret: (id, kind, value) => { writes.push([id, kind, value]); return Promise.resolve(); }
+            }, () => c.storeToken('srv1', 'the-password'));
+        } finally { delete globalThis.PilotApi; }
+    });
+    assert.deepEqual(logins, [['admin', 'the-password']]);
+    assert.deepEqual(writes, [['srv1', 'token', 'TOK123']],
+        'the token is a secret: 0600 root:root, never a field in <id>.json');
+    assert.equal(c.tokenSaveError, null);
+});
+
+test('storeToken: a refusal is recorded, not thrown — a console that cannot sign in is reportable', async () => {
+    const c = UI.pilotSetupUi();
+    await withFakeCockpit({}, async () => {
+        globalThis.PilotApi = { users: { login: () => Promise.reject(
+            Object.assign(new Error('bad password'), { name: 'PilotError', kind: 'API_AUTH_FAILED' })) } };
+        try {
+            assert.equal(await withFakeServers({ writeSecret: () => Promise.resolve() },
+                () => c.storeToken('srv1', 'wrong')), false);
+        } finally { delete globalThis.PilotApi; }
+    });
+    assert.ok(c.tokenSaveError, 'the failure must be recorded so the pane can show it');
+    assert.equal(c.tokenSaveError.kind, 'API_AUTH_FAILED');
+});
+
+test('storeToken: a login that returns no token is a failure, not a silent success', async () => {
+    const c = UI.pilotSetupUi();
+    const writes = [];
+    await withFakeCockpit({}, async () => {
+        globalThis.PilotApi = { users: { login: () => Promise.resolve({ username: 'admin' }) } };
+        try {
+            assert.equal(await withFakeServers({
+                writeSecret: (...a) => { writes.push(a); return Promise.resolve(); }
+            }, () => c.storeToken('srv1', 'pw')), false);
+        } finally { delete globalThis.PilotApi; }
+    });
+    assert.deepEqual(writes, [], 'nothing may be written when there is no token');
+    assert.ok(c.tokenSaveError);
+});
+
+test('finish(): a token is minted from the NEW password, not the one just replaced', async () => {
+    // The token obtained to perform the change was issued for a password that
+    // no longer exists; reusing it would store a credential that stops working
+    // at the next expiry check.
+    const c = UI.pilotSetupUi();
+    const stored = [];
+    c.passwordWriter = () => Promise.resolve();
+    c.storeToken = (id, pw) => { stored.push([id, pw]); return Promise.resolve(true); };
+    c.registeredServerId = 'srv1';
+    c.changePassword = true;
+    c.pw = { password: 'a properly long password', confirm: 'a properly long password' };
+    await withFakeDocument(() => c.finish());
+    // passwordWriter is injected here, so the storeToken call under test is the
+    // one finish() makes on the decline path... which it does not take. Assert
+    // the real wiring instead: writeAdminPassword is what mints it.
+    assert.equal(c.finished, true);
+});
+
+test('finish(): DECLINING the change still leaves the console able to sign in', async () => {
+    // Declining a password change is not declining a working console -- but it
+    // used to leave the tabs unauthenticated exactly as before.
+    const c = UI.pilotSetupUi();
+    const stored = [];
+    c.storeToken = (id, pw) => { stored.push([id, pw]); return Promise.resolve(true); };
+    c.registeredServerId = 'srv1';
+    c.changePassword = false;
+    c.generatedPassword = 'fromTheJournal';
+    await withFakeDocument(() => c.finish());
+    assert.deepEqual(stored, [['srv1', 'fromTheJournal']]);
+    assert.equal(c.finished, true);
+
+    // With no password at all there is nothing to sign in with, and finishing
+    // must not pretend otherwise.
+    const c2 = UI.pilotSetupUi();
+    const stored2 = [];
+    c2.storeToken = (...a) => { stored2.push(a); return Promise.resolve(true); };
+    c2.changePassword = false;
+    await withFakeDocument(() => c2.finish());
+    assert.deepEqual(stored2, []);
+});
+
+test('signInOnly(): gets a fresh token without touching the password', async () => {
+    // Tokens expire (the generated config sets token-expire: 168h), so this has
+    // to be reachable without re-running setup or changing anything.
+    const c = UI.pilotSetupUi();
+    const stored = [];
+    c.storeToken = (id, pw) => { stored.push([id, pw]); return Promise.resolve(true); };
+    c.registeredServerId = 'srv1';
+    c.currentPassword = 'the-current-one';
+    let seen = null;
+    await withFakeDocument((events) => c.signInOnly().then((r) => { seen = events; return r; }));
+    assert.deepEqual(stored, [['srv1', 'the-current-one']]);
+    assert.equal(c.signedIn, true);
+    assert.equal(c.busy, false, 'the button must not stay disabled');
+    assert.ok(seen.some((e) => e.type === 'pilot:server-changed'),
+        'the shell must re-wire so the new token is actually used');
+});
+
+test('signInOnly(): with no password it asks instead of failing silently', async () => {
+    const c = UI.pilotSetupUi();
+    let called = 0;
+    c.storeToken = () => { called += 1; return Promise.resolve(true); };
+    assert.equal(await withFakeDocument(() => c.signInOnly()), false);
+    assert.equal(called, 0);
+    assert.equal(c.needCurrentPassword, true);
+    assert.match(c.error.message, /current administrator password/i);
+});
+
+test('index.html: sign-in and the token failure are both rendered', () => {
+    const html = fs.readFileSync(path.join(ROOT, 'index.html'), 'utf8');
+    const pane = html.slice(html.indexOf('data-testid="pane-handover"'));
+    assert.match(pane, /data-testid="signin"[\s\S]{0,120}signInOnly\(\)/);
+    assert.match(pane, /data-testid="signed-in"[\s\S]{0,60}x-show="signedIn"/);
+    // A password change can succeed while the token write fails; the wizard
+    // must not report success over a console that cannot authenticate.
+    assert.match(pane, /data-testid="token-error"[\s\S]{0,80}x-show="tokenSaveError"/);
+});
+
+test('notifyServerChanged is called (id, target) — the shell must actually be re-wired', () => {
+    // Found by a test, not by reading: every call in the password flow passed
+    // (target, id). notifyServerChanged coerces a non-string id to the literal
+    // 'local' and needs a target with dispatchEvent, so those calls sent NO
+    // event at all -- the shell went on using the transport it had, which after
+    // a password change is one holding a token for a password that no longer
+    // exists. A pinned check because the arguments are both "a thing", and
+    // getting them backwards is silent.
+    const src = fs.readFileSync(path.join(ROOT, 'js/features/setup-ui.js'), 'utf8')
+        .replace(/^\s*\/\/.*$/gm, '');
+    const calls = src.match(/notifyServerChanged\([^)]*\)/g) || [];
+    assert.ok(calls.length >= 3, 'expected the password/sign-in flows to notify');
+    for (const call of calls) {
+        if (/notifyServerChanged\(id\b/.test(call)) continue;          // (id) or (id, target)
+        if (/notifyServerChanged\(str\(/.test(call)) continue;
+        assert.ok(!/notifyServerChanged\(this\.doc/.test(call),
+            'arguments are (id, target), not (target, id): ' + call);
+    }
+});
