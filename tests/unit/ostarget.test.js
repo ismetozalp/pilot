@@ -180,15 +180,15 @@ test('the two projects name the SAME machine differently, and both are honoured'
     assert.equal(OT.apiAsset('x86_64').name, 'linux-amd64.tar.gz');
 });
 
-test('server assets carry the pinned 1.1.16 digests verbatim', () => {
+test('server assets carry the pinned fork 1.4.3 digests verbatim', () => {
     assert.equal(OT.serverAsset('x86_64').sha256,
-        '0565c41affe6c3f409b0bddfaf5a24ccbf3f64f5f8e3fec250b69a0d5f6bdbcf');
+        '1feb4d64de2b7af684a44bd4315db3de29ee4e9a630cfbaea5f598ebd85055ac');
     assert.equal(OT.serverAsset('aarch64').sha256,
-        '6a4ae3c5ca257a4278ded72fd17eb2ca4eeb0356a5425e63a3e7fcb0ec6c155c');
+        '80034ffbe4514d1c6a56af159f5783b06b8c2eb01c8df6e9669a1e6f5e2b2045');
     assert.equal(OT.serverAsset('armv7l').sha256,
-        '2e832e901680bc4eb8d5d17df867e2bc9731c0bdf064b27c35084494fc279be2');
+        '610c15203355526d0d80878182807c2f9d2a4074eee3c57b3164878941cb187f');
     assert.equal(OT.serverAsset('i686').sha256,
-        'a10d2db36ceabec730ea2458dc0466b9fb46eda3f2ee90ab29a0bff8f92a7c22');
+        'eaebf49ef54ba69af94e81cdddcc5007806316848058271b9499c380d2b105eb');
 });
 
 test('API assets carry the pinned v2.7 digests — never null', () => {
@@ -212,9 +212,9 @@ test('every asset digest is a lowercase 64-hex string and every URL is https', (
 });
 
 test('URLs embed the pinned versions, so a bump cannot be half-applied', () => {
-    assert.ok(OT.serverAsset('x86_64').url.includes('/download/1.1.16/'));
+    assert.ok(OT.serverAsset('x86_64').url.includes('/download/1.4.3/'));
     assert.ok(OT.apiAsset('x86_64').url.includes('/download/v2.7/'));
-    assert.equal(OT.SERVER_VERSION, '1.1.16');
+    assert.equal(OT.SERVER_VERSION, '1.4.3');
     assert.equal(OT.API_VERSION, '2.7');
 });
 
@@ -365,4 +365,43 @@ test('index.html loads ostarget.js after errors.js', () => {
     assert.ok(srcs.includes('js/core/ostarget.js'), 'ostarget.js is not referenced');
     assert.ok(srcs.indexOf('js/core/errors.js') < srcs.indexOf('js/core/ostarget.js'),
         'ostarget.js must load after errors.js');
+});
+
+
+// ============================================ the fork is a stated exception
+//
+// Pilot installs hbbs/hbbr from wy414012/rustdesk-server, NOT from
+// rustdesk/rustdesk-server. Official hbbs 1.1.16 -- the newest official release
+// -- cannot serve a RustDesk client >= 1.4.1 that is signed in to the API, and
+// Pilot's whole purpose (the address book) requires being signed in. Measured
+// against a live 1.4.9 client on both servers.
+//
+// This is meant to be temporary. These assertions exist so the fork announces
+// itself in the test output instead of quietly becoming permanent, and so that
+// switching back is a deliberate edit rather than something nobody remembers.
+
+test('the server source is the fork, and says so out loud', () => {
+    assert.equal(OT.SERVER_IS_FORK, true,
+        'when this flips to false, the upstream/base/digests must all move together');
+    assert.equal(OT.SERVER_UPSTREAM, 'wy414012/rustdesk-server');
+    assert.ok(OT.serverAsset('x86_64').url.startsWith(
+        'https://github.com/wy414012/rustdesk-server/releases/download/'),
+    'every arch downloads from the fork, not a mix of both origins');
+});
+
+test('the fork carries a written reason and the upstream issue to watch', () => {
+    const src = fs.readFileSync(path.join(__dirname, '../../js/core/ostarget.js'), 'utf8');
+    assert.match(src, /TEMPORARY FORK/,
+        'the next person must not have to guess why this is not the official repo');
+    assert.match(src, /rustdesk-api\/issues\/482/,
+        'the issue to watch for the revert must be recorded next to the pin');
+});
+
+test('every server asset points at one origin -- a half-applied bump is the risk', () => {
+    for (const arch of ['x86_64', 'aarch64', 'armv7l', 'i686']) {
+        const a = OT.serverAsset(arch);
+        assert.ok(a.url.includes('/' + OT.SERVER_UPSTREAM + '/'), arch + ' uses the pinned origin');
+        assert.ok(a.url.includes('/download/' + OT.SERVER_VERSION + '/'), arch + ' uses the pinned version');
+        assert.match(a.sha256, /^[0-9a-f]{64}$/, arch + ' has a real digest');
+    }
 });

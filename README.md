@@ -5,6 +5,12 @@ self-hosted [RustDesk](https://rustdesk.com/) server: the OSS `hbbs`/`hbbr` pair
 the [`lejianwen/rustdesk-api`](https://github.com/lejianwen/rustdesk-api) API server
 that gives them a control plane.
 
+> **`hbbs`/`hbbr` currently come from a fork, on purpose.** Pilot installs
+> [`wy414012/rustdesk-server`](https://github.com/wy414012/rustdesk-server) **1.4.3**
+> rather than the official `rustdesk/rustdesk-server`. See
+> [Why the server is a fork](#why-the-server-is-a-fork) — this is temporary and
+> Pilot moves back to the official repo as soon as upstream is fixed.
+
 Two jobs, one screen:
 
 * **Provisioning.** A wizard that detects the target, shows you the exact plan it
@@ -27,6 +33,45 @@ TLS is optional and offered in three tiers: your own domain, an automatic
 `sslip.io` hostname, or DuckDNS. Choosing one installs and configures Caddy on
 443 and enables the browser-based web client. Skipping it is a supported choice —
 the reason the web client stays disabled is then shown on the Overview screen.
+
+## Why the server is a fork
+
+Pilot provisions `hbbs`/`hbbr` from
+[`wy414012/rustdesk-server`](https://github.com/wy414012/rustdesk-server) **1.4.3**,
+not from the official `rustdesk/rustdesk-server`. **This is temporary.**
+
+**The reason.** A RustDesk client 1.4.1 or newer that is *signed in* to the API
+server cannot connect through official `hbbs` **1.1.16** — the newest official
+release. The same client, signed out, connects fine. Because Pilot exists to manage
+the address book, and the address book only exists when you are signed in, the
+official server cannot run a working Pilot deployment today. Measured on a live
+1.4.9 client against both servers: signed out it connects, signed in every attempt
+fails, and swapping only the server binaries fixes it.
+
+The failure is easy to misread. It surfaces on the client as
+`Failed to secure tcp: deadline has elapsed`, which sounds like a firewall, a
+certificate or a wrong key, and is none of those.
+
+**What the fork changes.** Nothing about how Pilot installs it. The fork tracks the
+*client* version line (1.4.x) instead of the 1.1.x server line, ships the same asset
+names, the same three binaries (`hbbs`, `hbbr`, `rustdesk-utils`) in the same flat
+layout, and uses the same systemd units and data directory. Only the download origin,
+version and digests differ, all pinned in `js/core/ostarget.js` and checked by
+SHA256 before anything is unpacked.
+
+**Moving back to the official repo.** Watch
+[rustdesk-server releases](https://github.com/rustdesk/rustdesk-server/releases) for
+a release above 1.1.16 that serves signed-in 1.4.x clients, and
+[lejianwen/rustdesk-api#482](https://github.com/lejianwen/rustdesk-api/issues/482)
+for the upstream discussion. To switch back, in `js/core/ostarget.js` set
+`SERVER_UPSTREAM` to `rustdesk/rustdesk-server`, `SERVER_IS_FORK` to `false`, and
+`SERVER_VERSION` plus every `SERVER_ASSETS` digest to the new release. The tests in
+`tests/unit/ostarget.test.js` pin all of those together, so a half-applied switch
+fails rather than shipping a mixed origin.
+
+Already-provisioned servers are upgraded in place with the distribution packages or
+the release zip; the `id_ed25519` keypair in `/var/lib/rustdesk-server` is untouched
+by the swap, so no client needs reconfiguring in either direction.
 
 ## Install
 

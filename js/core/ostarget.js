@@ -16,10 +16,26 @@
         ? require('./errors.js')
         : root.PilotErrors;
 
-    const SERVER_VERSION = '1.1.16';
+    // TEMPORARY FORK -- switch back to rustdesk/rustdesk-server when upstream
+    // fixes this. Official hbbs 1.1.16 (the newest official release, 2026-07-20)
+    // cannot serve a RustDesk client >= 1.4.1 that is SIGNED IN to the API: the
+    // client fails every connection, while the same client signed out works.
+    // Since Pilot exists to manage the address book, and the address book
+    // requires being signed in, the official server cannot run a working Pilot
+    // deployment. Measured on a live 1.4.9 client against both servers.
+    //
+    // The fork tracks the CLIENT version line (1.4.x) rather than the 1.1.x
+    // server line, publishes the same asset names and the same three binaries,
+    // and needs no other change to the plan.
+    //
+    // Upstream to watch: https://github.com/rustdesk/rustdesk-server/releases
+    // and https://github.com/lejianwen/rustdesk-api/issues/482
+    const SERVER_VERSION = '1.4.3';
+    const SERVER_UPSTREAM = 'wy414012/rustdesk-server';
+    const SERVER_IS_FORK = true;
     const API_VERSION = '2.7';
     const SERVER_BASE =
-        'https://github.com/rustdesk/rustdesk-server/releases/download/' + SERVER_VERSION + '/';
+        'https://github.com/' + SERVER_UPSTREAM + '/releases/download/' + SERVER_VERSION + '/';
     const API_BASE =
         'https://github.com/lejianwen/rustdesk-api/releases/download/v' + API_VERSION + '/';
 
@@ -35,16 +51,19 @@
         i686: 'i386', i386: 'i386', i586: 'i386'
     };
 
-    // Digests verified via the GitHub releases API for tag 1.1.16 (spec §2.7).
+    // Digests for the FORK's tag 1.4.3, double-verified: the GitHub releases API
+    // `digest` field AND a local sha256sum of each downloaded zip. Both agree.
+    // The zips carry the same three binaries (hbbs, hbbr, rustdesk-utils) in the
+    // same flat layout as the official release, so the unpack step is unchanged.
     const SERVER_ASSETS = {
         amd64: { name: 'rustdesk-server-linux-amd64.zip',
-            sha256: '0565c41affe6c3f409b0bddfaf5a24ccbf3f64f5f8e3fec250b69a0d5f6bdbcf' },
+            sha256: '1feb4d64de2b7af684a44bd4315db3de29ee4e9a630cfbaea5f598ebd85055ac' },
         arm64: { name: 'rustdesk-server-linux-arm64v8.zip',
-            sha256: '6a4ae3c5ca257a4278ded72fd17eb2ca4eeb0356a5425e63a3e7fcb0ec6c155c' },
+            sha256: '80034ffbe4514d1c6a56af159f5783b06b8c2eb01c8df6e9669a1e6f5e2b2045' },
         armv7l: { name: 'rustdesk-server-linux-armv7.zip',
-            sha256: '2e832e901680bc4eb8d5d17df867e2bc9731c0bdf064b27c35084494fc279be2' },
+            sha256: '610c15203355526d0d80878182807c2f9d2a4074eee3c57b3164878941cb187f' },
         i386: { name: 'rustdesk-server-linux-i386.zip',
-            sha256: 'a10d2db36ceabec730ea2458dc0466b9fb46eda3f2ee90ab29a0bff8f92a7c22' }
+            sha256: 'eaebf49ef54ba69af94e81cdddcc5007806316848058271b9499c380d2b105eb' }
     };
 
     // Digests double-verified (GitHub API digest AND local sha256sum) for v2.7.
@@ -232,6 +251,7 @@
 
     const PilotOsTarget = {
         SERVER_VERSION: SERVER_VERSION, API_VERSION: API_VERSION,
+        SERVER_UPSTREAM: SERVER_UPSTREAM, SERVER_IS_FORK: SERVER_IS_FORK,
         SERVER_BASE: SERVER_BASE, API_BASE: API_BASE,
         parseOsRelease: parseOsRelease, family: family, normalizeArch: normalizeArch,
         serverAsset: serverAsset, apiAsset: apiAsset, initOk: initOk, evaluate: evaluate

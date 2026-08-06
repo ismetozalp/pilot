@@ -348,9 +348,19 @@
         // ---- hbbs/hbbr: adopt vs install, decided by detection alone --------
         if (doInstallHbbs) {
             const zip = CACHE + '/' + det.serverAsset.name;
+            // The origin is named in the title, not just the version. This is a
+            // FORK of rustdesk-server (see js/core/ostarget.js for why), and an
+            // operator approving a plan that installs software on their machine
+            // is entitled to see where it comes from without reading the URL.
             steps.push(step({ id: 'install-hbbs-fetch',
-                title: 'Download the RustDesk server ' + OsTarget.SERVER_VERSION + ' (' + det.arch + ')',
-                mutating: true, why: 'The pinned release is fetched and checked against a recorded SHA256 before anything is unpacked.',
+                title: 'Download the RustDesk server ' + OsTarget.SERVER_VERSION + ' (' + det.arch + ')' +
+                    (OsTarget.SERVER_IS_FORK ? ' from ' + OsTarget.SERVER_UPSTREAM : ''),
+                mutating: true,
+                why: OsTarget.SERVER_IS_FORK
+                    ? 'The pinned release is fetched and checked against a recorded SHA256 before anything is unpacked. ' +
+                      'This is a fork of rustdesk-server: the official build cannot serve a signed-in RustDesk client 1.4.1 or newer, ' +
+                      'which is what the address book requires. Pilot moves back to the official repo once that is fixed upstream.'
+                    : 'The pinned release is fetched and checked against a recorded SHA256 before anything is unpacked.',
                 argv: ['curl', '-fsSL', det.serverAsset.url, '-o', zip], sha256: det.serverAsset.sha256 }));
             steps.push(step({ id: 'install-hbbs-unpack', title: 'Unpack hbbs, hbbr and rustdesk-utils into ' + BIN_DIR,
                 mutating: true, why: 'The zip nests the binaries under an arch directory, so they are flattened into one bin directory.',

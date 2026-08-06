@@ -5,6 +5,41 @@ All notable changes to Pilot are recorded here. The format follows
 [semantic versioning](https://semver.org/) — `VERSION` is the single source of
 truth, read by the Makefile and by the self-updater.
 
+## Unreleased
+
+### Changed
+
+- **`hbbs`/`hbbr` are now installed from
+  [`wy414012/rustdesk-server`](https://github.com/wy414012/rustdesk-server) 1.4.3
+  instead of the official `rustdesk/rustdesk-server` 1.1.16.** Official `hbbs`
+  cannot serve a RustDesk client 1.4.1 or newer that is *signed in* to the API
+  server, and Pilot's whole purpose — the address book — requires being signed in.
+  The client reports `Failed to secure tcp: deadline has elapsed`, which reads like
+  a firewall or certificate fault and is neither. **Temporary**: see
+  [Why the server is a fork](README.md#why-the-server-is-a-fork) for the revert
+  procedure and the upstream issues to watch.
+- The Address Book's **bulk-tag** and **rename-tag** controls are dropdowns over the
+  tags that exist, instead of free-text fields. Typing a tag name invented a new one
+  on any typo, so a book could hold `laptop` and `Laptop` as separate tags with
+  nothing on screen to reveal it. With no tags yet, both controls say so and offer
+  the action that creates one.
+
+### Fixed
+
+- Renaming a device now also updates its **address-book alias**. A device name lives
+  in two tables on a rustdesk-api server and only the peer row was being written, so
+  a renamed device kept its old name in the Address Book — and in the RustDesk
+  desktop client, which reads the address-book alias.
+- Address-book writes made from the Devices tab now refresh the Address Book tab.
+  They are separate Alpine components, so a write on one was invisible to the other
+  until the whole browser page was reloaded.
+- The "not connected" banner no longer stays on screen after connecting. It carried a
+  Bootstrap `d-flex` utility, whose `display: flex !important` overrides the inline
+  `display: none` that `x-show` sets.
+- `reconnect()` is bounded at 15 seconds and explains what to do when it expires. A
+  Cockpit channel that never opens also never errors, so the button could sit on
+  "Reconnecting…" forever with nothing in the browser console.
+
 ## 0.1.0
 
 First release: a Cockpit plugin that provisions and then manages a self-hosted

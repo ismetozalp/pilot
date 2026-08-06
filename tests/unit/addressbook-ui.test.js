@@ -719,3 +719,72 @@ test('the event is ignored when no book is on screen -- there is nothing to relo
     assert.equal(c.onAddressBookChanged({ detail: { ab: 'x' } }), false);
     assert.equal(api.calls.filter((x) => x[0] === 'peers').length, 0);
 });
+
+
+// ===================================== FIELD REPORT: bulk tags was a text box
+//
+// "tags for this selection should be dropdown if no tags exists just write you
+// have to create tag".
+//
+// A free-text box asked the operator to retype a tag that already existed, and
+// silently created a NEW one on any typo -- a book could end up with "laptop"
+// and "Laptop" as separate tags with nothing in this row to reveal it. The only
+// valid values are the tags the book already has, so it is a choice.
+
+test('the bulk-tag control is a dropdown over existing tags, not a free-text field', () => {
+    const t = Ui.TEMPLATE;
+    const bulk = t.slice(t.indexOf('Tags for the selection'), t.indexOf('data-pilot="bulk-mode"'));
+    assert.ok(/<select[^>]*data-pilot="bulk-tags"/.test(bulk),
+        'bulk tagging must offer the tags that exist');
+    assert.ok(!/<input[^>]*data-pilot="bulk-tags"/.test(bulk),
+        'a text field here invents tags on a typo');
+    assert.ok(/x-for="t in tags"/.test(bulk), 'the options come from the loaded tags');
+});
+
+test('with no tags the control is replaced by an explanation and a way forward', () => {
+    const t = Ui.TEMPLATE;
+    // Spec 7.3: never render an empty dropdown -- it says something is wrong
+    // but not what, and offers no next action.
+    assert.ok(/x-if="tags\.length"/.test(t), 'the select renders only when there is something to choose');
+    assert.ok(/x-if="!tags\.length"/.test(t), 'the empty case must be handled explicitly');
+    assert.ok(/data-pilot="bulk-tags-empty"/.test(t));
+    assert.ok(/data-pilot="bulk-tags-empty-action"/.test(t), 'the empty state carries its CTA');
+});
+
+test('the bulk-tag empty state says what to do, and routes to the same action as the tag row', () => {
+    const e = Ui.bulkTagEmptyState();
+    assert.equal(e.message, 'You have to create a tag first.');
+    assert.equal(e.ctaLabel, Ui.tagEmptyState().ctaLabel,
+        'both empty states must land the operator on the same next step');
+    assert.ok(e.tab);
+});
+
+test('bulk tagging stays disabled until a tag is actually chosen', () => {
+    // The placeholder option is the empty string, so an untouched dropdown must
+    // not enable "Apply to selected".
+    const st = { peers: [{ id: 'a1', tags: [] }], selected: ['a1'], filter: '', bulkTags: '' };
+    assert.equal(Ui.canBulkTag(st), false, 'no tag chosen -> nothing to apply');
+    st.bulkTags = 'laptop';
+    assert.equal(Ui.canBulkTag(st), true);
+});
+
+
+test('the rename source is a dropdown too -- a typo there renames nothing, silently', () => {
+    const t = Ui.TEMPLATE;
+    const row = t.slice(t.indexOf('for="pilot-ab-renamefrom"'), t.indexOf('data-pilot="rename-to"'));
+    assert.ok(/<select[^>]*data-pilot="rename-from"/.test(row),
+        'the tag being renamed must already exist, so it is a choice');
+    assert.ok(!/<input[^>]*data-pilot="rename-from"/.test(row),
+        'a text field renames a tag that is not there and reports success');
+    assert.ok(/x-for="t in tags"/.test(row), 'options come from the loaded tags');
+    // The destination stays free text -- the new name is by definition one that
+    // does not exist yet.
+    assert.ok(/<input[^>]*data-pilot="rename-to"/.test(t),
+        'the NEW name cannot come from a list of names that already exist');
+});
+
+test('with no tags the rename source shows the same explanation and CTA', () => {
+    const t = Ui.TEMPLATE;
+    assert.ok(/data-pilot="rename-from-empty"/.test(t));
+    assert.ok(/data-pilot="rename-from-empty-action"/.test(t));
+});

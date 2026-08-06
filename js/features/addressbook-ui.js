@@ -127,6 +127,20 @@
         return entry || { message: 'No tags yet.', ctaLabel: 'Add a tag', tab: 'addressbook' };
     }
 
+    // The bulk-tag control's own empty state. It says something different from
+    // the Tags row's: up there "No tags yet." is a neutral observation, but here
+    // the operator has selected rows and is trying to act, so it has to explain
+    // why the control they expected is missing. Same CTA, so both routes land on
+    // the same next action.
+    function bulkTagEmptyState() {
+        const entry = tagEmptyState();
+        return {
+            message: 'You have to create a tag first.',
+            ctaLabel: entry.ctaLabel || 'Add a tag',
+            tab: entry.tab || 'addressbook'
+        };
+    }
+
     function csvFilename(book, now) {
         const when = (now instanceof Date && !isNaN(now.getTime())) ? now : new Date();
         const stamp = String(when.getUTCFullYear()) +
@@ -224,7 +238,25 @@
         '    </div>',
         '    <div class="col-auto">',
         '      <label class="form-label" for="pilot-ab-renamefrom">Rename</label>',
-        '      <input id="pilot-ab-renamefrom" type="text" class="form-control" data-pilot="rename-from" x-model="renameFrom">',
+        // Same reasoning as the bulk-tag control: the tag being renamed must
+        // already exist, so typing its name is a chance to get it wrong. A typo
+        // here renamed nothing and reported success, because the server has no
+        // tag by that name to complain about.
+        '      <template x-if="tags.length">',
+        '        <select id="pilot-ab-renamefrom" class="form-select" data-pilot="rename-from" x-model="renameFrom">',
+        '          <option value="">Choose a tag…</option>',
+        '          <template x-for="t in tags" :key="t">',
+        '            <option :value="t" x-text="t"></option>',
+        '          </template>',
+        '        </select>',
+        '      </template>',
+        '      <template x-if="!tags.length">',
+        '        <div data-pilot="rename-from-empty">',
+        '          <span class="text-secondary small" x-text="bulkTagEmptyState().message"></span>',
+        '          <button type="button" class="btn btn-sm btn-link p-0 ms-1" data-pilot="rename-from-empty-action"',
+        '                  @click="focusNewTag()" x-text="bulkTagEmptyState().ctaLabel"></button>',
+        '        </div>',
+        '      </template>',
         '    </div>',
         '    <div class="col-auto">',
         '      <label class="form-label" for="pilot-ab-renameto">to</label>',
@@ -238,7 +270,29 @@
         '  <div class="row g-2 align-items-end mb-3">',
         '    <div class="col-auto">',
         '      <label class="form-label" for="pilot-ab-bulk">Tags for the selection</label>',
-        '      <input id="pilot-ab-bulk" type="text" class="form-control" data-pilot="bulk-tags" x-model="bulkTags">',
+        // A free-text box here asked the operator to retype a tag that already
+        // exists, and silently created a NEW one on any typo -- the address book
+        // grew "laptop" and "Laptop" as separate tags with no way to tell from
+        // this row. The only valid values are the tags this book already has, so
+        // this is a choice, not a text field.
+        '      <template x-if="tags.length">',
+        '        <select id="pilot-ab-bulk" class="form-select" data-pilot="bulk-tags" x-model="bulkTags">',
+        '          <option value="">Choose a tag…</option>',
+        '          <template x-for="t in tags" :key="t">',
+        '            <option :value="t" x-text="t"></option>',
+        '          </template>',
+        '        </select>',
+        '      </template>',
+        // Spec §7.3: a data-driven control with nothing to choose from is never
+        // rendered. An empty dropdown says something is wrong but not what, and
+        // offers no way forward -- so say it, and point at the fix.
+        '      <template x-if="!tags.length">',
+        '        <div data-pilot="bulk-tags-empty">',
+        '          <span class="text-secondary small" x-text="bulkTagEmptyState().message"></span>',
+        '          <button type="button" class="btn btn-sm btn-link p-0 ms-1" data-pilot="bulk-tags-empty-action"',
+        '                  @click="focusNewTag()" x-text="bulkTagEmptyState().ctaLabel"></button>',
+        '        </div>',
+        '      </template>',
         '    </div>',
         '    <div class="col-auto">',
         '      <label class="form-label" for="pilot-ab-bulkmode">Mode</label>',
@@ -460,6 +514,7 @@
             // would be a self-referential no-op; focusing the add-tag input
             // is the genuinely useful next step instead.
             tagEmptyState() { return tagEmptyState(); },
+            bulkTagEmptyState() { return bulkTagEmptyState(); },
             focusNewTag() {
                 const d = this.doc || root.document || null;
                 if (!d || typeof d.getElementById !== 'function') return false;
@@ -752,7 +807,7 @@
 
     const PilotAddressBookUi = {
         HOST_ID, SERVER_CHANGED_EVENT, TEMPLATE, blankState, toAlert, activeBookOf, visiblePeers,
-        selectionOf, canBulkTag, csvFilename, tagEmptyState, mount, safeMount, pilotAddressBookUi
+        selectionOf, canBulkTag, csvFilename, tagEmptyState, bulkTagEmptyState, mount, safeMount, pilotAddressBookUi
     };
     root.PilotAddressBookUi = PilotAddressBookUi;
     if (typeof module !== 'undefined' && module.exports) module.exports = PilotAddressBookUi;

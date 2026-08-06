@@ -268,7 +268,7 @@ test('a fresh install still uses choices.apiPort — there is no det.api.port to
 test('C14: downloads are literal argv with -o as its own element', () => {
     const plan = P.build(detFresh(), choices({ installHbbs: true }));
     assert.deepEqual(byId(plan, 'install-hbbs-fetch').argv, ['curl', '-fsSL',
-        'https://github.com/rustdesk/rustdesk-server/releases/download/1.1.16/rustdesk-server-linux-amd64.zip',
+        'https://github.com/wy414012/rustdesk-server/releases/download/1.4.3/rustdesk-server-linux-amd64.zip',
         '-o', '/var/cache/pilot/rustdesk-server-linux-amd64.zip']);
     assert.deepEqual(byId(plan, 'fetch-api').argv, ['curl', '-fsSL',
         'https://github.com/lejianwen/rustdesk-api/releases/download/v2.7/linux-amd64.tar.gz',
@@ -973,4 +973,22 @@ test('config.yaml carries the release defaults, because an omitted key is a ZERO
     assert.match(cfg, /\n  show-swagger: 1\n/, 'the verify step depends on this');
     assert.match(cfg, /\n  api-addr: 0\.0\.0\.0:21114\n/);
     assert.match(cfg, /\n  id-server: /);
+});
+
+
+test('the download step names the fork, so an operator approving the plan sees the origin', () => {
+    const OT = require('../../js/core/ostarget.js');
+    const plan = P.build(detFresh(), choices({ installHbbs: true }));
+    const fetch = byId(plan, 'install-hbbs-fetch');
+    assert.ok(fetch, 'the plan installs hbbs when none was detected');
+    // Installing software on someone's machine from a third-party fork is not
+    // something to hide in a URL the plan renders but nobody reads.
+    assert.ok(fetch.title.includes(OT.SERVER_UPSTREAM),
+        'the origin belongs in the title: ' + fetch.title);
+    assert.match(fetch.why, /fork of rustdesk-server/,
+        'and the reason belongs in the why');
+    assert.match(fetch.why, /official repo once that is fixed upstream/,
+        'the plan must say this is temporary');
+    assert.equal(fetch.sha256, OT.serverAsset('x86_64').sha256,
+        'the digest checked is the one pinned for this arch');
 });

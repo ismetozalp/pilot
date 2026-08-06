@@ -144,12 +144,18 @@ export default async function run(ctx) {
     });
 
     await check('addressbook: bulk tag assignment writes one update per selected peer', async () => {
-        const page = await openAddressBook(ctx, baseRoutes());
+        // 'floor 1' must EXIST for the dropdown to offer it -- scoped to this
+        // check so the rename/delete check still owns a single-tag book.
+        const routes = Object.assign(baseRoutes(),
+            { ['POST /api/ab/tags/' + PERSONAL_GUID]: tagsOk(['office', 'floor 1']) });
+        const page = await openAddressBook(ctx, routes);
         try {
             await page.click('#pilot-addressbook [data-pilot="reload"]');
             await waitRowCount(page, 2);
             await page.click('#pilot-addressbook [data-pilot="select-all"]');
-            await page.fill('#pilot-addressbook [data-pilot="bulk-tags"]', 'floor 1');
+            // A dropdown, not a text field: only tags that already exist can be
+            // applied, which is the point -- typing used to invent a tag on a typo.
+            await page.selectOption('#pilot-addressbook [data-pilot="bulk-tags"]', 'floor 1');
             await page.click('#pilot-addressbook [data-pilot="bulk-apply"]');
             await page.waitForSelector('#pilot-addressbook [data-pilot="notice"] .alert', { timeout: WAIT });
             const calls = await transportCalls(page);
@@ -186,7 +192,7 @@ export default async function run(ctx) {
         try {
             await page.click('#pilot-addressbook [data-pilot="reload"]');
             await waitRowCount(page, 2);
-            await page.fill('#pilot-addressbook [data-pilot="rename-from"]', 'office');
+            await page.selectOption('#pilot-addressbook [data-pilot="rename-from"]', 'office');
             await page.fill('#pilot-addressbook [data-pilot="rename-to"]', 'HQ');
             await page.click('#pilot-addressbook [data-pilot="rename-tag"]');
             await page.waitForFunction(() => {
