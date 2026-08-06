@@ -431,15 +431,19 @@ export default async function run(ctx) {
     // permanently :disabled with the title "No address book yet" -- factually
     // wrong since task 23 shipped the whole Address Book surface -- and the
     // 25-line addToBook() with its complete error handling was unreachable.
-    const BOOKS_OK = { status: 200, body: { code: 0, message: '', data: { profiles: [
-        { guid: '', name: 'Personal', personal: true },
-        { guid: 'shared-1', name: 'Support team' }
-    ] } } };
+    // The REAL shapes, measured on a v2.7 server:
+    //   POST /api/ab/personal        -> {guid:"1-1-0", name:"admin", rule:3}
+    //   POST /api/ab/shared/profiles -> {data:[...]|null, total}
+    // The personal book is a separate call and carries a real guid; it used to
+    // be synthesised here with guid '', which the server answers 400/404.
+    const PERSONAL_OK = { status: 200, body: { guid: '1-1-0', name: 'admin', rule: 3 } };
+    const BOOKS_OK = { status: 200, body: { data: [{ guid: 'shared-1', name: 'Support team' }], total: 1 } };
 
     await check('FINDING 3: the address book selector is real, and "Add to address book" ' +
         'actually calls the API with the CHOSEN book', async () => {
         const page = await openDevices(ctx, {
             'GET /api/admin/peer/list': listOk(DEVICES),
+            'POST /api/ab/personal': PERSONAL_OK,
             'POST /api/ab/shared/profiles': BOOKS_OK,
             'POST /api/ab/peer/add/': { status: 200, body: { code: 0, message: '', data: {} } }
         });

@@ -492,3 +492,31 @@ test('init tolerates a target with no addEventListener (no DOM) and still refres
         assert.equal(c.rows.length, 3);
     });
 });
+
+// ------------------------------- the two seeded groups are named in Chinese
+
+test('the seeded groups get a readable label; anything renamed is left alone', () => {
+    // rustdesk-api seeds two groups at first migration -- 默认组 and 共享组 --
+    // regardless of the `lang` setting, so an English-speaking operator saw two
+    // unreadable options and could not tell which was which. `type` is what
+    // identifies them (1 default, 2 shared, verified on a real v2.7 install).
+    const g = U.normalizeGroups({ code: 0, data: { list: [
+        { id: 1, name: '默认组', type: 1 },
+        { id: 2, name: '共享组', type: 2 },
+        { id: 3, name: 'Support team', type: 2 },
+        { id: 4, name: 'Renamed default', type: 1 }
+    ] } });
+    const rows = Array.isArray(g) ? g : (g.list || []);
+    assert.deepEqual(rows.map((r) => r.name),
+        ['Default group', 'Shared group', 'Support team', 'Renamed default'],
+        'only the untouched seed is relabelled — a group someone named is theirs');
+    // The server's own name is kept, never overwritten.
+    assert.equal(rows[0].serverName, '默认组');
+    assert.equal(rows[2].serverName, 'Support team');
+});
+
+test('a group with no name at all is still identified', () => {
+    const g = U.normalizeGroups({ code: 0, data: { list: [{ id: 9, type: 7 }] } });
+    const rows = Array.isArray(g) ? g : (g.list || []);
+    assert.equal(rows[0].name, '(unnamed)');
+});

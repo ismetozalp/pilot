@@ -129,7 +129,11 @@
         const stamp = String(when.getUTCFullYear()) +
             String(when.getUTCMonth() + 1).padStart(2, '0') +
             String(when.getUTCDate()).padStart(2, '0');
-        let name = String((book && book.name) || '').toLowerCase()
+        // The personal book is named by the SERVER -- "admin" on a real v2.7,
+        // i.e. the account name. That is a poor and slightly leaky filename for
+        // an export, and it changes with the account. "personal" is what it is.
+        const raw = (book && book.personal) ? 'personal' : String((book && book.name) || '');
+        let name = raw.toLowerCase()
             .replace(/[^a-z0-9]+/g, '-').replace(/^-+/, '').replace(/-+$/, '');
         if (!name) name = 'book';
         return 'pilot-addressbook-' + name.slice(0, 40) + '-' + stamp + '.csv';
@@ -352,19 +356,29 @@
             async loadBooks() {
                 this.error.books = null;
                 const api = this.api();
+                // No synthetic fallback book. AB.PERSONAL.guid is '', and ''
+                // is not a guid this server accepts: /api/ab/peers?ab= is a 400
+                // and /api/ab/tags/ a 404. Standing one up when the server told
+                // us nothing produced a selector whose only entry could not be
+                // used -- the state §7.3 exists to prevent. An empty list is
+                // honest, and the empty state below says what to do.
                 if (!api) {
                     this.error.books = toAlert(mkErr('API_UNREACHABLE', NO_API, null));
-                    this.books = [Object.assign({}, AB.PERSONAL)];
+                    this.books = [];
                 } else {
                     try {
                         this.books = AB.booksFrom(await api.books());
                     } catch (e) {
                         this.error.books = toAlert(e);
-                        this.books = [Object.assign({}, AB.PERSONAL)];
+                        this.books = [];
                     }
                 }
+                // books[0] was read unguarded, which only ever worked because
+                // booksFrom() guaranteed a synthetic entry. With none, an empty
+                // list threw "Cannot read properties of undefined (reading
+                // 'guid')" at load and took the whole surface down.
                 if (!this.books.some((b) => b.guid === this.activeGuid))
-                    this.activeGuid = this.books[0].guid;
+                    this.activeGuid = this.books.length ? this.books[0].guid : '';
             },
 
             async loadPeers() {

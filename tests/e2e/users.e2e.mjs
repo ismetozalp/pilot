@@ -19,14 +19,19 @@ export const name = 'users';
 
 const WAIT = 5000;
 
+// Ids are INTEGERS on this API -- model.Group.id and admin.UserForm.group_id
+// are both uint, and the server rejects the string a <select> yields with
+// "cannot unmarshal string into Go struct field UserForm.group_id of type
+// uint", which is what the Users tab reported in the field. String ids here
+// let that bug through.
 const GROUPS = [
-    { id: 'g1', name: 'Support', device_count: 4, info: 'Tier-1 desks' },
-    { id: 'g2', name: 'Field', device_count: 0 }
+    { id: 1, name: 'Support', type: 2, device_count: 4, info: 'Tier-1 desks' },
+    { id: 2, name: 'Field', type: 2, device_count: 0 }
 ];
 const USERS = [
-    { id: 1, name: 'ada', email: 'ada@example.com', group_id: 'g1', status: 1, is_admin: true },
-    { id: 2, name: 'bob', email: 'bob@example.com', group_id: 'g2', status: 0 },
-    { id: 3, name: 'cem', email: 'cem@example.com', group_id: '', status: 1 }
+    { id: 1, name: 'ada', email: 'ada@example.com', group_id: 1, status: 1, is_admin: true },
+    { id: 2, name: 'bob', email: 'bob@example.com', group_id: 2, status: 0 },
+    { id: 3, name: 'cem', email: 'cem@example.com', group_id: 0, status: 1 }
 ];
 
 // C12: HTTP 200 even on failure, {code,message,data}; paginated data. Matches
@@ -158,19 +163,20 @@ export default async function run(ctx) {
             await page.click('#pilot-users [data-testid="users-refresh"]');
             await waitRowCount(page, 3);
             const row = page.locator('#pilot-users [data-testid="users-row"]').nth(2);
-            await row.locator('[data-testid="users-group"]').selectOption('g2');
+            await row.locator('[data-testid="users-group"]').selectOption('2');
             await page.waitForFunction(() => (window.__pilotTransport || { calls: [] }).calls
                 .some((c) => c.path.indexOf('/api/admin/user/update') === 0), null, { timeout: WAIT });
             const calls = await transportCalls(page);
             const wrote = calls.find((c) => c.path.indexOf('/api/admin/user/update') === 0 &&
                 jsonBody(c) && jsonBody(c).id === 3);
             assertOk(wrote, 'setGroup did not reach the façade');
-            assertEqual(jsonBody(wrote) && jsonBody(wrote).group_id, 'g2', 'the wrong group id was sent');
+            assertEqual(jsonBody(wrote) && jsonBody(wrote).group_id, 2,
+                'group_id is a uint on the wire; a string is rejected outright');
         } finally { await page.ctx.close(); }
     });
 
     await check('users: a row assigned to a group the Groups fetch never returned still shows its true group', async () => {
-        // Groups is deliberately empty here, and u1's group_id ('g1') never
+        // Groups is deliberately empty here, and u1's group_id (1) never
         // appears in it -- proves the <select> cannot silently fall back to
         // its default "Unassigned" option for an account that IS assigned.
         const page = await openUsers(ctx, baseRoutes({ 'GET /api/admin/group/list': listOk([]) }));
@@ -179,7 +185,7 @@ export default async function run(ctx) {
             await waitRowCount(page, 3);
             const first = page.locator('#pilot-users [data-testid="users-row"]').first();
             const selected = await first.locator('[data-testid="users-group"] option[selected]').first().innerText();
-            assertMatch(selected, /Group g1/, 'an unresolved group id must be shown honestly, not as Unassigned');
+            assertMatch(selected, /Group 1/, 'an unresolved group id must be shown honestly, not as Unassigned');
         } finally { await page.ctx.close(); }
     });
 
@@ -333,19 +339,19 @@ export default async function run(ctx) {
             assertOk(alert.includes('Groups'), 'the warning must name Groups, not Users');
             const first = page.locator('#pilot-users [data-testid="users-row"]').first();
             const selected = await first.locator('[data-testid="users-group"] option[selected]').first().innerText();
-            assertMatch(selected, /Group g1/, 'an unresolved group id must fall back honestly, not disappear');
+            assertMatch(selected, /Group 1/, 'an unresolved group id must fall back honestly, not disappear');
         } finally { await page.ctx.close(); }
     });
 
     await check('users: a hostile payload cannot inject markup, execute, or crash the surface', async () => {
         const hostile = [
             { id: '333333333', name: '<img src=x onerror="window.__xss=1">', email: 'x@example.com',
-              group_id: 'g1', status: 1 },
+              group_id: 1, status: 1 },
             { id: '444444444', name: 'a\x00b\x01c', email: 'y@example.com', status: 1 },
             { id: '555555555', name: 'ışıl ' + '\u202E' + 'evil' + '\u202C', email: 'z@example.com', status: 1 },
             { id: '666666666', name: 'n'.repeat(4000), email: 'w@example.com', status: 1 }
         ];
-        const hostileGroups = [{ id: 'g1', name: '<script>window.__xss2=1</script>', device_count: 1 }];
+        const hostileGroups = [{ id: 1, name: '<script>window.__xss2=1</script>', device_count: 1 }];
         const page = await openUsers(ctx, baseRoutes({
             'GET /api/admin/user/list': listOk(hostile), 'GET /api/admin/group/list': listOk(hostileGroups)
         }));

@@ -33,7 +33,12 @@ const PEERS = [
 ];
 
 function ok(data) { return { status: 200, body: { code: 0, message: '', data } }; }
-const BOOKS_OK = ok({ profiles: [] });
+// The personal book has a REAL guid, learned from /api/ab/personal. It used to
+// be synthesised with guid '' -- which the server answers 400 (/api/ab/peers)
+// and 404 (/api/ab/tags/), so the whole surface failed against a live server.
+const PERSONAL_GUID = '1-1-0';
+const PERSONAL_OK = ok({ guid: PERSONAL_GUID, name: 'admin', rule: 3 });
+const BOOKS_OK = ok({ data: [], total: 0 });
 function peersOk(list) { return ok({ peers: list }); }
 function tagsOk(list) { return ok({ tags: list }); }
 // A real non-2xx status (not a {code:1} application error) so errorKindFor()
@@ -47,9 +52,10 @@ const WRITE_OK = ok({});
 // override the entries they care about via ctx.useTransport()'s own table.
 function baseRoutes(over) {
     return Object.assign({
+        'POST /api/ab/personal': PERSONAL_OK,
         'POST /api/ab/shared/profiles': BOOKS_OK,
         'POST /api/ab/peers': peersOk(PEERS),
-        'POST /api/ab/tags/': tagsOk(['office']),
+        ['POST /api/ab/tags/' + PERSONAL_GUID]: tagsOk(['office']),
         'POST /api/ab/peer/add/': WRITE_OK,
         'PUT /api/ab/peer/update/': WRITE_OK,
         'DELETE /api/ab/peer/add/': WRITE_OK,
@@ -102,7 +108,7 @@ export default async function run(ctx) {
     const { check, assertEqual, assertOk, assertMatch, shot, transportCalls } = ctx;
 
     await check('addressbook: peers render even when the tag endpoint fails, with a real remediation shown', async () => {
-        const page = await openAddressBook(ctx, baseRoutes({ 'POST /api/ab/tags/': TAGS_FAIL }));
+        const page = await openAddressBook(ctx, baseRoutes({ ['POST /api/ab/tags/' + PERSONAL_GUID]: TAGS_FAIL }));
         try {
             await page.click('#pilot-addressbook [data-pilot="reload"]');
             await waitRowCount(page, 2);
@@ -337,7 +343,7 @@ export default async function run(ctx) {
         }];
         const page = await openAddressBook(ctx, baseRoutes({
             'POST /api/ab/peers': peersOk(hostile),
-            'POST /api/ab/tags/': tagsOk(['<script>window.__xss2=1</script>'])
+            ['POST /api/ab/tags/' + PERSONAL_GUID]: tagsOk(['<script>window.__xss2=1</script>'])
         }));
         try {
             await page.click('#pilot-addressbook [data-pilot="reload"]');
@@ -385,7 +391,8 @@ export default async function run(ctx) {
             http: {
                 'GET /admin/swagger/doc.json': { status: 404, body: '404 page not found' },
                 'GET /api/currentUser': WRITE_OK,
-                'POST /api/ab/shared/profiles': BOOKS_OK,
+                'POST /api/ab/personal': PERSONAL_OK,
+        'POST /api/ab/shared/profiles': BOOKS_OK,
                 'POST /api/ab/peers': peersOk(prodPeers),
                 'GET /api/admin/user/list': WRITE_OK,
                 'GET /api/admin/group/list': WRITE_OK,

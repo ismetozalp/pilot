@@ -264,10 +264,20 @@
             seen.add(b.guid);
             out.push(b);
         }
-        if (!out.some((b) => b.personal)) out.unshift(Object.assign({}, PERSONAL));
+        // No synthetic personal book. It used to be prepended with
+        // PERSONAL.guid = '' whenever the payload named none -- and '' is not a
+        // guid the server accepts: /api/ab/peers?ab= is a 400 and /api/ab/tags/
+        // a 404. Inventing an entry that cannot be used is worse than showing
+        // none, because §7.3's empty state at least tells the user what to do.
+        // PilotApi.addressbook.books() now asks /api/ab/personal for the real
+        // guid, so a server that HAS a personal book always reports one.
         return out;
     }
 
+    // v2.7 answers /api/ab/peers with {data:[...], licensed_devices, total}.
+    // No key needed for it: listFrom() already descends through .data at every
+    // level, which a mutation test confirmed -- adding 'data' to the key list
+    // here changed nothing, so it is not here.
     function peersFrom(payload) {
         return listFrom(payload, ['peers', 'list']).map(normalizePeer).filter((p) => p.id);
     }

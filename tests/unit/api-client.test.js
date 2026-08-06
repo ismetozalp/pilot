@@ -51,8 +51,8 @@ test('PilotApi exposes exactly the C12 surface', () => {
     assert.deepEqual(Object.keys(Api.devices).sort(),
         ['addToAddressBook', 'list', 'remove', 'rename']);
     assert.deepEqual(Object.keys(Api.addressbook).sort(),
-        ['addPeer', 'addTag', 'books', 'peers', 'removePeer', 'removeTag', 'renameTag',
-            'tags', 'updatePeer']);
+        ['addPeer', 'addTag', 'books', 'peers', 'personal', 'removePeer', 'removeTag',
+            'renameTag', 'tags', 'updatePeer']);
     assert.deepEqual(Object.keys(Api.users).sort(),
         ['create', 'groups', 'list', 'login', 'resetPassword', 'setEnabled', 'setGroup', 'update']);
     assert.deepEqual(Object.keys(Api.audit).sort(), ['conn', 'file', 'login']);
@@ -467,12 +467,16 @@ test('users.update POSTs the account to /user/update, id in the body', async () 
 
 test('users.setGroup POSTs {id,group_id} to /user/update, with a NUMERIC id', async () => {
     const calls = recorder({ status: 200, body: { code: 0, data: null } });
-    await Api.users.setGroup('7', 'g2');
+    await Api.users.setGroup('7', '2');
     assert.equal(calls[0].method, 'POST');
     assert.equal(calls[0].path, '/api/admin/user/update');
     // admin.UserForm types id as an integer; "7" is rejected by the server's
     // binder, so it is converted once in the client rather than at each site.
-    assert.deepEqual(JSON.parse(calls[0].body), { id: 7, group_id: 'g2' });
+    // group_id is a uint in admin.UserForm: the server rejects the string a
+    // <select> yields -- "cannot unmarshal string into Go struct field
+    // UserForm.group_id of type uint" -- which is exactly what the Users tab
+    // reported in the field.
+    assert.deepEqual(JSON.parse(calls[0].body), { id: 7, group_id: 2 });
     await assert.rejects(Api.users.setGroup('', 'g2'), (e) => e.kind === Errors.KIND.GENERIC);
     await assert.rejects(Api.users.setGroup('not-a-number', 'g2'), (e) => e.kind === Errors.KIND.GENERIC);
 });
@@ -655,11 +659,43 @@ test("addressbook.tags('') fills the path with an empty segment instead of rejec
     assert.deepEqual(r, { tags: ['office'] });
 });
 
-test('addressbook.books() resolves to the real {profiles:[...]} shape, not an empty paginated list', async () => {
-    const calls = recorder({ status: 200, body: { code: 0, message: '', data: { profiles: [{ guid: 'g1' }] } } });
+test('addressbook.books() is the UNION of the personal book and the shared ones', async () => {
+    // The personal book is not in shared/profiles -- it is its own call, and it
+    // is the only place its real guid ("1-1-0" on the reference server) can be
+    // learned. AB.PERSONAL hardcoded '', so every personal-book request went to
+    // /api/ab/peers?ab= and /api/ab/tags/, which answer 400 and 404.
+    const calls = [];
+    Api.setTransport((req) => {
+        calls.push(req);
+        if (req.path === '/api/ab/personal')
+            return Promise.resolve({ status: 200, body: { guid: '1-1-0', name: 'admin', rule: 3 } });
+        return Promise.resolve({ status: 200, body: { data: [{ guid: 'g1', name: 'Support' }], total: 1 } });
+    });
     const r = await Api.addressbook.books();
-    assert.equal(calls.length, 1);
-    assert.deepEqual(r, { profiles: [{ guid: 'g1' }] });
+    assert.deepEqual(calls.map((c) => c.path).sort(),
+        ['/api/ab/personal', '/api/ab/shared/profiles']);
+    assert.deepEqual(r, { profiles: [
+        { guid: '1-1-0', name: 'admin', personal: true },
+        { guid: 'g1', name: 'Support' }
+    ] }, 'the personal book comes first, carrying the guid the server gave it');
+});
+
+test('addressbook.books(): one half failing must not lose the other', async () => {
+    // A server with no shared books still has a personal one, and vice versa.
+    Api.setTransport((req) => req.path === '/api/ab/personal'
+        ? Promise.resolve({ status: 200, body: { guid: '1-1-0', name: 'admin' } })
+        : Promise.resolve({ status: 500, body: 'boom' }));
+    assert.deepEqual((await Api.addressbook.books()).profiles,
+        [{ guid: '1-1-0', name: 'admin', personal: true }]);
+
+    Api.setTransport((req) => req.path === '/api/ab/personal'
+        ? Promise.resolve({ status: 500, body: 'boom' })
+        : Promise.resolve({ status: 200, body: { data: [{ guid: 'g1' }] } }));
+    assert.deepEqual((await Api.addressbook.books()).profiles, [{ guid: 'g1' }]);
+
+    // Both failing is an empty list, never a throw that blanks the surface.
+    Api.setTransport(() => Promise.resolve({ status: 500, body: 'boom' }));
+    assert.deepEqual((await Api.addressbook.books()).profiles, []);
 });
 
 test("addressbook.addTag/renameTag/removeTag/addPeer/updatePeer/removePeer all accept ab=''", async () => {
@@ -772,6 +808,7 @@ test('ENDPOINTS: the exact routes, pinned — every one measured against a real 
         'devices.list': 'GET /api/admin/peer/list',
         'devices.rename': 'POST /api/admin/peer/update',
         'devices.remove': 'POST /api/admin/peer/delete',
+        'ab.personal': 'POST /api/ab/personal',
         'ab.books': 'POST /api/ab/shared/profiles',
         'ab.peers': 'POST /api/ab/peers',
         'ab.addPeer': 'POST /api/ab/peer/add/{ab}',

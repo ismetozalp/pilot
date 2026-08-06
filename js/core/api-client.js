@@ -59,6 +59,12 @@
         { id: 'devices.list', method: 'GET', path: '/api/admin/peer/list', admin: true, probe: true },
         { id: 'devices.rename', method: 'POST', path: '/api/admin/peer/update', admin: true, probe: false },
         { id: 'devices.remove', method: 'POST', path: '/api/admin/peer/delete', admin: true, probe: false },
+        // The personal address book has a REAL guid ("1-1-0" on the reference
+        // server), and this is the only route that reveals it.
+        // js/core/addressbook.js hardcodes PERSONAL.guid = '', so every
+        // personal-book call went to /api/ab/peers?ab= and /api/ab/tags/ --
+        // answered 400 and 404. The surface was unusable end to end.
+        { id: 'ab.personal', method: 'POST', path: '/api/ab/personal', admin: false, probe: false },
         { id: 'ab.books', method: 'POST', path: '/api/ab/shared/profiles', admin: false, probe: false },
         { id: 'ab.peers', method: 'POST', path: '/api/ab/peers', admin: false, probe: false },
         { id: 'ab.addPeer', method: 'POST', path: '/api/ab/peer/add/{ab}', admin: false, probe: false },
@@ -471,7 +477,29 @@
             // keys (or a bare array, or one more level of {data:...}) is actually
             // there, which is exactly why the interface here is documented as
             // "-> Promise<any>" rather than a pinned shape.
-            books: function () { return call('ab.books'); },
+            personal: function () { return call('ab.personal'); },
+            // The personal book is NOT in shared/profiles -- it is a separate
+            // call -- so "the books you can use" is the union of the two. One
+            // failing must not lose the other: a server with no shared books
+            // still has a personal one, and vice versa.
+            books: function () {
+                return Promise.all([
+                    call('ab.personal').then(function (v) { return v; }, function () { return null; }),
+                    call('ab.books').then(function (v) { return v; }, function () { return null; })
+                ]).then(function (pair) {
+                    const profiles = [];
+                    const mine = pair[0];
+                    if (mine && typeof mine === 'object' && str(mine.guid) !== '') {
+                        profiles.push({ guid: str(mine.guid),
+                            name: str(mine.name) || 'Personal', personal: true });
+                    }
+                    const shared = pair[1];
+                    const rest = (shared && typeof shared === 'object' && Array.isArray(shared.data))
+                        ? shared.data : (Array.isArray(shared) ? shared : []);
+                    rest.forEach(function (b) { if (b) profiles.push(b); });
+                    return { profiles: profiles };
+                });
+            },
             peers: function (ab) {
                 return guarded(function () {
                     return call('ab.peers', { query: { ab: abText(ab) } });
@@ -547,9 +575,14 @@
                 });
             },
             groups: function () { return call('users.groups').then(asList); },
+            // group_id is a uint in admin.UserForm. Sending the string a
+            // <select> yields is rejected outright: "cannot unmarshal string
+            // into Go struct field UserForm.group_id of type uint". '' means
+            // "no group", which the server spells 0.
             setGroup: function (id, gid) {
                 return guarded(function () {
-                    return call('users.update', { body: { id: numId(id), group_id: gid } });
+                    const g = (gid === '' || gid === null || gid === undefined) ? 0 : numId(gid);
+                    return call('users.update', { body: { id: numId(id), group_id: g } });
                 });
             },
             // Obtain an admin token from a username/password. Used by the setup

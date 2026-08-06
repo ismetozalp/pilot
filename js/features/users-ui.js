@@ -70,12 +70,36 @@
         return { ok: Object.keys(problems).length === 0, problems: problems };
     }
 
+    // rustdesk-api seeds two groups at first migration and names them in
+    // Chinese -- 默认组 and 共享组 -- regardless of the `lang` setting, so an
+    // English-speaking operator sees two unreadable options and cannot tell
+    // which is which. The names are the server's data and Pilot does not
+    // overwrite them; `type` is what actually identifies them (1 = the default
+    // group, 2 = the shared group, verified on a real v2.7 install), so the
+    // known seeds get a readable label and everything else is shown verbatim.
+    const SEEDED_GROUP_LABEL = { 1: 'Default group', 2: 'Shared group' };
+    const SEEDED_GROUP_NAMES = { '\u9ed8\u8ba4\u7ec4': 1, '\u5171\u4eab\u7ec4': 2 };
+
+    function groupDisplayName(rawName, rawType) {
+        const name = view().text(rawName);
+        const t = Number(rawType);
+        const bySeedName = Object.prototype.hasOwnProperty.call(SEEDED_GROUP_NAMES, name)
+            ? SEEDED_GROUP_NAMES[name] : null;
+        const key = Object.prototype.hasOwnProperty.call(SEEDED_GROUP_LABEL, t) ? t : bySeedName;
+        if (key === null || key === undefined) return name;
+        // Only relabel the untouched seed. A group someone renamed is theirs.
+        if (bySeedName === null && name !== '') return name;
+        return SEEDED_GROUP_LABEL[key];
+    }
+
     function normalizeGroup(row) {
         const V = view();
         const r = (row && typeof row === 'object') ? row : {};
+        const rawName = V.text(V.first(r, ['name', 'group_name', 'groupName']));
         return {
             id: V.idOf(r, ['id', 'group_id', 'groupId', 'uuid']),
-            name: V.text(V.first(r, ['name', 'group_name', 'groupName'])) || '(unnamed)',
+            name: groupDisplayName(rawName, V.first(r, ['type', 'group_type'])) || '(unnamed)',
+            serverName: rawName,
             note: V.text(V.first(r, ['info', 'note', 'remark'])),
             deviceCount: V.count(V.first(r, ['device_count', 'deviceCount', 'accessible_count']))
         };

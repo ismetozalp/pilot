@@ -14,7 +14,13 @@ function fakeApi(over) {
     const calls = [];
     const base = {
         calls,
-        books: async () => { calls.push(['books']); return { profiles: [{ guid: 'g1', name: 'Team' }] }; },
+        // Matches what PilotApi.addressbook.books() really returns: the
+        // personal book (with the guid /api/ab/personal issued -- "1-1-0" on
+        // the reference server, never '') followed by the shared ones.
+        books: async () => { calls.push(['books']); return { profiles: [
+            { guid: '1-1-0', name: 'admin', personal: true },
+            { guid: 'g1', name: 'Team' }
+        ] }; },
         peers: async (ab) => {
             calls.push(['peers', ab]);
             return { peers: [{ id: 'a1', alias: 'Front', tags: ['office'] }, { id: 'b2' }] };
@@ -66,13 +72,14 @@ test('load fills books, peers and tags and selects a book', async () => {
     const api = fakeApi();
     const c = make(api);
     await c.load();
-    assert.deepEqual(c.books.map((b) => b.guid), ['', 'g1']);
-    assert.equal(c.activeGuid, '');
+    assert.deepEqual(c.books.map((b) => b.guid), ['1-1-0', 'g1']);
+    assert.equal(c.activeGuid, '1-1-0', 'the personal book is selected by its REAL guid');
     assert.deepEqual(c.peers.map((p) => p.id), ['a1', 'b2']);
     assert.deepEqual(c.tags, ['office']);
     assert.deepEqual(c.error, { books: null, peers: null, tags: null, write: null });
     assert.equal(c.busy, false);
-    assert.ok(api.calls.some((x) => x[0] === 'peers' && x[1] === ''));
+    assert.ok(api.calls.some((x) => x[0] === 'peers' && x[1] === '1-1-0'),
+        "peers must be fetched for the real guid -- ab='' is a 400 on the server");
 });
 
 test('a failing tags call does not take the peer table with it', async () => {
@@ -86,14 +93,23 @@ test('a failing tags call does not take the peer table with it', async () => {
     assert.deepEqual(c.tags, []);
 });
 
-test('a failing books call still leaves a usable personal book', async () => {
+test('a failing books call reports the failure and offers no book it cannot use', async () => {
+    // CORRECTED. This used to assert that a failed books() still leaves "a
+    // usable personal book" -- AB.PERSONAL, whose guid is ''. That book is not
+    // usable: the server answers /api/ab/peers?ab= with 400 and /api/ab/tags/
+    // with 404, which is exactly what the Address Book tab showed. Standing up
+    // an entry that cannot work is worse than standing up none, because §7.3's
+    // empty state at least says what to do about it.
     const api = fakeApi({ books: async () => { throw { kind: 'API_AUTH_FAILED', message: 'x' }; } });
     const c = make(api);
     await c.load();
-    assert.equal(c.error.books.kind, 'API_AUTH_FAILED');
-    assert.deepEqual(c.books, [AB.PERSONAL]);
-    assert.equal(c.activeGuid, '');
-    assert.deepEqual(c.peers.map((p) => p.id), ['a1', 'b2']);
+    assert.equal(c.error.books.kind, 'API_AUTH_FAILED', 'the failure is reported, not swallowed');
+    assert.deepEqual(c.books, [], 'no invented book');
+    assert.equal(c.activeGuid, '', 'and nothing selected');
+    // The surface stays alive: an earlier version read books[0].guid unguarded
+    // and threw "Cannot read properties of undefined" at load, taking the whole
+    // tab down.
+    assert.equal(c.busy, false);
 });
 
 test('with no facade at all every source reports API_UNREACHABLE and nothing throws', async () => {
@@ -245,7 +261,8 @@ test('renameTagAction rewrites the tag on every local peer', async () => {
     assert.equal(await c.renameTagAction(), false);
     c.renameTo = 'HQ';
     assert.equal(await c.renameTagAction(), true);
-    assert.deepEqual(api.calls.filter((x) => x[0] === 'renameTag')[0], ['renameTag', '', 'office', 'HQ']);
+    assert.deepEqual(api.calls.filter((x) => x[0] === 'renameTag')[0],
+        ['renameTag', '1-1-0', 'office', 'HQ'], 'addressed at the real personal guid');
     assert.deepEqual(c.tags, ['HQ']);
     assert.deepEqual(c.peers[0].tags, ['HQ']);
     c.renameFrom = 'missing';

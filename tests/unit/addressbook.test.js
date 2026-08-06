@@ -230,11 +230,20 @@ test('listFrom digs at most three levels and never recurses forever', () => {
     assert.deepEqual(AB.listFrom('nope', ['list']), []);
 });
 
-test('booksFrom always yields exactly one personal book', () => {
+test('booksFrom reports the books it was GIVEN, and never invents one', () => {
+    // CORRECTED. It used to prepend a synthetic personal book with guid '' when
+    // the payload named none -- and '' is not a guid this server accepts:
+    // /api/ab/peers?ab= answers 400 and /api/ab/tags/ answers 404, which is
+    // exactly what the Address Book tab showed. An entry that cannot be used is
+    // worse than none, because §7.3's empty state at least says what to do.
+    // The real personal guid ("1-1-0" here) comes from /api/ab/personal, which
+    // PilotApi.addressbook.books() now folds in.
     const only = AB.booksFrom(null);
-    assert.equal(only.length, 1);
-    assert.equal(only[0].personal, true);
-    assert.equal(only[0].guid, '');
+    assert.deepEqual(only, [], 'nothing given, nothing invented');
+    const real = AB.booksFrom({ profiles: [{ guid: '1-1-0', name: 'admin', personal: true }] });
+    assert.equal(real.length, 1);
+    assert.equal(real[0].personal, true);
+    assert.equal(real[0].guid, '1-1-0', 'the guid the server actually issued');
     const mixed = AB.booksFrom({ data: { profiles: [
         { guid: 'g1', name: ' Team ' },
         { guid: 'g1', name: 'dup' },
@@ -391,4 +400,25 @@ test('an oversized field is rejected at import, not silently truncated', () => {
     const out = AB.fromCsv(text);
     assert.deepEqual(out.peers, []);
     assert.match(out.problems[0], /^row 2: note is longer than 1024/);
+});
+
+test('peers/books/tags unwrap the {data:[...]} envelope v2.7 actually sends', () => {
+    // Measured against a real server:
+    //   /api/ab/peers            -> {data:[...], licensed_devices, total}
+    //   /api/ab/shared/profiles  -> {data:[...]|null, total}
+    //   /api/ab/tags/{guid}      -> a bare array
+    // listFrom() already descends through .data at every level, so these shapes
+    // work without a key for them -- pinned here because nothing else in the
+    // suite used the shape the server actually sends.
+    assert.deepEqual(AB.peersFrom({ data: [{ id: 'p1' }, { id: 'p2' }], total: 2 }).map((p) => p.id),
+        ['p1', 'p2']);
+    assert.deepEqual(AB.booksFrom({ data: [{ guid: 'g1', name: 'Support' }], total: 1 })
+        .map((b) => b.guid), ['g1']);
+    assert.deepEqual(AB.tagsFrom({ data: ['office', 'lab'] }), ['office', 'lab']);
+    // The older shapes must keep working.
+    assert.deepEqual(AB.peersFrom({ peers: [{ id: 'p9' }] }).map((p) => p.id), ['p9']);
+    assert.deepEqual(AB.tagsFrom(['bare', 'array']), ['bare', 'array']);
+    // And an empty or null payload is an empty list, never a throw.
+    for (const empty of [{ data: null, total: 0 }, {}, null, undefined])
+        assert.deepEqual(AB.peersFrom(empty), []);
 });
