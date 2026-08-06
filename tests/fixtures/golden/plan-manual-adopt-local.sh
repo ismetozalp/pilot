@@ -97,6 +97,7 @@ rustdesk:
   relay-server: 203.0.113.10:21117
   api-server: http://203.0.113.10:21114
   personal: 1
+  ws-host: ""
   key: "AbCdEf0123456789+/="
 PILOT_EOF_0
 chmod 0640 /opt/rustdesk-api/conf/config.yaml

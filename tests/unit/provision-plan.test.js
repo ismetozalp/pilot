@@ -992,3 +992,74 @@ test('the download step names the fork, so an operator approving the plan sees t
     assert.equal(fetch.sha256, OT.serverAsset('x86_64').sha256,
         'the digest checked is the one pinned for this arch');
 });
+
+
+// ================================ FIELD REPORT: signed-in clients could not connect
+//
+// On a real deployment Pilot wrote:
+//
+//   id-server:    ec2-203-0-113-10.eu-central-1.compute.amazonaws.com:21116
+//   relay-server: ec2-203-0-113-10.eu-central-1.compute.amazonaws.com:21117
+//   api-server:   https://203.0.113.10.sslip.io
+//
+// -- the SSH hostname for two of them and the TLS domain for the third. The
+// certificate's only SAN was DNS:203.0.113.10.sslip.io.
+//
+// A RustDesk client >= 1.4.1 that is SIGNED IN does its rendezvous over
+// WebSocket and builds the URL as wss://<id-server>/ws/id, taking the id-server
+// THE API ADVERTISES. So every signed-in client dialled a hostname the
+// certificate did not cover and got `tlsv1 alert internal error`, surfaced as
+// "Failed to secure tcp: deadline has elapsed" -- an error naming neither TLS
+// nor the hostname. Signed out there is no WebSocket, so it worked, which made
+// it look like a login bug.
+
+function yamlValue(text, key) {
+    const m = new RegExp('^  ' + key.replace(/[-]/g, '[-]') + ': (.*)$', 'm').exec(text);
+    return m ? m[1].trim().replace(/^"|"$/g, '') : null;
+}
+
+test('with TLS on, every name the client is handed is the certificate hostname', () => {
+    const plan = P.build(detFresh(), choices({ installHbbs: true, tlsTier: 'own', domain: 'rd.example.com',
+        host: 'ec2-1-2-3-4.eu-central-1.compute.amazonaws.com' }));
+    const yaml = byId(plan, 'configure').write.content;
+    const id = yamlValue(yaml, 'id-server');
+    const relay = yamlValue(yaml, 'relay-server');
+    const api = yamlValue(yaml, 'api-server');
+
+    assert.equal(id, 'rd.example.com:21116', 'id-server must be the name on the certificate');
+    assert.equal(relay, 'rd.example.com:21117', 'relay-server too');
+    assert.ok(api.startsWith('https://rd.example.com'), 'api-server too: ' + api);
+
+    // The actual defect: the SSH hostname must not leak into any of them.
+    for (const [k, v] of [['id-server', id], ['relay-server', relay], ['api-server', api]])
+        assert.ok(!/amazonaws\.com/.test(v), k + ' still carries the SSH host: ' + v);
+});
+
+test('the hostname the client dials is the one wss://<id-server>/ws/id is built from', () => {
+    const plan = P.build(detFresh(), choices({ installHbbs: true, tlsTier: 'own', domain: 'rd.example.com', host: 'ssh.internal' }));
+    const yaml = byId(plan, 'configure').write.content;
+    const idHost = yamlValue(yaml, 'id-server').split(':')[0];
+    const apiHost = yamlValue(yaml, 'api-server').replace(/^https?:\/\//, '').split(/[:/]/)[0];
+    // These two disagreeing is precisely what shipped and broke every signed-in
+    // client, and neither value looks wrong on its own -- only together.
+    assert.equal(idHost, apiHost,
+        'the certificate covers one name; id-server and api-server must both be it');
+});
+
+test('with TLS off nothing changes: the plain address is correct and there is no wss', () => {
+    const plan = P.build(detFresh(), choices({ installHbbs: true, tlsTier: 'none', host: '203.0.113.10' }));
+    const yaml = byId(plan, 'configure').write.content;
+    assert.equal(yamlValue(yaml, 'id-server'), '203.0.113.10:21116');
+    assert.equal(yamlValue(yaml, 'relay-server'), '203.0.113.10:21117');
+    assert.equal(yamlValue(yaml, 'ws-host'), '', 'no certificate means no wss:// to advertise');
+});
+
+test('ws-host is emitted, and is the TLS domain when there is one', () => {
+    // Absent from Pilot's config until now, so it took Go's zero value like
+    // every other omitted key -- the same trap as resources-path and
+    // captcha-threshold before it.
+    const plan = P.build(detFresh(), choices({ installHbbs: true, tlsTier: 'own', domain: 'rd.example.com' }));
+    const yaml = byId(plan, 'configure').write.content;
+    assert.equal(yamlValue(yaml, 'ws-host'), 'wss://rd.example.com');
+    assert.match(yaml, /^  ws-host:/m, 'the key must be present, not merely defaulted');
+});

@@ -37,8 +37,9 @@ jwt:
 proxy:
   enable: false
 rustdesk:
-  id-server: 203.0.113.10:21116
-  relay-server: 203.0.113.10:21117
+  id-server: rd.example.com:21116
+  relay-server: rd.example.com:21117
   api-server: https://rd.example.com
   personal: 1
+  ws-host: "wss://rd.example.com"
   key: "AbCdEf0123456789+/="

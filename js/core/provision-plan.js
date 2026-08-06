@@ -178,6 +178,23 @@
 
     function configYaml(ch, det, domain) {
         const addr = ch.host || det.publicIp || '127.0.0.1';
+        // ONE hostname for every name the client is handed. This used to be two:
+        // api-server took the TLS `domain` while id-server/relay-server took the
+        // SSH `addr`, and on a real deployment those were
+        // 203.0.113.10.sslip.io and ec2-203-0-113-10....amazonaws.com.
+        //
+        // That divergence breaks every SIGNED-IN client, because a RustDesk
+        // client >= 1.4.1 does its rendezvous over WebSocket and builds the URL
+        // as wss://<id-server>/ws/id -- from the id-server THE API ADVERTISES,
+        // not from the client's own setting. The certificate only covers the TLS
+        // domain, so the handshake dies with `tlsv1 alert internal error`, which
+        // the client reports as "Failed to secure tcp: deadline has elapsed" --
+        // an error naming neither TLS nor the hostname that caused it.
+        //
+        // When TLS is on, the certificate's name is the only name that works, so
+        // it is the name everything uses. With TLS off there is no certificate
+        // and no wss://, so the plain address is correct and unchanged.
+        const rendezvousHost = domain || addr;
         // apiServerUrl() is the ONE place that decides https:// vs http://: the
         // client picks wss:// only when this string starts with https, otherwise
         // it silently downgrades to plaintext ws://.
@@ -240,10 +257,15 @@
             'proxy:\n' +
             '  enable: false\n' +
             'rustdesk:\n' +
-            '  id-server: ' + addr + ':' + ID_PORT + '\n' +
-            '  relay-server: ' + addr + ':' + RELAY_PORT + '\n' +
+            '  id-server: ' + rendezvousHost + ':' + ID_PORT + '\n' +
+            '  relay-server: ' + rendezvousHost + ':' + RELAY_PORT + '\n' +
             '  api-server: ' + api + '\n' +
             '  personal: 1\n' +
+            // Present in the release config, absent from Pilot's until now, so it
+            // took Go's zero value like every other omitted key. It is what the
+            // web client is told to dial; with TLS off there is no wss:// to
+            // offer, and "" is then both the release default and correct.
+            '  ws-host: "' + (domain ? 'wss://' + domain : '') + '"\n' +
             key + '\n';
     }
 
