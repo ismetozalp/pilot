@@ -2314,7 +2314,12 @@ test('a supplied current password is used INSTEAD of the stale captured one', as
             },
             setTransport() {}
         };
-        globalThis.PilotApiIo = { transport: () => (() => Promise.resolve({ status: 200, body: {} })) };
+        globalThis.PilotApiIo = {
+            transport: () => (() => Promise.resolve({ status: 200, body: {} })),
+            // The real module's builder: the endpoint decision lives in ONE
+            // place now, so the fake must not reimplement it.
+            connFor: require('../../js/core/api-io.js').connFor
+        };
         try {
             await withFakeServers({ read: () => Promise.resolve({ host: 'h', apiPort: 21114, tls: false }) },
                 () => withFakeDocument(() => c.finish()));

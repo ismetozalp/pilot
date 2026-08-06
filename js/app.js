@@ -165,22 +165,11 @@
                         token = null;
                         this.tokenError = e;
                     }
-                    // With TLS, the API is NOT at host:apiPort -- Caddy holds
-                    // 443 and proxies to 21114 on loopback, and the certificate
-                    // is issued for the DOMAIN, not for the instance hostname.
-                    // Ignoring rec.domain sent an https request to
-                    // ec2-....amazonaws.com:21114, where plain HTTP is served
-                    // and no certificate exists: the console reported "the API
-                    // server could not be reached" against a server that was
-                    // working perfectly on https://<domain>/.
-                    //
-                    // C17: no port is appended for the TLS endpoint -- the
-                    // RustDesk client appends none either, which is why the
-                    // Caddyfile pins 443.
-                    const useTls = rec.tls === true && str(rec.domain) !== '';
-                    const conn = useTls
-                        ? { address: str(rec.domain), port: 443, tls: true, token: token }
-                        : { address: rec.host, port: rec.apiPort, tls: false, token: token };
+                    // Io.connFor() is the single place that decides the
+                    // endpoint. Building it here by hand is what produced the
+                    // "could not be reached" bug: with TLS the API is behind
+                    // Caddy on the DOMAIN at 443, not at host:apiPort.
+                    const conn = Io.connFor(rec, token);
                     const send = Io.transport(conn);
                     Api.setTransport(send);
                     this.activeServerId = id;

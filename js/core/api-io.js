@@ -170,6 +170,30 @@
         return typeof cockpit !== 'undefined' && !!cockpit && typeof cockpit.http === 'function';
     }
 
+    // The ONE place that turns a server record into a Conn.
+    //
+    // It exists because the decision was made twice, by hand, and both copies
+    // were wrong the same way: {address: rec.host, port: rec.apiPort, tls:
+    // rec.tls} sends an HTTPS request to the instance hostname on 21114, where
+    // plain HTTP is served and no certificate for that name exists. With TLS the
+    // API is behind Caddy on the DOMAIN at 443 -- the record carries it, and
+    // neither caller read it. Fixing one left the other broken, which is exactly
+    // why this is a function and not a convention.
+    //
+    // C17: no port is appended to the TLS endpoint. The RustDesk client appends
+    // none either, which is why the generated Caddyfile pins 443.
+    function connFor(record, token) {
+        const rec = (record && typeof record === 'object') ? record : {};
+        const domain = str(rec.domain).trim();
+        const useTls = rec.tls === true && domain !== '';
+        return {
+            address: useTls ? domain : str(rec.host),
+            port: useTls ? 443 : rec.apiPort,
+            tls: useTls,
+            token: token === undefined ? null : token
+        };
+    }
+
     function transport(conn) {
         const opts = httpOptions(conn);                  // eager: a bad Conn fails at wiring time
         const token = conn.token === null || conn.token === undefined ? '' : String(conn.token);
@@ -253,6 +277,7 @@
 
     const PilotApiIo = {
         DEFAULT_TIMEOUT_MS: DEFAULT_TIMEOUT_MS,
+        connFor: connFor,
         MAX_BODY_BYTES: MAX_BODY_BYTES,
         PROBLEM_KIND: PROBLEM_KIND,
         METHODS: METHODS,

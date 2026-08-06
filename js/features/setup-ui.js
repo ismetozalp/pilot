@@ -2073,8 +2073,10 @@
                 const rec = await Servers.read(id);
                 if (!rec) throw fail('API_UNREACHABLE',
                     'No server record for ' + id + ', so Pilot does not know where to send the change.');
-                Api.setTransport(Io.transport(
-                    { address: rec.host, port: rec.apiPort, tls: rec.tls, token: token }));
+                // Io.connFor(), not a hand-built Conn: this line had the same
+                // bug js/app.js did, and fixing only app.js left the password
+                // change still talking to host:21114 over https.
+                Api.setTransport(Io.transport(Io.connFor(rec, token)));
                 try {
                     await Api.users.resetPassword(ADMIN_ID, str(newPassword));
                 } finally {

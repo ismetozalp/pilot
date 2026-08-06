@@ -387,3 +387,54 @@ test('index.html loads js/core/api-io.js in its C7 position', () => {
         if (i >= 0) assert.ok(i > me, m + ' must load after js/core/api-io.js');
     });
 });
+
+// ---------------- connFor: one place decides the endpoint, or it drifts again
+
+test('connFor: a TLS record is addressed at its DOMAIN on 443', () => {
+    // The bug this exists to prevent, seen in the field: the console reported
+    // "the API server could not be reached" while https://<domain>/api/version
+    // returned 200. The record carried the domain; two separate call sites
+    // built the Conn by hand from host+apiPort and neither read it.
+    const c = IO.connFor({ host: 'ec2-1-2-3-4.compute.amazonaws.com', apiPort: 21114,
+        tls: true, domain: 'rd.example.com' }, 'T0KEN');
+    assert.equal(c.address, 'rd.example.com', 'the certificate is for the domain, not the hostname');
+    assert.equal(c.port, 443, 'Caddy holds 443; the client appends no port (C17)');
+    assert.equal(c.tls, true);
+    assert.equal(c.token, 'T0KEN');
+});
+
+test('connFor: without TLS it is host:apiPort in plain HTTP', () => {
+    const c = IO.connFor({ host: 'rd.internal', apiPort: 21114, tls: false, domain: '' });
+    assert.deepEqual(c, { address: 'rd.internal', port: 21114, tls: false, token: null });
+});
+
+test('connFor: tls without a usable domain falls back rather than inventing an endpoint', () => {
+    // tls:true with no domain is a record that should not exist; connecting to
+    // ""|443 would be strictly worse than the host that at least resolves.
+    for (const domain of ['', null, undefined, '   ']) {
+        const c = IO.connFor({ host: 'rd.internal', apiPort: 21114, tls: true, domain: domain });
+        assert.equal(c.address, 'rd.internal', JSON.stringify(domain));
+        assert.equal(c.port, 21114);
+        assert.equal(c.tls, false);
+    }
+});
+
+test('connFor: hostile or absent records never throw', () => {
+    for (const bad of [null, undefined, 'nope', 7, [], {}])
+        assert.equal(typeof IO.connFor(bad), 'object', JSON.stringify(bad));
+});
+
+test('no module builds a Conn by hand — connFor is the only decision point', () => {
+    // Two hand-built Conns existed and both were wrong the same way; fixing one
+    // left the other broken. This is what stops a third.
+    const ROOT = path.join(__dirname, '..', '..');
+    for (const rel of ['js/app.js', 'js/features/setup-ui.js', 'js/features/server-ops-ui.js']) {
+        const p = path.join(ROOT, rel);
+        if (!fs.existsSync(p)) continue;
+        const src = fs.readFileSync(p, 'utf8').replace(/^\s*\/\/.*$/gm, '');
+        assert.ok(!/address:\s*\w+\.host/.test(src),
+            rel + ' builds a Conn from record.host by hand; use PilotApiIo.connFor()');
+        assert.ok(!/port:\s*\w+\.apiPort/.test(src),
+            rel + ' builds a Conn from record.apiPort by hand; use PilotApiIo.connFor()');
+    }
+});
