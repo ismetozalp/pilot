@@ -288,7 +288,27 @@
     function list() {
         return guard('list', function (ck) {
             return run(ck, ['find', SERVER_DIR, '-maxdepth', '1', '-type', 'f', '-name', '*.json'])
-                .then(function (out) { return parseListing(str(out)); }, function () { return []; })
+                .then(function (out) { return parseListing(str(out)); }, function (e) {
+                    // "I cannot read the registry" is not "there are no
+                    // servers", and swallowing the first into the second is why
+                    // a Limited-access session showed an empty server list, no
+                    // devices and "TLS is not configured on this server" -- four
+                    // confident falsehoods about a server that was configured
+                    // and running. /etc/pilot is root-owned 0700, and Cockpit
+                    // starts EVERY session unelevated, so this is the normal
+                    // case, not an edge one.
+                    //
+                    // A missing directory really is "none yet" (a fresh
+                    // install), so only a permission failure is raised.
+                    const problem = str(e && e.problem);
+                    if (problem === 'access-denied' || problem === 'not-authorized') {
+                        throw fail('API_AUTH_FAILED',
+                            'Pilot cannot read its server registry: this Cockpit session does not have ' +
+                            'administrative access. Use "Turn on administrative access" in the top-right menu.',
+                            { op: 'list', path: SERVER_DIR, problem: problem });
+                    }
+                    return [];
+                })
                 .then(function (ids) {
                     return ids.reduce(function (chain, id) {
                         return chain.then(function (acc) {

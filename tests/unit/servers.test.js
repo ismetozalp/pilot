@@ -36,6 +36,9 @@ function fakeCockpit(opts) {
     globalThis.cockpit = {
         spawn(argv, o) {
             calls.spawn.push({ argv, opts: o });
+            if (opts.spawnRejectsWith && argv[0] === 'find') {
+                return Promise.reject(opts.spawnRejectsWith);
+            }
             if (opts.spawnFailsOn && argv[0] === opts.spawnFailsOn) {
                 return Promise.reject(new Error(argv[0] + ': failed'));
             }
@@ -746,4 +749,35 @@ test('index.html loads js/core/servers.js in its C7 position', () => {
         const i = srcs.indexOf(m);
         if (i >= 0) assert.ok(i > me, m + ' must load after js/core/servers.js');
     });
+});
+
+// ------------- an unreadable registry is not an empty one
+
+test('list(): a permission failure is raised, never reported as "no servers"', async () => {
+    // FROM THE FIELD: a reload dropped the Cockpit session back to Limited
+    // access -- which is how EVERY session starts -- and Pilot answered with an
+    // empty server switcher, "Devices 0", "Server: local" and "TLS is not
+    // configured on this server". Four confident falsehoods about a server that
+    // was configured, running and serving TLS. list() caught the spawn failure
+    // and returned [], so "I cannot read /etc/pilot" became "there are none".
+    fakeCockpit({ spawnRejectsWith: Object.assign(new Error('access-denied'), { problem: 'access-denied' }) });
+    try {
+        await assert.rejects(S.list(), (e) => {
+            assert.equal(e.kind, 'API_AUTH_FAILED');
+            assert.match(e.message, /administrative access/i,
+                'the message must name the actual remedy: ' + e.message);
+            assert.equal(e.detail.problem, 'access-denied');
+            return true;
+        });
+    } finally { dropCockpit(); }
+});
+
+test('list(): a MISSING registry really is "none yet", and stays quiet', async () => {
+    // A fresh install has no /etc/pilot at all: find exits non-zero with no
+    // permission problem, and that genuinely means no servers are configured.
+    // Raising there would make first-run setup impossible.
+    fakeCockpit({ spawnRejectsWith: Object.assign(new Error('No such file or directory'), { exit_status: 1 }) });
+    try {
+        assert.deepEqual(await S.list(), []);
+    } finally { dropCockpit(); }
 });

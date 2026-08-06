@@ -77,6 +77,7 @@
             // fetch failing, if it fails at all).
             activeServerId: null,
             apiReady: false,
+            reconnecting: false,
             compatError: null,
             // Set only when the SECRET FILE ITSELF could not be read (e.g. a
             // permissions problem on the 0600 file) — never for the ordinary
@@ -149,7 +150,46 @@
                 }
 
                 try {
-                    const rec = await Servers.read(id);
+                    // read() THROWS for a missing record ("there is no server
+                    // record at ..."), it does not resolve null -- so the
+                    // recovery below has to catch, not test for falsy.
+                    let rec = null;
+                    let readError = null;
+                    try { rec = await Servers.read(id); } catch (e) { readError = e; }
+                    // The active id can name a server that is not registered.
+                    // It happened for real: a bug in notifyServerChanged's
+                    // arguments dispatched the literal 'local', switchServer()
+                    // persisted it, and config.json then pointed at a record
+                    // that had never existed. wireApi() looked it up, failed,
+                    // and every surface reported "no API transport is
+                    // configured" -- with a perfectly good server registered
+                    // beside it, and no reload or reconnect able to help.
+                    //
+                    // A dangling pointer with exactly one real server is not
+                    // ambiguous. Adopt it, persist the correction so the next
+                    // load is clean, and say so rather than fixing it silently.
+                    if (!rec) {
+                        const all = await Servers.list().catch(function () { return []; });
+                        const rows = Array.isArray(all) ? all.filter(function (r) { return r && r.id; }) : [];
+                        if (rows.length === 1) {
+                            rec = rows[0];
+                            id = rec.id;
+                            this.switchError = null;
+                            try { await Servers.setActive(id); } catch (e) { this.switchError = e; }
+                        } else if (rows.length > 1) {
+                            this.switchError = { message: 'The selected server "' + id +
+                                '" is not registered. Choose one from the switcher.' };
+                        }
+                    }
+                    if (!rec) {
+                        this.activeServerId = null;
+                        this.apiReady = false;
+                        // Recorded where it always was: the surfaces read
+                        // compatError, and moving it would drop the message
+                        // rather than relocate it.
+                        if (readError) this.compatError = readError;
+                        return null;
+                    }
                     // readSecret() resolving to null means "no token file" — an
                     // ordinary, expected case (anonymous request). A REJECTION
                     // means the file exists but could not be read (e.g. a
@@ -209,6 +249,30 @@
             // the signal for "same server, new credential".
             async reloadCredentials() {
                 return this.wireApi();
+            },
+
+            // Cockpit starts EVERY session unelevated, and /etc/pilot is
+            // root-owned 0700. Pilot wired the API once, at load: a user who
+            // turned on administrative access afterwards was left with
+            // "no API transport is configured" on every surface, permanently,
+            // and Refresh did not help because the surfaces refetch through a
+            // transport that was never built. Measured: apiReady stayed false
+            // through elevation AND through Refresh.
+            //
+            // cockpit.superuser is a shell API and is not exposed to plugin
+            // frames -- verified in the running page -- so there is no event to
+            // listen for. Re-attempting on a tab change is the cheap, obvious
+            // recovery: it costs one read of the registry, only while
+            // disconnected, and it means clicking anything at all fixes it.
+            selectTab(id) {
+                this.tab = id;
+                if (!this.apiReady) this.wireApi();
+                return this.tab;
+            },
+
+            async reconnect() {
+                this.reconnecting = true;
+                try { return await this.wireApi(); } finally { this.reconnecting = false; }
             },
 
             async switchServer(id) {

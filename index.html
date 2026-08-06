@@ -38,11 +38,24 @@
                     <button class="nav-link py-1 px-3"
                             :class="{ active: tab === t.id }"
                             :data-tab="t.id"
-                            @click="tab = t.id"
+                            @click="selectTab(t.id)"
                             x-text="t.label"></button>
                 </li>
             </template>
         </ul>
+    </div>
+
+    <!-- Not a "something went wrong" banner: this is a specific, actionable
+         state. Cockpit starts every session unelevated and /etc/pilot is
+         root-owned, so a plugin opened before administrative access was turned
+         on can read nothing -- and every surface then says "no API transport is
+         configured" with no hint that the fix is one click away. -->
+    <div class="alert alert-warning d-flex align-items-center gap-2" data-testid="not-connected"
+         x-show="!apiReady">
+      <span>Pilot is not connected to a server yet. If you have just turned on
+        administrative access in Cockpit, reconnect to pick it up.</span>
+      <button class="btn btn-sm btn-outline-dark" data-testid="reconnect" @click="reconnect()"
+              :disabled="reconnecting" x-text="reconnecting ? 'Reconnecting…' : 'Reconnect'"></button>
     </div>
 
     <!-- The control-plane strip. NOT the "global something went wrong" banner

@@ -36,9 +36,17 @@ function fakeCockpit(overrides) {
         '/etc/pilot/servers/prod.json': JSON.stringify(REC),
         '/etc/pilot/servers/prod.token': 'TOK123\n'
     }, overrides || {});
+    // The listing has to follow the files, not be hardcoded: it always claimed
+    // prod.json existed, so a test whose whole premise was "no record exists
+    // yet" was in fact running against a populated registry. That only went
+    // unnoticed while wireApi() never consulted the registry.
     globalThis.cockpit = {
         spawn(argv) {
-            if (argv[0] === 'find') return Promise.resolve('/etc/pilot/servers/prod.json\n');
+            if (argv[0] === 'find') {
+                return Promise.resolve(Object.keys(files)
+                    .filter((k) => /^\/etc\/pilot\/servers\/.*\.json$/.test(k))
+                    .join('\n') + '\n');
+            }
             return Promise.resolve('');
         },
         file(p) {
@@ -193,7 +201,12 @@ test('switchServer: a request for the server that is ALREADY active is a no-op (
 // to try at all.
 test('switchServer: "local" with nothing configured genuinely tries to wire it and fails safe ' +
     '(no record exists yet -- there is simply nothing TO wire)', async (t) => {
-    fakeCockpit({ '/etc/pilot/config.json': '{}' });
+    // An EMPTY registry, which is what this test always meant: the fixture used
+    // to hand back a prod.json listing no matter what, so "nothing configured"
+    // was never actually the state under test.
+    fakeCockpit({ '/etc/pilot/config.json': '{}',
+        '/etc/pilot/servers/prod.json': undefined,
+        '/etc/pilot/servers/prod.token': undefined });
     t.after(dropCockpit);
     const seen = spyOnSetTransport(t);
 
@@ -539,4 +552,59 @@ test('wireApi: tls true with NO domain falls back rather than inventing an endpo
     restore();
     assert.equal(conns[0].address, 'rd.internal');
     assert.equal(conns[0].port, 21114);
+});
+
+test('wireApi: an active id naming no record adopts the only registered server', async (t) => {
+    // FROM THE FIELD: config.json pointed at "local", a record that had never
+    // existed -- written by switchServer() after notifyServerChanged's argument
+    // order sent the literal 'local'. wireApi() looked it up, read() THREW
+    // ("there is no server record at ..."), and every surface reported "no API
+    // transport is configured" while a perfectly good server sat registered
+    // beside it. Neither a reload nor a reconnect could help: the pointer was
+    // wrong on disk.
+    fakeCockpit();
+    t.after(dropCockpit);
+    const conns = spyOnTransport(t);
+    const S = globalThis.PilotServers;
+    const saved = { active: S.active, read: S.read, list: S.list,
+        setActive: S.setActive, readSecret: S.readSecret, probeCompatibility: S.probeCompatibility };
+    t.after(() => Object.assign(S, saved));
+    const setActiveCalls = [];
+    const real = { id: 'prod', host: 'rd.internal', apiPort: 21114, tls: false, domain: '' };
+    S.active = () => Promise.resolve('local');
+    S.read = (id) => id === 'prod' ? Promise.resolve(real)
+        : Promise.reject(Object.assign(new Error('there is no server record at /etc/pilot/servers/local.json'),
+            { name: 'PilotError', kind: 'GENERIC' }));
+    S.list = () => Promise.resolve([real]);
+    S.setActive = (id) => { setActiveCalls.push(id); return Promise.resolve(); };
+    S.readSecret = () => Promise.resolve(null);
+    S.probeCompatibility = () => Promise.resolve({ ok: true });
+
+    const c = App.pilotApp();
+    await c.wireApi();
+
+    assert.equal(c.apiReady, true, 'one unambiguous server must be adopted, not abandoned');
+    assert.equal(c.activeServerId, 'prod');
+    assert.equal(conns[0].address, 'rd.internal');
+    assert.deepEqual(setActiveCalls, ['prod'],
+        'and the correction is persisted, so the next load does not repeat it');
+});
+
+test('wireApi: a dangling id with SEVERAL servers asks rather than guessing', async (t) => {
+    fakeCockpit();
+    t.after(dropCockpit);
+    spyOnTransport(t);
+    const S = globalThis.PilotServers;
+    const saved = { active: S.active, read: S.read, list: S.list, setActive: S.setActive };
+    t.after(() => Object.assign(S, saved));
+    S.active = () => Promise.resolve('gone');
+    S.read = () => Promise.reject(Object.assign(new Error('no record'), { name: 'PilotError', kind: 'GENERIC' }));
+    S.list = () => Promise.resolve([{ id: 'a' }, { id: 'b' }]);
+    S.setActive = () => { throw new Error('must not pick one at random'); };
+
+    const c = App.pilotApp();
+    await c.wireApi();
+    assert.equal(c.apiReady, false);
+    assert.ok(c.switchError, 'the user must be told which server to choose');
+    assert.match(String(c.switchError.message), /not registered/i);
 });
