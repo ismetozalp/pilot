@@ -545,3 +545,51 @@ test('the DuckDNS token appears nowhere in what the helper prints for a DuckDNS 
     assert.ok(update.cmd.indexOf(TOKEN) === -1 && update.cmd.indexOf('-K') !== -1,
         'the update step reads the URL from a config file, so its own command is safe to print');
 });
+
+
+// ============ the Server Ops envelope, validated by the thing that validates it
+//
+// Every Server Ops action was dead on arrival: envelopeFor() built its step out
+// of the five keys that carry data, and pilot-exec rejects a missing key exactly
+// as hard as an unknown one, so nothing ever ran --
+//
+//   envelope.steps[0] is missing key(s): check, secret, sha256, write
+//
+// The unit tier could not catch it. Every test there stubs the transport, so
+// client and tests agreed about a shape this helper has never accepted. Two
+// mirrors are not a measurement. This check builds the envelope with the REAL
+// js/features/server-ops-ui.js and hands it to the REAL helper, which is the
+// one assertion a stub cannot fake.
+//
+// --print-plan validates and renders without executing anything, so this runs
+// on any machine with no RustDesk server, no root and no side effects.
+
+const ServerOps = require('../../js/features/server-ops-ui.js');
+
+const OPS_SERVER = { id: 'srv', transport: 'local', host: 'localhost', sshPort: 22, hasCredential: true };
+
+test('pilot-exec accepts the envelope every Server Ops action actually sends', () => {
+    for (const op of ServerOps.OPS) {
+        const env = ServerOps.envelopeFor(op.id, OPS_SERVER, null);
+        const r = run(['--print-plan'], JSON.stringify(env));
+        assert.equal(r.code, 0,
+            op.id + ' was refused by pilot-exec: ' + r.out.trim() + r.err.trim());
+        const out = lines(r.out);
+        const planStep = out.filter((l) => l.t === 'plan-step')[0];
+        assert.ok(planStep, op.id + ' produced no plan-step');
+        assert.equal(planStep.id, op.id);
+        assert.ok(String(planStep.cmd).length > 0, op.id + ' rendered an empty command');
+    }
+});
+
+test('a step missing any required key is refused -- this is what shipped', () => {
+    const env = ServerOps.envelopeFor('status', OPS_SERVER, null);
+    for (const key of ['write', 'check', 'sha256', 'secret']) {
+        const broken = JSON.parse(JSON.stringify(env));
+        delete broken.steps[0][key];
+        const r = run(['--print-plan'], JSON.stringify(broken));
+        assert.notEqual(r.code, 0, 'dropping ' + key + ' must be refused');
+        assert.match(r.out + r.err, new RegExp('missing key\\(s\\).*' + key),
+            'the refusal must name ' + key);
+    }
+});

@@ -155,8 +155,19 @@
                 return ['systemctl', 'restart', UNIT.api];
             case 'relay-log':
                 return ['journalctl', '-u', UNIT.hbbr, '--no-pager', '-o', 'cat', '-n', '2000'];
-            case 'doctor':
-                return ['rustdesk-utils', 'doctor'];
+            case 'doctor': {
+                // `doctor` takes the server address as a positional argument:
+                //     doctor [rustdesk-server]   Check for server connection problems
+                // Run bare it prints "ERROR: You must supply the rustdesk-server
+                // address" and its usage, and exits -- so this op could never
+                // once have produced a diagnosis. It is the address the CLIENTS
+                // dial that is worth checking (doctor resolves it, compares the
+                // reverse DNS and probes the ports), which is the record's host,
+                // not localhost.
+                const host = str(server && server.host).trim();
+                if (host === '') return null;
+                return ['rustdesk-utils', 'doctor', host];
+            }
             case 'recheck-ports':
                 return ['ss', '-H', '-ltnu'];
             case 'rotate-key': {
@@ -496,7 +507,29 @@
                 password: authType === 'password' ? secret : null,
                 pem: authType === 'pem' ? secret : null
             } : null,
-            steps: [{ id: op.id, title: op.label, mutating: !!op.danger, why: op.why, argv: opArgv(opId, server) }]
+            // EVERY key pilot-exec's STEP_KEYS names, present, in the same shape
+            // js/core/provision-plan.js's step() produces. The helper rejects a
+            // step with a missing key as hard as one with an unknown key -- it
+            // validates the whole set, not the keys it happens to need -- so a
+            // step built with only the five that carry data was refused before
+            // it ran, and EVERY Server Ops action died with
+            // "envelope.steps[0] is missing key(s): check, secret, sha256, write".
+            //
+            // The four constants below are not padding: null/false is what each
+            // one MEANS for an operation that runs a command and nothing else.
+            // No file is written, no idempotency guard applies, no download is
+            // verified, and no argument is a secret.
+            steps: [{
+                id: op.id,
+                title: op.label,
+                mutating: !!op.danger,
+                why: op.why,
+                argv: opArgv(opId, server),
+                write: null,
+                check: null,
+                sha256: null,
+                secret: false
+            }]
         };
     }
 
@@ -860,6 +893,7 @@
         parseUnitState: parseUnitState, unitStatesFrom: unitStatesFrom, STATUS_UNITS: STATUS_UNITS,
         parseRelayLog: parseRelayLog, summarise: summarise,
         blankState: blankState, serverOpsUi: serverOpsUi, serverEmptyState: serverEmptyState,
+        envelopeFor: envelopeFor,
         TEMPLATE: TEMPLATE, mount: mount
     };
     root.PilotServerOpsUi = PilotServerOpsUi;

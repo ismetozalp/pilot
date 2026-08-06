@@ -179,9 +179,21 @@ test('opArgv: relay-log reads hbbr through journalctl in raw (cat) form', () => 
     assert.deepEqual(argv, ['journalctl', '-u', 'rustdesk-hbbr.service', '--no-pager', '-o', 'cat', '-n', '2000']);
 });
 
-test('opArgv: doctor and recheck-ports', () => {
-    assert.deepEqual(S.opArgv('doctor', LOCAL), ['rustdesk-utils', 'doctor']);
+test('opArgv: doctor takes the server address, recheck-ports takes none', () => {
+    // rustdesk-utils' own usage: `doctor [rustdesk-server]`. Run bare it prints
+    // "ERROR: You must supply the rustdesk-server address" and exits, so this
+    // op could never once have produced a diagnosis. Verified against the real
+    // binary on a provisioned server.
+    assert.deepEqual(S.opArgv('doctor', LOCAL), ['rustdesk-utils', 'doctor', LOCAL.host]);
     assert.deepEqual(S.opArgv('recheck-ports', LOCAL), ['ss', '-H', '-ltnu']);
+});
+
+test('doctor refuses to run rather than invoke itself with no address', () => {
+    // Returning null blocks the op. Emitting a bare `rustdesk-utils doctor`
+    // would surface the binary's usage text as if it were a diagnosis.
+    assert.equal(S.opArgv('doctor', { id: 'x', transport: 'local', host: '' }), null);
+    assert.equal(S.opArgv('doctor', { id: 'x', transport: 'local', host: '   ' }), null);
+    assert.equal(S.opArgv('doctor', {}), null);
 });
 
 test('opArgv: rotate-key removes the keypair and restarts hbbs in one compound command', () => {
@@ -920,4 +932,63 @@ test('init wires a pilot:server-changed listener that reloads the server, live',
         assert.ok(c.server, 'the dispatched event must actually reload the server, not be ignored');
         assert.equal(c.server.id, 'edge9');
     });
+});
+
+
+// ======================= FIELD REPORT: every Server Ops action was dead on arrival
+//
+// "when i click service status nothing happens and there is a error on console":
+//
+//   Uncaught PilotError: envelope.steps[0] is missing key(s): check, secret,
+//                        sha256, write
+//
+// envelopeFor() built a step out of the five keys that carry data for an
+// operation. libexec/pilot-exec validates the WHOLE key set -- it rejects a
+// missing key exactly as hard as an unknown one -- so the envelope was refused
+// before a single command ran. Not just Service status: all eight operations,
+// every one of them, since the screen was written.
+//
+// It survived because every test above stubs the transport and asserts on argv.
+// Nothing compared the envelope against the thing that actually validates it,
+// so client and tests agreed about a shape the helper has never accepted.
+// That is why this reads STEP_KEYS out of libexec/pilot-exec instead of
+// restating it: a copy of the contract would have passed while broken too.
+
+function pilotExecStepKeys() {
+    const src = fs.readFileSync(path.join(__dirname, '../../libexec/pilot-exec'), 'utf8');
+    const m = /^STEP_KEYS\s*=\s*\(([^)]*)\)/m.exec(src);
+    assert.ok(m, 'STEP_KEYS not found in libexec/pilot-exec -- the contract moved');
+    return m[1].split(',').map((s) => s.trim().replace(/^["']|["']$/g, '')).filter(Boolean).sort();
+}
+
+const OPS_SERVER = { id: 'srv', transport: 'local', host: 'h.example', sshPort: 22, hasCredential: true };
+
+test('the envelope step carries exactly the keys pilot-exec demands, read from pilot-exec', () => {
+    const want = pilotExecStepKeys();
+    for (const op of S.OPS) {
+        const env = S.envelopeFor(op.id, OPS_SERVER, null);
+        const got = Object.keys(env.steps[0]).sort();
+        assert.deepEqual(got, want,
+            op.id + ' step keys do not match pilot-exec STEP_KEYS');
+    }
+});
+
+test('the four non-command keys carry the value that means "not applicable"', () => {
+    // They are not padding to satisfy a validator: an operation runs a command
+    // and nothing else -- no file written, no idempotency guard, no download to
+    // verify, no secret argument.
+    const env = S.envelopeFor('status', OPS_SERVER, null);
+    const step = env.steps[0];
+    assert.equal(step.write, null);
+    assert.equal(step.check, null);
+    assert.equal(step.sha256, null);
+    assert.equal(step.secret, false);
+    // ...and the keys that DO carry data still do.
+    assert.equal(step.id, 'status');
+    assert.ok(Array.isArray(step.argv) && step.argv.length > 0, 'the command survives');
+});
+
+test('a danger op is marked mutating, a read-only one is not', () => {
+    assert.equal(S.envelopeFor('restart-hbbs', OPS_SERVER, null).steps[0].mutating, true);
+    assert.equal(S.envelopeFor('status', OPS_SERVER, null).steps[0].mutating, false);
 });
