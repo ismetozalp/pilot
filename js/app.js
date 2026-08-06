@@ -201,6 +201,16 @@
 
             // Called when the user picks a different server in the shell: persist
             // the choice, then re-wire exactly like startup does.
+            // switchServer() deliberately no-ops when the id is unchanged (see
+            // its re-entrancy guard). Signing in changes the CREDENTIAL, not the
+            // server -- so a token stored for the already-active server was
+            // written, read back, and never used: every tab went on saying
+            // "Please log in first" with a perfectly good token on disk. This is
+            // the signal for "same server, new credential".
+            async reloadCredentials() {
+                return this.wireApi();
+            },
+
             async switchServer(id) {
                 // Re-entrancy guard: index.html's shell listens for the very
                 // 'pilot:server-changed' event wireApi() dispatches below and

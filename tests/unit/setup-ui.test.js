@@ -2800,3 +2800,34 @@ test('notifyServerChanged is called (id, target) — the shell must actually be 
             'arguments are (id, target), not (target, id): ' + call);
     }
 });
+
+test('storing a token announces a CREDENTIAL change, not a server change', async () => {
+    // js/app.js's switchServer() no-ops when the id is unchanged (its own
+    // re-entrancy guard says so). Signing in changes the credential, not the
+    // server -- so the token was written, read back, and NEVER USED: every tab
+    // kept reporting "Please log in first" with a good token on disk. Proven in
+    // the browser before and after: devices went from 0 rows to 4.
+    const c = UI.pilotSetupUi();
+    let seen = null;
+    await withFakeCockpit({}, async () => {
+        globalThis.PilotApi = { users: { login: () => Promise.resolve({ token: 'TOK' }) } };
+        try {
+            await withFakeDocument((events) =>
+                withFakeServers({ writeSecret: () => Promise.resolve() },
+                    () => c.storeToken('srv1', 'pw')).then(() => { seen = events; }));
+        } finally { delete globalThis.PilotApi; }
+    });
+    assert.ok(seen.some((e) => e.type === 'pilot:credentials-changed'),
+        'without this the new token is never picked up by the transport');
+});
+
+test('index.html and app.js agree on the credentials-changed signal', () => {
+    const html = fs.readFileSync(path.join(ROOT, 'index.html'), 'utf8');
+    const app = fs.readFileSync(path.join(ROOT, 'js/app.js'), 'utf8');
+    assert.match(html, /@pilot:credentials-changed\.document="reloadCredentials\(\)"/,
+        'the shell must listen, or the event goes nowhere — the exact shape of ' +
+        'the pilot:server-changed and pilot:open-wizard gaps found earlier');
+    assert.match(app, /async reloadCredentials\(\)/, 'and the handler must exist');
+    assert.match(app.slice(app.indexOf('async reloadCredentials()')), /this\.wireApi\(\)/,
+        'reloading credentials means rebuilding the transport');
+});

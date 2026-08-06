@@ -1284,6 +1284,19 @@
     // local copy rather than a cross-feature require(): overview.js's own
     // openWizardTls() dispatch is the same pattern, and setup-ui.js already
     // has no dependency on any other js/features/*.js module.
+    // "Same server, new credential." notifyServerChanged() cannot express that:
+    // js/app.js's switchServer() no-ops when the id is unchanged, by design, so
+    // a freshly stored token was never picked up and every tab kept reporting
+    // "Please log in first" against a token sitting on disk.
+    function notifyCredentialsChanged(target) {
+        const t = target || (root && root.document) || null;
+        if (!t || typeof t.dispatchEvent !== 'function') return false;
+        const CE = root && root.CustomEvent;
+        if (typeof CE !== 'function') return false;
+        t.dispatchEvent(new CE('pilot:credentials-changed', { detail: {}, bubbles: true }));
+        return true;
+    }
+
     function notifyServerChanged(id, target) {
         const t = target || (root && root.document) || null;
         if (!t || typeof t.dispatchEvent !== 'function') return false;
@@ -2118,6 +2131,9 @@
                         return false; }
                     await Servers.writeSecret(str(id), 'token', str(token));
                     this.tokenSaveError = null;
+                    // The transport must be rebuilt to carry it; the server is
+                    // unchanged, so server-changed alone would be a no-op.
+                    notifyCredentialsChanged(this.doc || (root ? root.document : null));
                     return true;
                 } catch (e) {
                     this.tokenSaveError = describe(e);
@@ -2214,6 +2230,7 @@
         parseLine, reduce, progress, transcriptText, runPath,
         firstFailure, failureMessage, capturePassword, scrubSecret, scrubLines, SECRET_MASK,
         handover, passwordGate, manualFor, mergeReach, blockedReason,
+        notifyCredentialsChanged,
         runIdFor, splitStream, detectRequest, envelopeCtx, planChoicesFor, requiredPorts, reachFrom,
         notifyServerChanged,
         pilotSetupUi

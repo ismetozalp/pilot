@@ -27,7 +27,8 @@
      scope this one cannot reach into. -->
 <div class="pilot-shell" x-data="pilotApp()" x-cloak
      @pilot:server-changed.document="switchServer($event.detail.id)"
-     @pilot:open-wizard.document="openWizard($event.detail)">
+     @pilot:open-wizard.document="openWizard($event.detail)"
+     @pilot:credentials-changed.document="reloadCredentials()">
 
     <div class="pilot-header d-flex align-items-center gap-3">
         <strong class="me-2">Pilot</strong>
