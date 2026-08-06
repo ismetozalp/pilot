@@ -1063,3 +1063,54 @@ test('ws-host is emitted, and is the TLS domain when there is one', () => {
     assert.equal(yamlValue(yaml, 'ws-host'), 'wss://rd.example.com');
     assert.match(yaml, /^  ws-host:/m, 'the key must be present, not merely defaulted');
 });
+
+
+// ===================== FIELD REPORT: what we fixed by hand must be provisioned
+//
+// The reference server was repaired by hand with `hbbs -k _ -r <host>:21117`
+// and `hbbr -k _`, and only then did signed-in clients work. Pilot still
+// generated a bare ExecStart, so a fresh provision rebuilt the broken server.
+//
+// -k _ makes both daemons ENFORCE the keypair in their working directory.
+// Without it the server does not do key-based encryption at all while clients
+// that have a key still try to, and the client reports "Failed to secure tcp".
+// Verified on a real binary: with no keypair present, `hbbs -k _` GENERATES one
+// and starts cleanly -- so it is correct on a first provision, not only a
+// repair.
+//
+// -r is the relay handed to clients that cannot punch directly. Sessions on the
+// reference deployment go through it, so it is load-bearing.
+
+function execStart(plan, id) {
+    return byId(plan, id).write.content.split('\n').filter((l) => l.indexOf('ExecStart=') === 0)[0];
+}
+
+test('the generated hbbs unit enforces the key and advertises a relay', () => {
+    const plan = P.build(detFresh(), choices({ installHbbs: true, tlsTier: 'own', domain: 'rd.example.com' }));
+    const line = execStart(plan, 'install-hbbs-unit');
+    assert.match(line, /\/hbbs\b/);
+    assert.match(line, /-k _/, 'without -k the server ignores keys and clients fail the handshake');
+    assert.match(line, /-r rd\.example\.com:21117/, 'without -r a failed punch has no fallback');
+});
+
+test('the generated hbbr unit enforces the key too -- both daemons or neither', () => {
+    const plan = P.build(detFresh(), choices({ installHbbs: true, tlsTier: 'own', domain: 'rd.example.com' }));
+    assert.match(execStart(plan, 'install-hbbr-unit'), /\/hbbr -k _/);
+});
+
+test('the relay hbbs advertises is the SAME host the API advertises', () => {
+    // Two computations of "the hostname" disagreeing is the bug that broke
+    // every signed-in client. There is one definition now; this pins that they
+    // cannot drift apart again.
+    for (const c of [
+        { installHbbs: true, tlsTier: 'own', domain: 'rd.example.com', host: 'ssh.internal' },
+        { installHbbs: true, tlsTier: 'none', host: '203.0.113.10' }
+    ]) {
+        const plan = P.build(detFresh(), choices(c));
+        const unitHost = /-r ([^:\s]+):/.exec(execStart(plan, 'install-hbbs-unit'))[1];
+        const yaml = byId(plan, 'configure').write.content;
+        const apiHost = /^  relay-server: ([^:\s]+):/m.exec(yaml)[1];
+        assert.equal(unitHost, apiHost,
+            'hbbs advertises ' + unitHost + ' while the API advertises ' + apiHost);
+    }
+});

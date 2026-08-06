@@ -176,6 +176,16 @@
 
     // ------------------------------------------------------ generated files
 
+    // THE hostname every client-facing name is built from -- the API's
+    // id-server/relay-server, and the relay hbbs advertises. With TLS on it must
+    // be the certificate's name, because a signed-in client builds
+    // wss://<id-server>/ws/id from it and anything else fails the handshake.
+    // One definition: this used to be computed twice with different answers,
+    // which is the bug that broke every signed-in client.
+    function rendezvousHostFor(ch, det, domain) {
+        return domain || (ch.host || det.publicIp || '127.0.0.1');
+    }
+
     function configYaml(ch, det, domain) {
         const addr = ch.host || det.publicIp || '127.0.0.1';
         // ONE hostname for every name the client is handed. This used to be two:
@@ -194,7 +204,7 @@
         // When TLS is on, the certificate's name is the only name that works, so
         // it is the name everything uses. With TLS off there is no certificate
         // and no wss://, so the plain address is correct and unchanged.
-        const rendezvousHost = domain || addr;
+        const rendezvousHost = rendezvousHostFor(ch, det, domain);
         // apiServerUrl() is the ONE place that decides https:// vs http://: the
         // client picks wss:// only when this string starts with https, otherwise
         // it silently downgrades to plaintext ws://.
@@ -292,7 +302,23 @@
             'WantedBy=multi-user.target\n';
     }
 
-    function hbbUnit(name, bin, dataDir) {
+    // args are appended to ExecStart. Both daemons need them, and a unit written
+    // without them produces a server that looks healthy and cannot do its job:
+    //
+    //   -k _   makes hbbs/hbbr ENFORCE the keypair in their working directory.
+    //          Without it the server does not participate in key-based
+    //          encryption at all, while clients that have a key still try to --
+    //          and the client reports "Failed to secure tcp: deadline has
+    //          elapsed", naming neither the key nor the server. Verified safe on
+    //          a FIRST start: with no keypair present, `hbbs -k _` generates one
+    //          and starts normally, which is exactly what a fresh provision does.
+    //
+    //   -r     is the relay hbbs hands to clients that cannot punch directly.
+    //          Without it there is no fallback: the punch fails and the client
+    //          waits out its deadline. Sessions on the reference deployment go
+    //          through this relay, so it is load-bearing, not belt-and-braces.
+    function hbbUnit(name, bin, dataDir, args) {
+        const extra = (Array.isArray(args) && args.length) ? ' ' + args.join(' ') : '';
         return '[Unit]\n' +
             'Description=RustDesk ' + name + ' (managed by Pilot)\n' +
             'After=network-online.target\n' +
@@ -301,7 +327,7 @@
             '[Service]\n' +
             'Type=simple\n' +
             'WorkingDirectory=' + dataDir + '\n' +
-            'ExecStart=' + BIN_DIR + '/' + bin + '\n' +
+            'ExecStart=' + BIN_DIR + '/' + bin + extra + '\n' +
             'Restart=on-failure\n' +
             'RestartSec=5\n' +
             '\n' +
@@ -393,11 +419,12 @@
             steps.push(step({ id: 'install-hbbs-unit', title: 'Write ' + UNIT_DIR + '/rustdesk-hbbs.service',
                 mutating: true, why: 'No rpm exists upstream, so a Pilot-generated unit is the portable path.',
                 write: { path: UNIT_DIR + '/rustdesk-hbbs.service', mode: '0644', owner: 'root:root',
-                    content: hbbUnit('ID/rendezvous server', 'hbbs', dataDir) } }));
+                    content: hbbUnit('ID/rendezvous server', 'hbbs', dataDir,
+                        ['-k', '_', '-r', rendezvousHostFor(ch, det, domain) + ':' + RELAY_PORT]) } }));
             steps.push(step({ id: 'install-hbbr-unit', title: 'Write ' + UNIT_DIR + '/rustdesk-hbbr.service',
                 mutating: true, why: 'The relay is a separate process and therefore a separate unit.',
                 write: { path: UNIT_DIR + '/rustdesk-hbbr.service', mode: '0644', owner: 'root:root',
-                    content: hbbUnit('relay server', 'hbbr', dataDir) } }));
+                    content: hbbUnit('relay server', 'hbbr', dataDir, ['-k', '_']) } }));
             steps.push(step({ id: 'install-hbbs-reload', title: 'Reload the systemd unit files', mutating: true,
                 why: 'systemd will not see a newly written unit until it is told to reload.',
                 argv: ['systemctl', 'daemon-reload'] }));
