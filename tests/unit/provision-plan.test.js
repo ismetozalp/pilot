@@ -132,7 +132,13 @@ test('adopt path contains no install and no restart of the existing hbbs', () =>
     assert.equal(ids.indexOf('hbbs-key'), -1, 'the key is read from detection when adopting');
     for (const s of plan.steps) {
         const line = s.argv.join(' ');
-        assert.ok(line.indexOf('restart') === -1, 'no restart anywhere in the adopt path: ' + line);
+        // The rule is what the title says: never restart the ADOPTED services.
+        // Restarting rustdesk-api is not only allowed but required -- Pilot
+        // writes its unit and config.yaml two steps earlier, and a service that
+        // keeps running keeps using the old ones. The blanket "no restart
+        // anywhere" was broader than the intent and would have blocked that fix.
+        assert.ok(!/restart\b.*(hbbs|hbbr|rustdesk-server)/.test(line),
+            'the adopted hbbs/hbbr must never be restarted: ' + line);
         assert.ok(!/rustdesk-hbb[sr]/.test(line) || s.argv[0] === 'cat',
             'the only hbbs touch is reading its key: ' + line);
     }
@@ -406,15 +412,49 @@ test('enable --now is not trusted on its own: the service must really be active'
     // died -- with Restart=on-failure it sits in "activating (auto-restart)",
     // which systemd reports as a successful start. A crash-looping service was
     // therefore recorded as "ok exit=0".
+    //
+    // And `--now` is gone entirely: it starts a STOPPED unit and does nothing
+    // to a running one, so re-provisioning a live server left it on the unit
+    // and config.yaml written two steps earlier. Enabling for the reboot and
+    // applying what was just written are two jobs.
     const plan = P.build(detAdopt(), choices());
     const enable = byId(plan, 'unit-enable');
-    assert.deepEqual(enable.argv, ['systemctl', 'enable', '--now', 'rustdesk-api.service']);
+    assert.deepEqual(enable.argv, ['systemctl', 'enable', 'rustdesk-api.service'],
+        'no --now: it cannot apply a config to an already-running service');
+    const restart = byId(plan, 'unit-restart');
+    assert.ok(restart, 'the config just written must actually be applied');
+    assert.deepEqual(restart.argv, ['systemctl', 'restart', 'rustdesk-api.service']);
     const active = byId(plan, 'unit-active');
     assert.ok(active, 'starting a service and never asking whether it runs is not a check');
     assert.equal(active.mutating, false);
     assert.deepEqual(active.argv, ['systemctl', 'is-active', '--quiet', 'rustdesk-api.service']);
     const ids = plan.steps.map((x) => x.id);
-    assert.ok(ids.indexOf('unit-enable') < ids.indexOf('unit-active'));
+    assert.ok(ids.indexOf('configure') < ids.indexOf('unit-restart'), 'write the config, THEN apply it');
+    assert.ok(ids.indexOf('unit-restart') < ids.indexOf('unit-active'));
+});
+
+test('Caddy: enabling and applying are separate, and TLS is verified rather than assumed', () => {
+    // FROM THE FIELD: Caddy had been running since 10:11, Pilot wrote a new
+    // Caddyfile at 17:53, `systemctl enable --now caddy` exited 0, and Caddy
+    // went on serving the OLD config -- HTTP only, no certificate, 443 never
+    // bound. The console then reported "the API server could not be reached"
+    // against a server that was fine. Proven on the real host: enable --now
+    // left 443 unbound; reload-or-restart bound it and Let's Encrypt issued.
+    const plan = P.build(detAdopt(), choices({ tlsTier: 'own', domain: 'rd.example.com' }));
+    const ids = P.stepIds(plan);
+    assert.deepEqual(byId(plan, 'tls-enable').argv, ['systemctl', 'enable', 'caddy.service']);
+    assert.deepEqual(byId(plan, 'tls-reload').argv,
+        ['systemctl', 'reload-or-restart', 'caddy.service'],
+        'enable --now cannot load a new Caddyfile into a running Caddy');
+    const verify = byId(plan, 'tls-verify');
+    assert.ok(verify, 'Caddy binds 443 only once it holds a certificate: that is the only real proof');
+    assert.equal(verify.mutating, false);
+    assert.match(verify.argv.join(' '), /:443/);
+    assert.ok(ids.indexOf('tls-caddyfile') < ids.indexOf('tls-reload'), 'write the file, THEN load it');
+    assert.ok(ids.indexOf('tls-reload') < ids.indexOf('tls-verify'));
+    // No step may use --now on caddy again.
+    plan.steps.forEach((st) => assert.ok(!/enable .*--now.*caddy/.test(st.argv.join(' ')),
+        'enable --now on caddy is a no-op against a running instance: ' + st.argv.join(' ')));
 });
 
 test('C17: the generated unit sets WorkingDirectory=/opt/rustdesk-api', () => {
@@ -903,4 +943,34 @@ test('the verify step is a health check, not a document download', () => {
     // validation and takes the whole run with it.
     v.argv.forEach((a) => assert.ok(!/[\x00-\x1f\x7f]/.test(a),
         'argv element carries a control character: ' + JSON.stringify(a)));
+});
+
+test('config.yaml carries the release defaults, because an omitted key is a ZERO, not an inherit', () => {
+    // This file REPLACES the one the release ships, and the missing keys did
+    // not fall back to the shipped values -- they fell back to Go's zero
+    // values, which broke a real server twice over:
+    //   gin.resources-path omitted -> "" -> InitI18n opens "/i18n" -> panic on
+    //     startup, restart counter reached 403;
+    //   app.captcha-threshold omitted -> 0, and the shipped config documents 0
+    //     as "always" -> every admin login answered "Captcha error", correct
+    //     password or not, so the handover password change could never work.
+    const cfg = byId(P.build(detAdopt(), choices()), 'configure').write.content;
+    // The two that actually took the server down.
+    assert.match(cfg, /\n  resources-path: 'resources'\n/,
+        'without this the binary panics on /i18n at startup');
+    assert.match(cfg, /\n  captcha-threshold: 3\n/,
+        'zero means ALWAYS require a captcha, which blocks every admin login');
+    // The rest of the keys whose zero value is wrong.
+    for (const [key, why] of [
+        ['\n  type: "sqlite"\n', 'the database backend'],
+        ['\n  mode: "release"\n', 'gin would otherwise run in debug and log every request'],
+        ['\n  path: "./runtime/log.txt"\n', 'the log path'],
+        ['\nlang: ', 'the locale'],
+        ['\n  hello-file: ', 'the admin hello file'],
+        ['\n  token-expire: ', 'zero would expire every token immediately']
+    ]) assert.ok(cfg.indexOf(key) !== -1, 'missing ' + why + ': ' + JSON.stringify(key));
+    // And Pilot's own values still win.
+    assert.match(cfg, /\n  show-swagger: 1\n/, 'the verify step depends on this');
+    assert.match(cfg, /\n  api-addr: 0\.0\.0\.0:21114\n/);
+    assert.match(cfg, /\n  id-server: /);
 });

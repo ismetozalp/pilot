@@ -454,3 +454,89 @@ test('every state slot js/app.js writes is actually rendered by index.html', () 
             `js/app.js writes ${name} but no x-show/x-text in index.html reads it — render it or delete it`);
     }
 });
+
+// ------------------------------- the TLS endpoint is the domain, not the host
+
+// Captures the Conn that wireApi() hands to PilotApiIo.transport(), which is
+// the whole decision under test: an https request to the wrong address fails
+// no matter how healthy the server is.
+// app.js reads root.PilotServers directly, so that object IS the seam.
+function fakeRecord(t, rec) {
+    const S = globalThis.PilotServers;
+    const saved = { active: S.active, read: S.read, readSecret: S.readSecret,
+        probeCompatibility: S.probeCompatibility };
+    S.active = () => Promise.resolve(rec.id);
+    S.read = () => Promise.resolve(rec);
+    S.readSecret = () => Promise.resolve(null);
+    S.probeCompatibility = () => Promise.resolve({ ok: true });
+    const restore = () => Object.assign(S, saved);
+    t.after(restore);
+    return restore;
+}
+
+function spyOnTransport(t) {
+    const Io = globalThis.PilotApiIo;
+    const real = Io.transport;
+    const seen = [];
+    Io.transport = function (conn) { seen.push(conn); return real(conn); };
+    t.after(() => { Io.transport = real; });
+    return seen;
+}
+
+test('wireApi: a TLS server is reached at its DOMAIN on 443, not at host:apiPort', async (t) => {
+    // FROM THE FIELD. The record read:
+    //   host ec2-203-0-113-10...amazonaws.com, apiPort 21114, tls true,
+    //   domain 203.0.113.10.sslip.io
+    // and wireApi() built {address: host, port: apiPort, tls: true} -- an https
+    // request to port 21114, which serves plain HTTP and has no certificate for
+    // that name. The console reported "the API server could not be reached"
+    // while https://203.0.113.10.sslip.io/api/version returned 200.
+    fakeCockpit();
+    t.after(dropCockpit);
+    const conns = spyOnTransport(t);
+
+    const restore = fakeRecord(t, {
+        id: 's1', host: 'ec2-1-2-3-4.compute.amazonaws.com', apiPort: 21114,
+        tls: true, domain: 'rd.example.com'
+    });
+    const c = App.pilotApp();
+    await c.wireApi();
+    restore();
+
+    assert.equal(conns.length, 1, 'exactly one transport should be built');
+    assert.equal(conns[0].address, 'rd.example.com',
+        'the certificate is issued for the domain, not the instance hostname');
+    assert.equal(conns[0].port, 443,
+        'Caddy holds 443 and proxies to 21114 on loopback; the client appends no port (C17)');
+    assert.equal(conns[0].tls, true);
+});
+
+test('wireApi: without TLS it still goes to host:apiPort in plain HTTP', async (t) => {
+    fakeCockpit();
+    t.after(dropCockpit);
+    const conns = spyOnTransport(t);
+
+    const restore = fakeRecord(t, { id: 's1', host: 'rd.internal', apiPort: 21114, tls: false, domain: '' });
+    const c = App.pilotApp();
+    await c.wireApi();
+    restore();
+    assert.equal(conns[0].address, 'rd.internal');
+    assert.equal(conns[0].port, 21114);
+    assert.equal(conns[0].tls, false);
+});
+
+test('wireApi: tls true with NO domain falls back rather than inventing an endpoint', async (t) => {
+    // tls:true and no domain is a contradiction the record should never hold,
+    // but if it does, connecting to ""|443 would be strictly worse than
+    // connecting to the host that at least exists.
+    fakeCockpit();
+    t.after(dropCockpit);
+    const conns = spyOnTransport(t);
+
+    const restore = fakeRecord(t, { id: 's1', host: 'rd.internal', apiPort: 21114, tls: true, domain: null });
+    const c = App.pilotApp();
+    await c.wireApi();
+    restore();
+    assert.equal(conns[0].address, 'rd.internal');
+    assert.equal(conns[0].port, 21114);
+});
