@@ -976,3 +976,134 @@ test('the Address column reads last_online_ip, which is the field v2.7 sends', (
     assert.equal(rows[1].ip, '10.0.0.8', 'the older names still work');
     assert.equal(rows[2].ip, DASH, 'and a device with no address is a dash, not "undefined"');
 });
+
+
+// ============================================ FIELD REPORT: the two aliases
+//
+// Reported as two separate complaints -- "when i rename a device i cant see it
+// on addressbook", and "is there way to see the names in rust client" -- which
+// are one bug. A rustdesk-api server stores a device's name in TWO tables, and
+// this surface only ever wrote one. Measured on a live v2.7 server:
+//
+//   /api/admin/peer/list   row_id 1  id 100000001  alias "alpha-host"
+//   /api/ab/peers?ab=1-1-0 row_id 9  id 100000001  alias ""
+//
+// Nothing on the server reconciles them. And the RustDesk DESKTOP CLIENT reads
+// the address-book alias -- so a device renamed in Pilot kept showing as a bare
+// number in the client forever. That is the part that made this worth fixing
+// rather than documenting.
+//
+// The device rename must still succeed on its own: the address-book write is a
+// second request against a book the device may legitimately not be in.
+
+async function bookedComponent(over) {
+    const o = over || {};
+    const api = o.api || fakeApi(o.over);
+    const c = component({ api, deps: { doc: o.doc || null } });
+    await c.refresh(true);
+    c.books = [{ guid: 'shared-1', name: 'Support team' }];
+    c.book = 'shared-1';
+    return { c, api };
+}
+
+function withCustomEvent(fn) {
+    const had = typeof globalThis.CustomEvent === 'function';
+    if (!had) globalThis.CustomEvent = function (n, o) { this.type = n; this.detail = o && o.detail; };
+    try { return fn(); } finally { if (!had) delete globalThis.CustomEvent; }
+}
+
+function eventDoc() {
+    const fired = [];
+    return { fired, dispatchEvent: (ev) => { fired.push(ev); return true; } };
+}
+
+test('renaming a device writes the address-book alias too -- the name the client shows', async () => {
+    const seen = [];
+    const { c, api } = await bookedComponent({
+        over: { addressbook: { updatePeer: async (ab, peer) => { seen.push([ab, peer]); return { code: 0 }; } } }
+    });
+    c.startRename(c.rows[0]);
+    c.editName = 'alpha-host';
+    assert.equal(await c.commitRename(), true);
+
+    // Both tables, one user action.
+    assert.deepEqual(api.calls.filter((x) => x[0] === 'rename'), [['rename', 1, '123456789', 'alpha-host']]);
+    assert.deepEqual(seen, [['shared-1', { id: '123456789', alias: 'alpha-host' }]]);
+    assert.match(c.notice, /address book/);
+});
+
+test('a device rename still succeeds when the address-book half is rejected', async () => {
+    // The honest and commonest case: the device is not in the selected book.
+    // The live server answers 400 and -- verified -- creates no row. Reporting
+    // the whole rename as failed would be a lie about the peer table, which was
+    // written successfully.
+    const { c, api } = await bookedComponent({
+        over: { addressbook: { updatePeer: async () => { throw new Error('Params validation failed.'); } } }
+    });
+    c.startRename(c.rows[0]);
+    c.editName = 'alpha-host';
+    assert.equal(await c.commitRename(), true);
+    assert.equal(c.actionError, null);
+    assert.equal(c.rows[0].name, 'alpha-host');
+    assert.equal(api.calls.filter((x) => x[0] === 'rename').length, 1);
+    // ...and it must not claim to have done what it did not do.
+    assert.doesNotMatch(c.notice, /address book/);
+});
+
+test('with no book selected a rename touches only the peer table', async () => {
+    const seen = [];
+    const api = fakeApi({ addressbook: { updatePeer: async (ab, p) => { seen.push([ab, p]); } } });
+    const c = component({ api });
+    await c.refresh(true);
+    c.book = null;
+    c.startRename(c.rows[0]);
+    c.editName = 'alpha-host';
+    assert.equal(await c.commitRename(), true);
+    assert.deepEqual(seen, []);
+});
+
+test('writing to a book announces it -- the Address Book tab is a separate component', () => {
+    withCustomEvent(() => {
+        const doc = eventDoc();
+        assert.equal(D.emitAddressBookChanged('shared-1', doc), true);
+        assert.equal(doc.fired.length, 1);
+        assert.equal(doc.fired[0].type, 'pilot:addressbook-changed');
+        assert.deepEqual(doc.fired[0].detail, { ab: 'shared-1' });
+        assert.equal(D.emitAddressBookChanged('shared-1', {}), false);
+        assert.equal(D.emitAddressBookChanged('shared-1', null), false);
+    });
+});
+
+test('"Add to address book" fires the event -- reported as needing a browser refresh', async () => {
+    await withCustomEvent(async () => {
+        const doc = eventDoc();
+        const { c } = await bookedComponent({ doc });
+        assert.equal(await c.addToBook(c.rows[0]), true);
+        assert.deepEqual(doc.fired.map((e) => e.type), ['pilot:addressbook-changed']);
+    });
+});
+
+test('a rename that reached the book fires the event; one that did not stays silent', async () => {
+    await withCustomEvent(async () => {
+        const ok = eventDoc();
+        const a = await bookedComponent({ doc: ok,
+            over: { addressbook: { updatePeer: async () => ({ code: 0 }) } } });
+        a.c.startRename(a.c.rows[0]); a.c.editName = 'alpha-host';
+        await a.c.commitRename();
+        assert.deepEqual(ok.fired.map((e) => e.type), ['pilot:addressbook-changed']);
+
+        const bad = eventDoc();
+        const b = await bookedComponent({ doc: bad,
+            over: { addressbook: { updatePeer: async () => { throw new Error('400'); } } } });
+        b.c.startRename(b.c.rows[0]); b.c.editName = 'alpha-host';
+        await b.c.commitRename();
+        assert.deepEqual(bad.fired, []);
+    });
+});
+
+test('both feature modules spell the event the same -- a typo lands nowhere, silently', () => {
+    const ab = fs.readFileSync(path.join(__dirname, '../../js/features/addressbook-ui.js'), 'utf8');
+    assert.equal(D.AB_CHANGED_EVENT, 'pilot:addressbook-changed');
+    assert.match(ab, /const AB_CHANGED_EVENT = 'pilot:addressbook-changed';/);
+    assert.match(ab, /addEventListener\(AB_CHANGED_EVENT/);
+});

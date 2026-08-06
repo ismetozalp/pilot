@@ -675,3 +675,47 @@ test('mount injects once into the host element and never throws without one', ()
     assert.equal(Ui.safeMount(null), false);
     assert.equal(Ui.safeMount({ getElementById() { throw new Error('boom'); } }), false);
 });
+
+
+// ================================== FIELD REPORT: "i have to refresh the browser"
+//
+// Reported verbatim: "when i add a device i have refresh the browser to see it
+// in adressbook". The Devices tab and this one are separate Alpine components
+// that share no state on purpose, so a write over there was invisible here
+// until the whole page reloaded. js/features/devices-ui.js now announces its
+// address-book writes; this surface listens.
+//
+// Peers ONLY. Reloading books would discard the operator's book selection, and
+// reloading tags would re-render a table that a peer write cannot change.
+
+test('init() subscribes to the address-book-changed event', async () => {
+    const doc = fakeDoc();
+    const c = make(fakeApi());
+    await c.init(doc);
+    assert.ok(Array.isArray(doc.listeners['pilot:addressbook-changed']),
+        'devices-ui writes to a book and nothing here would ever know');
+});
+
+test('an address-book write elsewhere reloads the peers, and only the peers', async () => {
+    const api = fakeApi();
+    const doc = fakeDoc();
+    const c = make(api);
+    await c.init(doc);
+    const count = (k) => api.calls.filter((x) => x[0] === k).length;
+    const books = count('books'), peers = count('peers'), tags = count('tags');
+
+    doc.emit('pilot:addressbook-changed', { ab: 'shared-1' });
+    await new Promise((r) => setTimeout(r, 0));
+
+    assert.equal(count('peers'), peers + 1, 'the stale peer list is refetched');
+    assert.equal(count('books'), books, 'the book selection must survive');
+    assert.equal(count('tags'), tags, 'a peer write cannot change the tag list');
+});
+
+test('the event is ignored when no book is on screen -- there is nothing to reload', async () => {
+    const api = fakeApi();
+    const c = make(api);
+    c.activeGuid = null;
+    assert.equal(c.onAddressBookChanged({ detail: { ab: 'x' } }), false);
+    assert.equal(api.calls.filter((x) => x[0] === 'peers').length, 0);
+});

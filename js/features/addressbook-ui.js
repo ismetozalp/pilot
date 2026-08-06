@@ -74,6 +74,9 @@
 
     const HOST_ID = 'pilot-addressbook';
     const SERVER_CHANGED_EVENT = 'pilot:server-changed';
+    // Emitted by js/features/devices-ui.js when it writes to a book. Same
+    // literal on both sides, pinned by a unit test — see the note there.
+    const AB_CHANGED_EVENT = 'pilot:addressbook-changed';
     const NO_API = 'The address book API is not available.';
 
     function blankState() {
@@ -321,9 +324,29 @@
             init(doc) {
                 const target = doc || this.doc || root.document || null;
                 const self = this;
-                if (target && typeof target.addEventListener === 'function')
+                if (target && typeof target.addEventListener === 'function') {
                     target.addEventListener(SERVER_CHANGED_EVENT, function (ev) { self.onServerChanged(ev); });
+                    target.addEventListener(AB_CHANGED_EVENT, function (ev) { self.onAddressBookChanged(ev); });
+                }
                 return this.load();
+            },
+
+            // The Devices tab just wrote to a book. Reload the peers -- and ONLY
+            // the peers: books and tags did not change, and reloading them would
+            // throw away the user's book selection and re-render two more tables
+            // for nothing.
+            //
+            // Reloads whichever book is on screen regardless of which book the
+            // event names. Matching on detail.ab would be wrong in the case that
+            // matters: the Devices tab writes to ITS selected book, which is
+            // routinely not the one this tab is showing, and "the peer list you
+            // are looking at may now be stale" is true either way. A reload
+            // costs one request; showing a list that silently lies does not
+            // announce itself at all.
+            onAddressBookChanged() {
+                if (!this.activeGuid) return false;
+                this.loadPeers();
+                return true;
             },
 
             // Reacts to the SAME event js/app.js dispatches once its real

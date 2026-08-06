@@ -30,6 +30,11 @@
 
     const MOUNT_ID = 'pilot-devices';
     const SERVER_CHANGED_EVENT = 'pilot:server-changed';
+    // Kept as a literal here and in js/features/addressbook-ui.js, like
+    // SERVER_CHANGED_EVENT: neither feature module may import the other. A unit
+    // test pins the two literals to the same string, because a typo in one of
+    // them is silent -- the event simply lands nowhere.
+    const AB_CHANGED_EVENT = 'pilot:addressbook-changed';
     const DASH = '\u2014';
     const MAX_NAME = 64;
     const MAX_FIELD = 200;
@@ -332,6 +337,22 @@
         return true;
     }
 
+    // This surface writes to the address book -- "Add to address book", and
+    // now rename -- while js/features/addressbook-ui.js is a SEPARATE Alpine
+    // component that loaded its peers once and has no reason to suspect they
+    // changed. Adding a device left the Address Book tab showing yesterday's
+    // list until the whole browser page was reloaded. The two components share
+    // no state by design, so the write has to say so out loud, exactly as
+    // 'pilot:server-changed' already does.
+    function emitAddressBookChanged(ab, target) {
+        const t = target || root.document || null;
+        if (!t || typeof t.dispatchEvent !== 'function') return false;
+        if (typeof root.CustomEvent !== 'function') return false;
+        t.dispatchEvent(new root.CustomEvent(AB_CHANGED_EVENT,
+            { detail: { ab: clean(ab) }, bubbles: true }));
+        return true;
+    }
+
     // ---------------------------------------------------------- component
 
     function pilotDevices(deps) {
@@ -557,6 +578,34 @@
             },
             cancelRename() { this.editingId = null; this.editName = ''; return true; },
 
+            // A device's name lives in TWO tables on a rustdesk-api server, and
+            // renaming here only ever wrote one of them. Measured on a live
+            // v2.7: peer row 1 carried alias "alpha-host" while the address-book row
+            // for the same id 100000001 still carried alias "" -- so a device
+            // renamed on this tab kept its old name on the Address Book tab
+            // forever. The server will not reconcile them; nothing does.
+            //
+            // So the rename writes both. It is a SECOND request and it is
+            // allowed to fail: the device rename has already succeeded and must
+            // not be reported as failed because the address-book half did not
+            // apply. The commonest reason it does not apply is the honest one --
+            // this device simply is not in the selected book, which the server
+            // answers with 400 and, verified against the live server, WITHOUT
+            // creating a row. That is why no membership pre-check is needed.
+            async renameInBook(id, name) {
+                if (!this.hasBook()) return false;
+                const api = this.api;
+                if (!api || !api.addressbook || typeof api.addressbook.updatePeer !== 'function')
+                    return false;
+                try {
+                    await api.addressbook.updatePeer(this.book, { id: id, alias: name });
+                } catch (e) {
+                    return false;
+                }
+                emitAddressBookChanged(this.book, this.doc || (root ? root.document : null));
+                return true;
+            },
+
             async commitRename() {
                 const id = this.editingId;
                 const row = this.rows.filter((r) => r.id === id)[0];
@@ -575,7 +624,10 @@
                     row.name = v.value;
                     this.state.rows = this.rows.slice();
                     this.actionError = null;
-                    this.notice = 'Renamed to ' + v.value + '.';
+                    const alsoBook = await this.renameInBook(id, v.value);
+                    this.notice = alsoBook
+                        ? 'Renamed to ' + v.value + ' here and in the address book.'
+                        : 'Renamed to ' + v.value + '.';
                     this.cancelRename();
                     return true;
                 } catch (e) {
@@ -648,6 +700,7 @@
                     await this.api.devices.addToAddressBook(id, ab);
                     this.actionError = null;
                     this.notice = id + ' added to the address book.';
+                    emitAddressBookChanged(ab, this.doc || (root ? root.document : null));
                     return true;
                 } catch (e) {
                     this.actionError = e;
@@ -808,6 +861,7 @@
         filterRows, sortRows, validName,
         newStore, newSurfaceState, stateFor, rememberState,
         serverChangedDetail, emitServerChanged, errorMessage,
+        AB_CHANGED_EVENT, emitAddressBookChanged,
         pilotDevices, mount
     };
     root.PilotDevicesUi = PilotDevicesUi;
