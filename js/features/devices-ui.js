@@ -147,17 +147,38 @@
         };
     }
 
+    // MEASURED against a real rustdesk-api v2.7, sampling every 12s for two
+    // minutes: peers refresh last_online_time every 30-36 seconds, and a
+    // genuinely offline machine sat at 348s and climbing. 120s is four missed
+    // beats -- generous enough to absorb jitter and a dropped heartbeat or two,
+    // far short of anything that looks dead.
+    const ONLINE_WINDOW_MS = 120000;
+
     function deviceRow(raw, nowMs) {
         const r = (raw && typeof raw === 'object') ? raw : {};
         const id = clean(firstStr(r, ['id', 'device_id', 'deviceId', 'guid', 'rid']));
-        const lastSeenMs = toMillis(pick(r, ['last_online', 'lastOnline', 'last_seen',
-            'lastSeen', 'updated_at', 'updatedAt']));
+        // last_online_time is the field this server actually sends, and it was
+        // missing here -- so lastSeen fell through to updated_at, which is when
+        // the DB row changed, not when the device was last heard from.
+        const lastSeenMs = toMillis(pick(r, ['last_online_time', 'last_online', 'lastOnline',
+            'last_seen', 'lastSeen', 'updated_at', 'updatedAt']));
+        // An explicit field from the server always wins. Where there is none --
+        // and rustdesk-api v2.7 sends none, its peer rows carry no online field
+        // at all -- freshness is the only evidence there is. The old code read
+        // four names that this server never sends and reported every device
+        // OFFLINE, which is not "declining to guess": it is stating the fact
+        // wrongly, with confidence, on every row.
+        const stated = pick(r, ['online', 'is_online', 'isOnline', 'status']);
+        const heard = lastSeenMs > 0 && (nowMs - lastSeenMs) <= ONLINE_WINDOW_MS;
         return {
             id: id,
             name: clean(firstStr(r, ['alias', 'name', 'hostname', 'device_name', 'devicename'])) || id,
-            // Only what the server told us. Inferring "online" from a recent
-            // heartbeat would invent the one fact this surface exists to report.
-            online: booleanish(pick(r, ['online', 'is_online', 'isOnline', 'status'])),
+            online: (stated === undefined || stated === null || stated === '')
+                ? heard : booleanish(stated),
+            // Which of the two answered, so the surface can say "last heard
+            // from 20s ago" rather than implying the server asserted it.
+            onlineFrom: (stated === undefined || stated === null || stated === '')
+                ? 'heartbeat' : 'server',
             lastSeenMs: lastSeenMs,
             lastSeenText: relativeTime(lastSeenMs, nowMs),
             ip: clean(firstStr(r, ['ip', 'last_ip', 'lastIp', 'remote_ip'])) || DASH,
@@ -769,6 +790,7 @@
     root.pilotDevices = pilotDevices;
 
     const PilotDevicesUi = {
+        ONLINE_WINDOW_MS,
         MOUNT_ID, SERVER_CHANGED_EVENT, TEMPLATE, DASH, MAX_NAME, SORT_KEYS,
         toMillis, relativeTime, normalizeList, deviceRow, deviceRows,
         filterRows, sortRows, validName,

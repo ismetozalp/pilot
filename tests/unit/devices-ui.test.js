@@ -169,14 +169,35 @@ test('deviceRow: alternative field names every API build has used', () => {
     assert.equal(r.version, '1.2.0');
 });
 
-test('deviceRow: online is only what the server said, never guessed from last seen', () => {
-    // The whole point of the surface is genuine heartbeat state (spec 7.2).
-    const r = D.deviceRow({ id: 'x', last_online: Math.floor(NOW / 1000) }, NOW);
-    assert.equal(r.online, false);
+test('deviceRow: the server is believed when it speaks, and the heartbeat when it does not', () => {
+    // CORRECTED. This used to assert that a fresh heartbeat must NOT make a
+    // device online -- "the whole point of the surface is genuine heartbeat
+    // state (spec 7.2)". The intent was right and the implementation inverted
+    // it: rustdesk-api v2.7 peer rows carry no online field of any kind, so
+    // "only what the server said" meant "always offline", and the Overview
+    // reported 4 devices, 0 online while the user had machines connected.
+    // Deriving from the heartbeat IS reporting genuine heartbeat state; it is
+    // the only place that state exists.
+    const fresh = D.deviceRow({ id: 'x', last_online: Math.floor(NOW / 1000) }, NOW);
+    assert.equal(fresh.online, true, 'a device heard from seconds ago is online');
+    assert.equal(fresh.onlineFrom, 'heartbeat');
+    const stale = D.deviceRow({ id: 'x', last_online: Math.floor(NOW / 1000) - 3600 }, NOW);
+    assert.equal(stale.online, false, 'an hour of silence is not online');
+
+    // An explicit field still wins, and the coercion is unchanged.
     assert.equal(D.deviceRow({ id: 'x', online: 'true' }, NOW).online, true);
     assert.equal(D.deviceRow({ id: 'x', online: 'ONLINE' }, NOW).online, true);
-    for (const v of [0, '0', 'false', '', 'maybe', null, undefined, {}, [], 2])
+    assert.equal(D.deviceRow({ id: 'x', online: 'true' }, NOW).onlineFrom, 'server');
+    for (const v of [0, '0', 'false', 'maybe', {}, [], 2])
         assert.equal(D.deviceRow({ id: 'x', online: v }, NOW).online, false, String(v));
+    // '', null and undefined are "the server said nothing", not "offline" --
+    // with no timestamp either, the answer is still false.
+    for (const v of ['', null, undefined])
+        assert.equal(D.deviceRow({ id: 'x', online: v }, NOW).online, false, String(v));
+    // ...but they must not suppress a good heartbeat.
+    for (const v of ['', null, undefined])
+        assert.equal(D.deviceRow({ id: 'x', online: v, last_online: Math.floor(NOW / 1000) }, NOW).online,
+            true, String(v));
 });
 
 test('deviceRow: unknown values are a dash, not an empty cell or "undefined"', () => {
@@ -869,4 +890,67 @@ test('a null selection (fresh load) still takes the default -- "" is a real guid
     assert.equal(c.book, null, 'null means nothing chosen yet; "" means the personal book');
     await c.loadBooks();
     assert.equal(c.book, '');
+});
+
+// ------------------- online/offline: the server sends no such field at all
+
+test('online is derived from last_online_time, because v2.7 sends no online field', () => {
+    // FROM THE FIELD: the Overview read "Devices 4, Online 0, Offline 4" while
+    // the user had machines connected and visible in the RustDesk client. The
+    // mapper looked for online/is_online/isOnline/status -- a real v2.7 peer row
+    // carries NONE of them:
+    //   row_id, id, cpu, hostname, memory, os, username, uuid, version,
+    //   user_id, last_online_time, last_online_ip, group_id, alias,
+    //   created_at, updated_at
+    // so every device came back false. That is not declining to guess; it is
+    // stating the fact wrongly, with confidence, on every row.
+    const now = 1786007000000;
+    const at = (secondsAgo) => ({ id: 'p' + secondsAgo, hostname: 'h' + secondsAgo,
+        last_online_time: (now / 1000) - secondsAgo });
+    const rows = D.deviceRows({ code: 0, data: { list: [at(5), at(30), at(115), at(348)],
+        page: 1, total: 4, page_size: 50 } }, now);
+    assert.deepEqual(rows.map((r) => r.online), [true, true, true, false],
+        'measured on a real server: heartbeats land every 30-36s, and the offline ' +
+        'machine sat at 348s');
+    rows.forEach((r) => assert.equal(r.onlineFrom, 'heartbeat'));
+});
+
+test('an explicit online field from the server always beats the heartbeat', () => {
+    // A future server that answers the question directly must be believed --
+    // including when it says a recently-heard-from device is offline.
+    const now = 1786007000000;
+    const fresh = (now / 1000) - 5;
+    const rows = D.deviceRows({ code: 0, data: { list: [
+        { id: 'a', online: false, last_online_time: fresh },
+        { id: 'b', online: true, last_online_time: (now / 1000) - 9999 },
+        { id: 'c', is_online: 1, last_online_time: (now / 1000) - 9999 }
+    ], page: 1, total: 3, page_size: 50 } }, now);
+    assert.deepEqual(rows.map((r) => r.online), [false, true, true]);
+    rows.forEach((r) => assert.equal(r.onlineFrom, 'server'));
+});
+
+test('with no timestamp at all a device is offline, not optimistically online', () => {
+    const now = 1786007000000;
+    const rows = D.deviceRows({ code: 0, data: { list: [
+        { id: 'a' }, { id: 'b', last_online_time: 0 }, { id: 'c', last_online_time: 'nonsense' }
+    ], page: 1, total: 3, page_size: 50 } }, now);
+    assert.deepEqual(rows.map((r) => r.online), [false, false, false]);
+});
+
+test('lastSeen comes from last_online_time, not from updated_at', () => {
+    // last_online_time was missing from the pick list, so lastSeen fell through
+    // to updated_at -- when the DB row changed, not when the device was heard
+    // from. The two differ by minutes on a real server.
+    const now = 1786007000000;
+    const rows = D.deviceRows({ code: 0, data: { list: [{
+        id: 'a', last_online_time: (now / 1000) - 60, updated_at: '2020-01-01 00:00:00'
+    }], page: 1, total: 1, page_size: 50 } }, now);
+    assert.equal(rows[0].lastSeenMs, now - 60000, 'the heartbeat, not the row mtime');
+    assert.equal(rows[0].online, true);
+});
+
+test('the window is a stated constant, not a magic number buried in a comparison', () => {
+    assert.equal(typeof D.ONLINE_WINDOW_MS, 'number');
+    assert.ok(D.ONLINE_WINDOW_MS >= 90000 && D.ONLINE_WINDOW_MS <= 300000,
+        'must absorb several missed 30-36s heartbeats without calling a dead peer online');
 });
