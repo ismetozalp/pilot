@@ -5,7 +5,11 @@ All notable changes to Pilot are recorded here. The format follows
 [semantic versioning](https://semver.org/) — `VERSION` is the single source of
 truth, read by the Makefile and by the self-updater.
 
-## Unreleased
+## 1.0.0 — 2026-08-07
+
+First stable release. Everything below was found by running Pilot against a real
+deployment rather than by review: four devices, a remote EC2 target, and a
+RustDesk client that would not connect.
 
 ### Changed
 
@@ -23,7 +27,6 @@ truth, read by the Makefile and by the self-updater.
   on any typo, so a book could hold `laptop` and `Laptop` as separate tags with
   nothing on screen to reveal it. With no tags yet, both controls say so and offer
   the action that creates one.
-
 - **The browser web client is disabled at provision time** (`app.web-client: 0`).
   The client bundled with `rustdesk-api` v2.7 latency-probes a hardcoded list of
   `rustdesk.com` servers and overwrites the stored rendezvous server with the
@@ -36,7 +39,6 @@ truth, read by the Makefile and by the self-updater.
   and opens `/_admin/`. It previously pointed at the site root, which redirects
   to the admin console anyway — so the button had never opened the web client,
   and now says so.
-
 - **A Settings tab**, with the update repository for each of the three components
   Pilot installs: Pilot itself (`ismetozalp/pilot`), the API server
   (`lejianwen/rustdesk-api`) and the RustDesk server (`wy414012/rustdesk-server`).
