@@ -25,7 +25,8 @@
         { id: 'addressbook', label: 'Address Book', mount: 'pilot-addressbook' },
         { id: 'users',       label: 'Users',        mount: 'pilot-users' },
         { id: 'audit',       label: 'Audit',        mount: 'pilot-audit' },
-        { id: 'server-ops',  label: 'Server Ops',   mount: 'pilot-server-ops' }
+        { id: 'server-ops',  label: 'Server Ops',   mount: 'pilot-server-ops' },
+        { id: 'settings',    label: 'Settings',     mount: 'pilot-settings' }
     ];
 
     // app.js has no string coercion of its own; the TLS endpoint decision below

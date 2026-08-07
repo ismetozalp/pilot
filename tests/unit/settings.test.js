@@ -18,7 +18,15 @@ test('module loads with no cockpit global — the pure half must run under node'
 test('the documented defaults are exactly §11.3', () => {
     assert.deepEqual(S.DEFAULTS, {
         ui: { theme: 'system' },
-        update: { repo: 'ismetozalp/pilot', checkOnStartup: true }
+        // Three components, three upstreams: Pilot, the API server, and the
+        // hbbs/hbbr pair. Each defaults to what Pilot actually installs, so a
+        // fresh install can check for updates before being configured.
+        update: {
+            repo: 'ismetozalp/pilot',
+            apiRepo: 'lejianwen/rustdesk-api',
+            serverRepo: 'wy414012/rustdesk-server',
+            checkOnStartup: true
+        }
     });
     assert.equal(S.REL_PATH, '.config/cockpit/pilot/settings.json');
     assert.equal(S.REL_DIR, '.config/cockpit/pilot');
@@ -88,7 +96,12 @@ test('merge keeps valid values and replaces only the invalid leaf', () => {
     const out = S.merge({ ui: { theme: 'a/b' }, update: { repo: 'me/mine', checkOnStartup: false } });
     assert.deepEqual(out, {
         ui: { theme: 'system' },
-        update: { repo: 'me/mine', checkOnStartup: false }
+        update: {
+            repo: 'me/mine',
+            apiRepo: S.DEFAULTS.update.apiRepo,
+            serverRepo: S.DEFAULTS.update.serverRepo,
+            checkOnStartup: false
+        }
     });
 });
 
@@ -101,7 +114,12 @@ test('merge drops unknown keys so a newer Pilot cannot inject surprises into an 
     });
     assert.deepEqual(out, {
         ui: { theme: 'nord' },
-        update: { repo: 'me/mine', checkOnStartup: true }
+        update: {
+            repo: 'me/mine',
+            apiRepo: S.DEFAULTS.update.apiRepo,
+            serverRepo: S.DEFAULTS.update.serverRepo,
+            checkOnStartup: true
+        }
     });
     assert.equal(out.secrets, undefined);
     // §11.3: this file NEVER contains secrets — they stay in the 0600 files of §5.
@@ -165,7 +183,12 @@ test('parse accepts the real thing, including a trailing newline', () => {
     const good = '{"ui":{"theme":"gruvbox"},"update":{"repo":"me/mine","checkOnStartup":false}}\n';
     assert.deepEqual(S.parse(good), {
         ui: { theme: 'gruvbox' },
-        update: { repo: 'me/mine', checkOnStartup: false }
+        update: {
+            repo: 'me/mine',
+            apiRepo: S.DEFAULTS.update.apiRepo,
+            serverRepo: S.DEFAULTS.update.serverRepo,
+            checkOnStartup: false
+        }
     });
 });
 
@@ -176,7 +199,12 @@ test('parse rejects non-string input', () => {
 });
 
 test('serialize round-trips through parse and ends with a newline', () => {
-    const value = { ui: { theme: 'rosepine' }, update: { repo: 'a/b', checkOnStartup: false } };
+    const value = { ui: { theme: 'rosepine' }, update: {
+        repo: 'a/b',
+        apiRepo: S.DEFAULTS.update.apiRepo,
+        serverRepo: S.DEFAULTS.update.serverRepo,
+        checkOnStartup: false
+    } };
     const text = S.serialize(value);
     assert.ok(text.endsWith('\n'), 'a config file is a text file');
     assert.deepEqual(S.parse(text), value);
@@ -227,4 +255,48 @@ test('write() reports a clear PilotError when Cockpit is absent', () => {
             assert.equal(e.kind, 'GENERIC');
             assert.match(e.message, /Cockpit/);
         });
+});
+
+
+// ================================ three components, three upstreams
+//
+// Pilot installs three separate things from three separate repos, and they are
+// easy to conflate -- the fork switched yesterday was hbbs/hbbr only, while the
+// API has always been upstream. Each gets its own setting so an update check
+// asks the right project, and so returning hbbs/hbbr to the official repo is a
+// setting rather than a code edit.
+
+test('each component has its own repo, and they are genuinely different', () => {
+    const u = S.DEFAULTS.update;
+    assert.equal(u.repo, 'ismetozalp/pilot', 'Pilot itself');
+    assert.equal(u.apiRepo, 'lejianwen/rustdesk-api', 'the API, admin console and address book');
+    assert.equal(u.serverRepo, 'wy414012/rustdesk-server', 'hbbs/hbbr -- currently a fork');
+    assert.equal(new Set([u.repo, u.apiRepo, u.serverRepo]).size, 3,
+        'three components must not share one repo setting');
+});
+
+test('the server repo default matches what provisioning actually installs', () => {
+    // A settings default that disagrees with the installer would check for
+    // updates against a project the user does not run.
+    const OT = require('../../js/core/ostarget.js');
+    assert.equal(S.DEFAULTS.update.serverRepo, OT.SERVER_UPSTREAM,
+        'settings and ostarget.js must name the same upstream');
+});
+
+test('clearing a repo sticks -- it means "do not check this one"', () => {
+    // Falling back to the default would make the field impossible to clear.
+    const out = S.merge({ update: { repo: '', apiRepo: '', serverRepo: '' } });
+    assert.equal(out.update.repo, '');
+    assert.equal(out.update.apiRepo, '');
+    assert.equal(out.update.serverRepo, '');
+});
+
+test('an unusable repo still falls back, per field', () => {
+    for (const bad of ['../etc', 'a/b/c', 'one', 'a b/c', 'a/b\n', 42, null]) {
+        const out = S.merge({ update: { apiRepo: bad } });
+        assert.equal(out.update.apiRepo, S.DEFAULTS.update.apiRepo, JSON.stringify(bad));
+        // ...and it must not take the others down with it.
+        assert.equal(out.update.repo, S.DEFAULTS.update.repo);
+        assert.equal(out.update.serverRepo, S.DEFAULTS.update.serverRepo);
+    }
 });

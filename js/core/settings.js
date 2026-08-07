@@ -19,11 +19,28 @@
     // attack, and parsing it would only turn a broken file into a slow broken file.
     const MAX_BYTES = 64 * 1024;
 
+    // Three separate components, three separate upstreams. They are NOT
+    // interchangeable and conflating them is easy:
+    //
+    //   repo        Pilot itself, this Cockpit plugin.
+    //   apiRepo     rustdesk-api -- the API, admin console and address book.
+    //   serverRepo  hbbs/hbbr -- the ID/rendezvous and relay daemons. Currently a
+    //               FORK, because official hbbs cannot serve a signed-in client
+    //               >= 1.4.1 (see README, "Why the server is a fork"). Having it
+    //               here makes going back to rustdesk/rustdesk-server a setting
+    //               rather than a code edit.
+    //
+    // Each defaults to what Pilot actually installs today, so a fresh install can
+    // check for updates without being configured first. Clearing any one of them
+    // disables update checking for that component only.
     const DEFAULTS = {
         ui: { theme: 'system' },
-        // Pilot's own upstream, so a fresh install can offer updates without being
-        // configured first. Clearing this disables update checking entirely.
-        update: { repo: 'ismetozalp/pilot', checkOnStartup: true }
+        update: {
+            repo: 'ismetozalp/pilot',
+            apiRepo: 'lejianwen/rustdesk-api',
+            serverRepo: 'wy414012/rustdesk-server',
+            checkOnStartup: true
+        }
     };
 
     // Validation is by exclusion, not by an anchored regex: in JavaScript `$` also
@@ -71,7 +88,7 @@
     }
 
     // Pure: project a stored document onto the documented shape. Always returns a
-    // FRESH object with exactly three leaves — unknown keys are dropped, and each
+    // FRESH object with exactly the documented leaves — unknown keys are dropped, and each
     // invalid leaf falls back on its own so one bad theme does not also reset the
     // update repo. Nothing from `stored` is retained by reference.
     function merge(stored) {
@@ -79,11 +96,22 @@
         const update = pick(stored, 'update');
         const theme = pick(ui, 'theme');
         const repo = pick(update, 'repo');
+        const apiRepo = pick(update, 'apiRepo');
+        const serverRepo = pick(update, 'serverRepo');
         const check = pick(update, 'checkOnStartup');
+        // An empty string is a deliberate "do not check this component", so it is
+        // preserved rather than replaced by the default -- otherwise clearing a
+        // field could never stick. Anything else invalid still falls back.
+        const repoOr = function (v, dflt) {
+            if (v === '') return '';
+            return isSafeRepo(v) ? v : dflt;
+        };
         return {
             ui: { theme: isSafeTheme(theme) ? theme : DEFAULTS.ui.theme },
             update: {
-                repo: isSafeRepo(repo) ? repo : DEFAULTS.update.repo,
+                repo: repoOr(repo, DEFAULTS.update.repo),
+                apiRepo: repoOr(apiRepo, DEFAULTS.update.apiRepo),
+                serverRepo: repoOr(serverRepo, DEFAULTS.update.serverRepo),
                 // Strict boolean: a hand-edited "false" must not read as true.
                 checkOnStartup: typeof check === 'boolean' ? check : DEFAULTS.update.checkOnStartup
             }
