@@ -18,7 +18,9 @@ Two jobs, one screen:
   on this machine or on a remote host over SSH. Every step is also available as a
   shell script you can read and run yourself.
 * **Day-2 management.** Devices, address books, users and groups, audit logs, service
-  status and restarts, key rotation, and a self-update from GitHub releases.
+  status and restarts, key rotation, and updates: Pilot updates itself from GitHub
+  releases, and Server Ops updates the API server and the RustDesk server on the
+  target after checking what is actually installed there.
 
 ## What it needs
 
@@ -30,9 +32,10 @@ Two jobs, one screen:
 | Privilege | The wizard asks Cockpit for administrative access; nothing runs as root until you grant it |
 
 TLS is optional and offered in three tiers: your own domain, an automatic
-`sslip.io` hostname, or DuckDNS. Choosing one installs and configures Caddy on
-443 and enables the browser-based web client. Skipping it is a supported choice —
-the reason the web client stays disabled is then shown on the Overview screen.
+`sslip.io` hostname, or DuckDNS. Choosing one installs and configures Caddy on 443,
+which is what makes the API reachable over `https://` and the admin console
+linkable from Overview. Skipping it is a supported choice — Overview then says
+exactly why the console cannot be opened, and offers the route to set TLS up.
 
 ## Why the browser web client is disabled
 
@@ -151,7 +154,7 @@ beside the server record, never inside it.
 Five tiers, all runnable from a checkout:
 
 ```sh
-npm test                 # ~1450 unit tests (node:test), no browser, ~1.5s
+npm test                 # ~1650 unit tests (node:test), no browser, ~2s
 npm run test:integration # pilot-exec against real podman containers, ~30s
 npm run test:smoke       # 8 structural rules (C7 order, dual exports, CSP, …)
 npm run test:e2e         # Playwright against index.html + a stubbed bridge
@@ -161,8 +164,7 @@ npm run test:live        # Playwright against a REAL Cockpit on localhost:9090
 `test:e2e` needs `make vendor` to have run and skips cleanly with a printed reason
 if chromium is unavailable (`PILOT_E2E_REQUIRE=1` turns that skip into a failure).
 `test:live` is opt-in: it needs Pilot installed, Cockpit listening on 9090, and
-credentials in `COCKPIT_USER`/`COCKPIT_PASSWORD` or
-`~/.config/.claude/cockpit-credentials.json`. It asserts state only — it never
+credentials in `COCKPIT_USER`/`COCKPIT_PASSWORD`. It asserts state only — it never
 installs anything, never runs `sudo`, and restores your
 `~/.config/cockpit/pilot/settings.json` when it is done.
 
@@ -174,7 +176,7 @@ installs anything, never runs `sudo`, and restores your
 | `/etc/pilot/servers/<id>.json` | one record per managed server — never a secret |
 | `/etc/pilot/servers/<id>.{ssh,token}` | 0600 root-only credential sidecars |
 | `/var/lib/pilot/runs/<run-id>.jsonl` | the transcript of each provisioning run |
-| `~/.config/cockpit/pilot/settings.json` | per-user settings: theme, update repo |
+| `~/.config/cockpit/pilot/settings.json` | per-user settings: theme, and the update repository for each of Pilot, the API server and the RustDesk server |
 
 ## Licence
 
