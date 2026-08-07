@@ -160,3 +160,28 @@ test('the template renders every field, its explanation and its error slot', () 
     assert.ok(spinner && !/x-show/.test(spinner[0]), 'the spinner must be x-if, not x-show');
     assert.ok(t.indexOf('x-html') === -1, 'no x-html anywhere');
 });
+
+
+// ============ FIELD REPORT: "where is the check for update and update buttons"
+//
+// The tab showed three repositories and no way to act on any of them. The fields
+// choose WHERE Pilot looks; they do not perform an update. Pilot updates itself
+// from the header badge, and the two server-side components are day-2 operations
+// on a remote host, so they live on Server Ops with the other ones -- but
+// nothing on this page said so.
+
+test('the tab explains where each update is actually applied', () => {
+    const t = UI.TEMPLATE;
+    assert.match(t, /Applying updates/, 'the page must answer "so where do I click"');
+    assert.match(t, /version badge/, 'Pilot updates itself from the header');
+    assert.match(t, /Server Ops/, 'the two server-side components are day-2 operations');
+    assert.match(t, /Check for updates/, 'and it names the action to run first');
+});
+
+test('the page routes to Server Ops rather than only describing it', () => {
+    const t = UI.TEMPLATE;
+    assert.match(t, /data-testid="settings-goto-ops"/);
+    // A generic tab event, not the wizard-specific one: this is not the wizard.
+    assert.match(t, /pilot:open-tab/);
+    assert.match(t, /id: 'server-ops'/);
+});

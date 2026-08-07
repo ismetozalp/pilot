@@ -273,6 +273,33 @@
         '              @click="resetDefaults()" :disabled="busy">Restore defaults</button>',
         '    </div>',
         '  </div>',
+        '',
+        // These fields say WHERE to look for updates; they do not perform one.
+        // Without this the operator is left on a page full of repositories with
+        // no way to act on them -- which is exactly what happened: "where is the
+        // check for update and update buttons for these 2". Pilot updates itself
+        // from the badge in the header; the two server-side components are day-2
+        // operations on a remote host, so they live with the other ones.
+        '  <div class="card">',
+        '    <div class="card-body">',
+        '      <h3 class="h6">Applying updates</h3>',
+        '      <p class="text-secondary small mb-2">',
+        '        These fields choose where Pilot looks. To actually check and install:',
+        '      </p>',
+        '      <ul class="small mb-3">',
+        '        <li><strong>Pilot</strong> updates itself — the version badge in the header',
+        '            checks and applies it.</li>',
+        '        <li><strong>The API server</strong> and <strong>the RustDesk server</strong> run on',
+        '            the target host, so they are updated from Server Ops:',
+        '            <em>Check for updates</em>, then <em>Update API server</em> or',
+        '            <em>Update RustDesk server</em>.</li>',
+        '      </ul>',
+        '      <button type="button" class="btn btn-sm btn-outline-primary"',
+        '              data-testid="settings-goto-ops"',
+        '              @click="$dispatch(\'pilot:open-tab\', { id: \'server-ops\' })">',
+        '        Go to Server Ops</button>',
+        '    </div>',
+        '  </div>',
         '</div>'
     ].join('\n');
 

@@ -660,6 +660,8 @@
             unitStates: [],          // [{key,unit,label,state}] from the last 'status' run
             updates: {},              // { 'update-api': {latest,url,sha256,installed,stamp} }
             installed: { arch: '', api: '', hbbs: '' },
+            checked: false,           // has a check actually completed?
+            checkedRepos: {},         // which repo each component was checked against
             relaySessions: [],        // from the last 'relay-log' run
             relaySummary: null,
             output: {}               // free-text output per op id (doctor/recheck-ports/rotate-key)
@@ -879,8 +881,20 @@
 
             reasonBlocked: function (opId) {
                 if (!this.server) return 'No server is configured yet.';
-                if ((opId === 'update-api' || opId === 'update-server') && !this.updateAvailable(opId))
-                    return 'Run "Check for updates" first — nothing is known about newer releases yet.';
+                // "No check has run" and "you are already current" both leave the
+                // button disabled, and they are NOT the same fact -- one is a
+                // thing to do, the other is a result. Reported as one sentence
+                // they read as a fault; the operator asked outright which it was.
+                if ((opId === 'update-api' || opId === 'update-server') && !this.updateAvailable(opId)) {
+                    if (!this.checked)
+                        return 'Run "Check for updates" first — nothing is known about newer releases yet.';
+                    const have = (opId === 'update-api') ? this.installed.api : this.installed.hbbs;
+                    if (!have) return 'This component is not installed on the server.';
+                    if (!this.checkedRepos[opId])
+                        return 'No repository is configured for this component — set one on the Settings tab.';
+                    return 'Already at the latest release (' + have + ') in ' +
+                        this.checkedRepos[opId] + '.';
+                }
                 const op = findOp(opId);
                 if (!op) return 'Unknown operation.';
                 if (op.needsCredential && this.server.hasCredential !== true)
@@ -1031,6 +1045,8 @@
                         url: asset.url, sha256: asset.sha256, stamp: stamp };
                 }
                 this.updates = found;
+                this.checkedRepos = { 'update-api': repos.api, 'update-server': repos.server };
+                this.checked = true;
                 return true;
             },
 
@@ -1210,7 +1226,13 @@
         '              </template>',
         '              <span x-text="opLabel(op)"></span>',
         '            </button>',
-        '            <div class="small text-secondary" x-show="!isOpAllowed(op.id)"',
+        // Shown whenever the button is disabled, not only when the op is
+        // disallowed. The update ops ARE allowed -- they have a credential --
+        // and are disabled for a different reason, so this condition rendered
+        // nothing and the operator got a greyed-out button with no explanation.
+        // Excluded while running: "why can't I click this" is answered by the
+        // spinner then, not by a sentence.
+        '            <div class="small text-secondary" x-show="opDisabled(op.id) && !isBusy(op.id)"',
         '                 :data-testid="\'op-\' + op.id + \'-reason\'" x-text="reasonBlocked(op.id)"></div>',
         '          </div>',
         '        </template>',

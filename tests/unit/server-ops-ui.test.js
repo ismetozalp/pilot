@@ -1355,3 +1355,52 @@ test('the report renders only after a check, and never claims "up to date" befor
     assert.match(t, /updates\[op\.id\]\.latest/);
     assert.match(t, /updates\[op\.id\]\.repo/, 'and which repository it came from');
 });
+
+
+// ========== FIELD REPORT: "they are disabled right now is it because they are on the latest?"
+//
+// Exactly the question a disabled button with no explanation provokes. Two very
+// different facts produced the identical greyed-out control: "no check has run"
+// (a thing to do) and "you are already current" (a result). And the reason line
+// was gated on !isOpAllowed(), which is FALSE for these ops -- they are allowed,
+// they hold a credential -- so nothing was rendered at all.
+
+test('the blocked reason distinguishes "not checked yet" from "already current"', () => {
+    const c = S.serverOpsUi({});
+    c.server = { id: 's', transport: 'ssh', host: 'h', hasCredential: true };
+
+    assert.match(c.reasonBlocked('update-api'), /Check for updates/,
+        'before a check, name the action that resolves it');
+
+    c.checked = true;
+    c.installed = { arch: 'aarch64', api: '2.7', hbbs: '1.4.3' };
+    c.checkedRepos = { 'update-api': 'lejianwen/rustdesk-api', 'update-server': 'wy414012/rustdesk-server' };
+    const api = c.reasonBlocked('update-api');
+    assert.match(api, /Already at the latest release/, 'after a check, report the result');
+    assert.match(api, /2\.7/, 'and say which version that is');
+    assert.match(api, /lejianwen\/rustdesk-api/, 'and which repository was consulted');
+    assert.match(c.reasonBlocked('update-server'), /1\.4\.3/);
+});
+
+test('a component that is absent or unconfigured says so, not "already current"', () => {
+    const c = S.serverOpsUi({});
+    c.server = { id: 's', transport: 'ssh', host: 'h', hasCredential: true };
+    c.checked = true;
+    c.installed = { arch: 'aarch64', api: '', hbbs: '1.4.3' };
+    c.checkedRepos = { 'update-api': 'a/b', 'update-server': 'c/d' };
+    assert.match(c.reasonBlocked('update-api'), /not installed/,
+        'claiming an absent component is up to date would be a lie');
+    c.installed.api = '2.7';
+    c.checkedRepos['update-api'] = '';
+    assert.match(c.reasonBlocked('update-api'), /No repository is configured/);
+    assert.match(c.reasonBlocked('update-api'), /Settings/, 'and where to fix it');
+});
+
+test('the reason renders whenever the button is disabled, not only when disallowed', () => {
+    const t = S.TEMPLATE;
+    // The bug: these ops ARE allowed (they hold a credential) and are disabled
+    // for a different reason, so a condition on isOpAllowed rendered nothing.
+    assert.match(t, /x-show="opDisabled\(op\.id\) && !isBusy\(op\.id\)"/);
+    assert.ok(!/x-show="!isOpAllowed\(op\.id\)"/.test(t),
+        'gating on isOpAllowed alone leaves the update ops unexplained');
+});

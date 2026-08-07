@@ -28,6 +28,7 @@
 <div class="pilot-shell" x-data="pilotApp()" x-cloak
      @pilot:server-changed.document="switchServer($event.detail.id)"
      @pilot:open-wizard.document="openWizard($event.detail)"
+     @pilot:open-tab.document="openTab($event.detail)"
      @pilot:credentials-changed.document="reloadCredentials()">
 
     <div class="pilot-header d-flex align-items-center gap-3">

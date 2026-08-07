@@ -279,6 +279,17 @@
                 return this.tab;
             },
 
+            // A surface asking to hand the operator to another tab. Deliberately
+            // narrow: only a tab that EXISTS is honoured, so a stale or hostile
+            // event cannot blank the shell by selecting a tab with no mount.
+            // 'pilot:open-wizard' predates this and stays as-is -- it also carries
+            // a step, which js/features/setup-ui.js listens for separately.
+            openTab(detail) {
+                const id = (detail && typeof detail.id === 'string') ? detail.id : '';
+                for (const t of TABS) if (t.id === id) return this.selectTab(id);
+                return this.tab;
+            },
+
             // wireApi() reads the registry over Cockpit channels, and a channel
             // that never opens also never errors -- so this button could sit on
             // "Reconnecting…" forever with nothing in the console, which is

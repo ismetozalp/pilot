@@ -671,3 +671,29 @@ test('no x-show sits on a Bootstrap display utility — !important beats inline 
     assert.deepEqual(offenders, [],
         'x-show cannot hide an element whose display is set !important by a utility class');
 });
+
+
+test('openTab honours a real tab and ignores anything else', () => {
+    // A surface handing the operator to another tab. Narrow on purpose: a tab id
+    // with no mount point would blank the shell, so only declared tabs are
+    // honoured and anything else leaves the current tab alone.
+    const app = App.pilotApp();
+    app.apiReady = true;
+    const start = app.tab;
+    assert.equal(app.openTab({ id: 'server-ops' }), 'server-ops');
+    assert.equal(app.openTab({ id: 'settings' }), 'settings');
+    for (const bad of [null, undefined, {}, { id: '' }, { id: 'nope' }, { id: 42 }]) {
+        const before = app.tab;
+        assert.equal(app.openTab(bad), before, JSON.stringify(bad) + ' must not move the shell');
+    }
+    assert.notEqual(start, undefined);
+});
+
+test('every tab the shell declares has a mount point in index.html', () => {
+    // openTab() trusts TABS; if a declared tab had no mount, selecting it would
+    // render an empty page and look like a crash.
+    const html = fs.readFileSync(path.join(__dirname, '../../index.html'), 'utf8');
+    for (const t of App.TABS)
+        assert.ok(html.indexOf('id="' + t.mount + '"') !== -1,
+            t.id + ' declares mount ' + t.mount + ' which index.html does not contain');
+});
