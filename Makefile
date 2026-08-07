@@ -13,7 +13,7 @@ ALPINE_URL = https://cdn.jsdelivr.net/npm/alpinejs@3.14.9/dist/cdn.min.js
 BOOTSTRAP_JS_URL = https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js
 BOOTSTRAP_CSS_URL = https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css
 
-FILES = manifest.json index.html VERSION Makefile README.md CHANGELOG.md css js html libexec
+FILES = manifest.json index.html VERSION Makefile README.md CHANGELOG.md LICENSE css js html libexec
 
 .PHONY: all help version test install uninstall zip publish vendor clean
 
