@@ -11,6 +11,8 @@ that gives them a control plane.
 > [Why the server is a fork](#why-the-server-is-a-fork) — this is temporary and
 > Pilot moves back to the official repo as soon as upstream is fixed.
 
+![Pilot's Devices tab: four devices with online state, last seen, address and platform](screenshots/devices.png)
+
 Two jobs, one screen:
 
 * **Provisioning.** A wizard that detects the target, shows you the exact plan it
@@ -103,6 +105,24 @@ Already-provisioned servers are upgraded in place with the distribution packages
 the release zip; the `id_ed25519` keypair in `/var/lib/rustdesk-server` is untouched
 by the swap, so no client needs reconfiguring in either direction.
 
+## What it looks like
+
+Every image below is generated from `tests/screenshots.mjs`, which drives the same
+stubbed harness the end-to-end tests use. The data is fictional — RFC 2606
+hostnames, RFC 5737 addresses, invented device ids — so no screenshot can leak a
+real deployment. Regenerate them with `node tests/screenshots.mjs`.
+
+| | |
+|---|---|
+| **Overview** — the active server, device counts, and the route to the admin console | **Devices** — inventory with real online state, rename, delete, add to a book |
+| ![Overview](screenshots/overview.png) | ![Devices](screenshots/devices.png) |
+| **Address Book** — books, tags, bulk tagging, CSV import and export | **Users** — accounts and groups as the API reports them |
+| ![Address Book](screenshots/address-book.png) | ![Users](screenshots/users.png) |
+| **Audit** — connection, file-transfer and login logs with filters | **Server Ops** — status, restarts, diagnostics, updates, key rotation |
+| ![Audit](screenshots/audit.png) | ![Server Ops](screenshots/server-ops.png) |
+| **Settings** — the update repository for each of the three components | **Setup** — the provisioning wizard, plan shown before anything runs |
+| ![Settings](screenshots/settings.png) | ![Setup](screenshots/setup.png) |
+
 ## Install
 
 ```sh
@@ -161,6 +181,9 @@ npm run test:e2e         # Playwright against index.html + a stubbed bridge
 npm run test:live        # Playwright against a REAL Cockpit on localhost:9090
 ```
 
+`tests/screenshots.mjs` is not a test — it reuses the same harness to regenerate
+the images in this README from fictional data (`node tests/screenshots.mjs`).
+
 `test:e2e` needs `make vendor` to have run and skips cleanly with a printed reason
 if chromium is unavailable (`PILOT_E2E_REQUIRE=1` turns that skip into a failure).
 `test:live` is opt-in: it needs Pilot installed, Cockpit listening on 9090, and
@@ -180,4 +203,10 @@ installs anything, never runs `sudo`, and restores your
 
 ## Licence
 
-See the repository for licensing terms.
+See the [`LICENSE`](LICENSE) file at the root of this repository — that file is
+the authority, and GitHub shows the same terms in the sidebar.
+
+Third-party components keep their own licences and are not covered by it: Alpine
+and Bootstrap are fetched by `make vendor` rather than committed, and Pilot
+installs `hbbs`/`hbbr` and `rustdesk-api` from their upstream releases at
+provision time rather than redistributing them.
