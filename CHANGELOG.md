@@ -24,6 +24,19 @@ truth, read by the Makefile and by the self-updater.
   nothing on screen to reveal it. With no tags yet, both controls say so and offer
   the action that creates one.
 
+- **The browser web client is disabled at provision time** (`app.web-client: 0`).
+  The client bundled with `rustdesk-api` v2.7 latency-probes a hardcoded list of
+  `rustdesk.com` servers and overwrites the stored rendezvous server with the
+  winner, so it cannot reach a self-hosted deployment at all — it fails with
+  "Failed to connect to rendezvous server". Serving it published a page that
+  could not work and needed no login to reach. `/_admin/` and `/api` are separate
+  routes and are unaffected. See
+  [Why the browser web client is disabled](README.md#why-the-browser-web-client-is-disabled).
+- Overview's **"Open the web client"** button is now **"Go to administration"**
+  and opens `/_admin/`. It previously pointed at the site root, which redirects
+  to the admin console anyway — so the button had never opened the web client,
+  and now says so.
+
 ### Fixed
 
 - Renaming a device now also updates its **address-book alias**. A device name lives

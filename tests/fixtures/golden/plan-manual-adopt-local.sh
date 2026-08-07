@@ -60,7 +60,7 @@ cat > /opt/rustdesk-api/conf/config.yaml <<'PILOT_EOF_0'
 # startup (resources-path) and login (captcha-threshold) before.
 lang: "en"
 app:
-  web-client: 1
+  web-client: 0
   register: false
   register-status: 1
   captcha-threshold: 3

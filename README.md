@@ -34,6 +34,33 @@ TLS is optional and offered in three tiers: your own domain, an automatic
 443 and enables the browser-based web client. Skipping it is a supported choice —
 the reason the web client stays disabled is then shown on the Overview screen.
 
+## Why the browser web client is disabled
+
+Pilot provisions `rustdesk-api` with `app.web-client: 0`, so `/webclient/` is not
+served. This is deliberate.
+
+The web client bundled with `rustdesk-api` v2.7 **cannot reach a self-hosted
+rendezvous server**. Its startup path latency-probes a hardcoded list —
+`rs-sg`, `rs-cn`, `rs-us.rustdesk.com` — and overwrites the stored rendezvous
+server with whichever answers. On a self-hosted deployment those hosts are
+unreachable, so it fails with *"Failed to connect to rendezvous server"* before
+anything else runs.
+
+That was verified against a real server every way the client can be configured:
+the API-injected config, `custom-rendezvous-server` and `rendezvous-server` in
+localStorage, with and without the `:21116` port, the server key set, signed in
+and signed out, before and after a reload, and by opening a session URL
+directly. **No socket ever reached the self-hosted server.**
+
+Serving it anyway would publish a page that cannot work and needs no login to
+reach. Disabling it touches nothing else: the admin console at `/_admin/` and
+the whole `/api` surface are separate routes and stay up — Pilot's Overview links
+to the admin console.
+
+To re-enable it on a server, set `app.web-client: 1` in
+`/opt/rustdesk-api/conf/config.yaml` and restart `rustdesk-api`. Expect the
+failure above.
+
 ## Why the server is a fork
 
 Pilot provisions `hbbs`/`hbbr` from

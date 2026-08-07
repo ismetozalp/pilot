@@ -100,7 +100,7 @@ test('webClientLink: TLS plus a domain gives a port-less https address', () => {
     const w = O.webClientLink(ALPHA);
     assert.equal(w.enabled, true);
     // C17: Caddy listens on 443 because the client appends no port.
-    assert.equal(w.url, 'https://rd.example.com/webclient/');
+    assert.equal(w.url, 'https://rd.example.com/_admin/');
     assert.equal(w.action, 'open');
     assert.equal(w.reason, '');
 });
@@ -109,7 +109,7 @@ test('webClientLink: every TLS tier that produces a certificate enables the link
     for (const tier of ['own', 'sslip', 'duckdns']) {
         const w = O.webClientLink({ id: 'a', domain: 'rd.example.com', tlsTier: tier });
         assert.equal(w.enabled, true, tier);
-        assert.equal(w.url, 'https://rd.example.com/webclient/', tier);
+        assert.equal(w.url, 'https://rd.example.com/_admin/', tier);
     }
 });
 
@@ -133,7 +133,7 @@ test('webClientLink: TLS with no domain and TLS with a broken domain say differe
 test('webClientLink: the domain may live under tls.domain', () => {
     const w = O.webClientLink({ id: 'a', tls: { tier: 'own', domain: 'rd.example.com' } });
     assert.equal(w.enabled, true);
-    assert.equal(w.url, 'https://rd.example.com/webclient/');
+    assert.equal(w.url, 'https://rd.example.com/_admin/');
 });
 
 test('webClientLink: hostile servers are disabled, never enabled with a broken URL', () => {
@@ -177,14 +177,14 @@ test('webClientLink: script markup, unicode and a very long domain are all badDo
     }
 });
 
-test('webClientLink: an enabled URL carries no port and no query, and lands ON the web client', () => {
+test('webClientLink: an enabled URL carries no port and no query, and lands ON the admin console', () => {
     const w = O.webClientLink({ tlsTier: 'own', domain: 'RD.Example.COM.' });
     // The path is REQUIRED. This used to assert there was none, which is how
     // the link shipped pointing at the site root -- and the root 302s to
     // /_admin/, so the button opened the admin console and looked like it
     // worked. Verified on a live v2.7: /webclient/ is 200, / redirects to
     // /_admin/, and /webclient2/ (the v2 preview) is a 404.
-    assert.equal(w.url, 'https://rd.example.com/webclient/');
+    assert.equal(w.url, 'https://rd.example.com/_admin/');
     assert.ok(!/:\d/.test(w.url.slice('https://'.length)), 'no port: the client appends none');
     assert.ok(w.url.indexOf('?') === -1, 'no query');
 });
@@ -647,20 +647,53 @@ test('mount injects the template once and creates its host if the page has none'
     for (const bad of [null, undefined, {}, 'x', 7]) assert.equal(O.mount(bad), false, String(bad));
 });
 
-test('the web client address comes from PilotTls.webClientUrl, not a local copy of the rule', () => {
+test('the address comes from PilotTls.adminUrl, not a local copy of the rule', () => {
     const Tls = require('../../js/core/tls.js');
     const server = { id: 'a', tlsTier: 'own', domain: 'rd.example.com' };
     const link = O.webClientLink(server);
     assert.equal(link.enabled, true);
-    assert.equal(link.url, Tls.webClientUrl('rd.example.com'),
+    assert.equal(link.url, Tls.adminUrl('rd.example.com'),
         'the two must be the same string because there is only one rule');
-    assert.equal(link.url, 'https://rd.example.com/webclient/');
+    assert.equal(link.url, 'https://rd.example.com/_admin/');
     // And whatever PilotTls refuses to vouch for stays disabled rather than
     // rendering an href to nowhere: webClientUrl() answers '' for those.
     for (const bad of ['1.2.3.4', 'localhost', 'not a host', 'rd.example.com:8443', '*.example.com']) {
         const l = O.webClientLink({ id: 'a', tlsTier: 'own', domain: bad });
-        assert.equal(l.enabled, false, bad + ' must not produce a web client link');
+        assert.equal(l.enabled, false, bad + ' must not produce a link');
         assert.equal(l.url, null);
         assert.ok(l.reason, 'a disabled link always says why');
+    }
+});
+
+
+// ============ the card offers ADMINISTRATION, not the web client
+//
+// Pilot disables the web client at provision time: the one bundled with
+// rustdesk-api v2.7 latency-probes a hardcoded list of rustdesk.com servers and
+// cannot reach a self-hosted rendezvous server, so the button could only ever
+// lead to "Failed to connect to rendezvous server". The admin console is a
+// different route on the same host and works.
+
+test('the card links to the admin console and never to the web client', () => {
+    const link = O.webClientLink({ id: 's', tlsTier: 'sslip', domain: 'rd.example.com' });
+    assert.equal(link.enabled, true);
+    assert.ok(link.url.endsWith('/_admin/'), 'links to the console: ' + link.url);
+    assert.ok(link.url.indexOf('/webclient') === -1,
+        'the web client is disabled at provision time; linking to it is a dead end');
+});
+
+test('the card says "administration", so the button matches where it goes', () => {
+    const t = O.TEMPLATE;
+    assert.match(t, />Administration</, 'the heading names what the card offers');
+    assert.match(t, /Go to administration<\/a>/, 'the enabled control');
+    assert.match(t, /Go to administration<\/button>/, 'and the disabled one agree with it');
+    assert.ok(t.indexOf('Open the web client') === -1,
+        'no control may still offer the disabled web client');
+});
+
+test('the disabled reasons talk about the admin console, not the web client', () => {
+    for (const r of Object.values(O.REASON)) {
+        assert.ok(/admin console/.test(r), 'reason still mentions the web client: ' + r);
+        assert.ok(!/web client/.test(r), 'reason still mentions the web client: ' + r);
     }
 });

@@ -234,7 +234,22 @@
             '# startup (resources-path) and login (captcha-threshold) before.\n' +
             'lang: "en"\n' +
             'app:\n' +
-            '  web-client: 1\n' +
+            // 0, deliberately. The web client bundled with rustdesk-api v2.7
+            // cannot reach a self-hosted rendezvous server: its startup path
+            // latency-probes a HARDCODED list (rs-sg/rs-cn/rs-us.rustdesk.com)
+            // and overwrites the stored rendezvous server with the winner, so on
+            // a self-hosted deployment it fails with "Failed to connect to
+            // rendezvous server" before anything else runs. Verified against a
+            // real server every way it can be configured: custom-rendezvous-server
+            // and rendezvous-server, with and without the port, key set, signed in
+            // and out, before and after a reload, and by opening a session
+            // directly -- not one socket ever reached the self-hosted server.
+            //
+            // Shipping it enabled means publishing a page that cannot work and
+            // needs no login to reach. This disables ONLY the web client:
+            // /_admin/ (the admin console) and the whole /api surface are
+            // separate routes and stay up, verified on a live server.
+            '  web-client: 0\n' +
             '  register: false\n' +
             '  register-status: 1\n' +
             '  captcha-threshold: 3\n' +

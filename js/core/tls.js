@@ -305,9 +305,25 @@
     // does not ship: /webclient2/ is a 404 there.
     const WEB_CLIENT_PATH = '/webclient/';
 
+    // The admin console rustdesk-api serves. The site root 302s here, but the
+    // real path is named rather than relying on that redirect -- a redirect is
+    // someone else's decision and can change.
+    //
+    // This is what Pilot links to now. The web client is deliberately DISABLED
+    // at provision time (app.web-client: 0 in the generated config): the client
+    // bundled with v2.7 latency-probes a hardcoded list of rustdesk.com servers
+    // and cannot reach a self-hosted rendezvous server at all. Disabling it does
+    // not touch this console or the API -- separate routes, verified live.
+    const ADMIN_PATH = '/_admin/';
+
     function webClientUrl(host) {
         const d = normalizeDomain(host);
         return isValidDomain(d) ? 'https://' + d + WEB_CLIENT_PATH : '';
+    }
+
+    function adminUrl(host) {
+        const d = normalizeDomain(host);
+        return isValidDomain(d) ? 'https://' + d + ADMIN_PATH : '';
     }
 
     const TIER_NOTES = {
@@ -423,6 +439,7 @@
         classifyAcmeFailure: classifyAcmeFailure,
         apiServerUrl: apiServerUrl,
         webClientUrl: webClientUrl, WEB_CLIENT_PATH: WEB_CLIENT_PATH,
+        adminUrl: adminUrl, ADMIN_PATH: ADMIN_PATH,
         advisory: advisory,
         caddyfile: caddyfile
     };

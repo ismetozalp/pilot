@@ -595,6 +595,18 @@ test('webClientUrl exists only for a real hostname, and points AT the web client
         assert.equal(T.webClientUrl(v), '', JSON.stringify(String(v)));
 });
 
+test('adminUrl points at the console rustdesk-api serves, on the same hostname rule', () => {
+    assert.equal(T.ADMIN_PATH, '/_admin/');
+    assert.equal(T.adminUrl('rd.example.com'), 'https://rd.example.com/_admin/');
+    assert.equal(T.adminUrl('RD.Example.com.'), 'https://rd.example.com/_admin/');
+    // Same refusals as webClientUrl: no certificate, no link.
+    for (const v of ['', null, undefined, '1.2.3.4', 'rd.example.com\n', 'localhost'])
+        assert.equal(T.adminUrl(v), '', JSON.stringify(String(v)));
+    // Named, not inferred from the root's 302 -- a redirect is someone else's
+    // decision and can change.
+    assert.notEqual(T.ADMIN_PATH, '/');
+});
+
 test('the web client path is the one rustdesk-api actually serves', () => {
     // Measured against a live v2.7, all three:
     //   /webclient/   200, the Flutter client

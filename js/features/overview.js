@@ -37,13 +37,18 @@
 
     const TIERS = new Set(['none', 'own', 'sslip', 'duckdns']);
 
+    // The card offers the ADMIN CONSOLE, not the web client. Pilot disables the
+    // web client at provision time: the one bundled with rustdesk-api v2.7
+    // latency-probes a hardcoded list of rustdesk.com servers and cannot reach a
+    // self-hosted rendezvous server, so the button led to a page that could only
+    // fail. The admin console is a different route and works.
     const REASON = {
         noTls: 'TLS is not configured on this server, so there is no HTTPS address ' +
-            'to open the web client at.',
-        noDomain: 'This server has no domain name. The web client needs one, because ' +
+            'to open the admin console at.',
+        noDomain: 'This server has no domain name. The admin console needs one, because ' +
             'a bare IP address cannot be given a certificate.',
         badDomain: 'The domain recorded for this server is not a usable host name, ' +
-            'so no HTTPS address can be formed for the web client.'
+            'so no HTTPS address can be formed for the admin console.'
     };
 
     const FALLBACK_SERVER = { id: 'local', name: 'This server', domain: '', tlsTier: 'none' };
@@ -119,7 +124,7 @@
         // made validDomain/normDomain below delegate. It returns '' for
         // anything it will not vouch for, so an empty answer stays disabled
         // rather than rendering an href to nowhere.
-        const url = Tls && typeof Tls.webClientUrl === 'function' ? Tls.webClientUrl(raw) : '';
+        const url = Tls && typeof Tls.adminUrl === 'function' ? Tls.adminUrl(raw) : '';
         if (!url) return { enabled: false, url: null, reason: REASON.badDomain, action: 'wizard-tls' };
         return { enabled: true, url: url, reason: '', action: 'open' };
     }
@@ -492,15 +497,15 @@
         '  </div>',
         '  <div class="card">',
         '    <div class="card-body">',
-        '      <h3 class="h6">Web client</h3>',
+        '      <h3 class="h6">Administration</h3>',
         '      <p x-show="webClient.enabled">',
         '        <a class="btn btn-sm btn-primary" data-test="web-client-link"',
         '           :href="webClient.url" target="_blank" rel="noopener noreferrer">',
-        '          Open the web client</a>',
+        '          Go to administration</a>',
         '      </p>',
         '      <p x-show="!webClient.enabled">',
         '        <button type="button" class="btn btn-sm btn-primary" disabled',
-        '                data-test="web-client-disabled">Open the web client</button>',
+        '                data-test="web-client-disabled">Go to administration</button>',
         '      </p>',
         '      <p class="text-secondary" data-test="web-client-reason" x-show="!webClient.enabled"',
         '         x-text="webClient.reason"></p>',

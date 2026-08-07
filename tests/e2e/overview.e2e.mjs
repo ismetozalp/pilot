@@ -184,7 +184,7 @@ export default async function run(ctx) {
         }
     });
 
-    await check('overview: the web client opens in a new tab when TLS is configured, and is never framed', async () => {
+    await check('overview: administration opens in a new tab when TLS is configured, and is never framed', async () => {
         const page = await openOverview(ctx);
         try {
             await installFixtures(page, SERVERS, { alpha: ALPHA_DEVICES, beta: BETA_DEVICES });
@@ -200,8 +200,11 @@ export default async function run(ctx) {
             // /webclient/ is where rustdesk-api serves the browser client. The
             // site root 302s to /_admin/, so pointing there opened the ADMIN
             // console -- a page that loads, which is why it read as working.
-            assertEqual(link.href, 'https://rd.example.com/webclient/',
-                'the port-less https address, ON the web client');
+            // The card links to the ADMIN CONSOLE. Pilot disables the web
+            // client at provision time -- the bundled one cannot reach a
+            // self-hosted rendezvous server -- so linking to it was a dead end.
+            assertEqual(link.href, 'https://rd.example.com/_admin/',
+                'the port-less https address, ON the admin console');
             assertEqual(link.target, '_blank', 'a new tab, never the plugin frame');
             assertOk(/noopener/.test(link.rel) && /noreferrer/.test(link.rel), 'the tab is isolated');
 
