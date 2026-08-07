@@ -13,6 +13,24 @@ that gives them a control plane.
 
 ![Pilot's Devices tab: four devices with online state, last seen, address and platform](screenshots/devices.png)
 
+> **🗂️ Another Cockpit plugin of mine:** [**Explorer**](https://github.com/ismetozalp/explorer)
+> (`ismetozalp/explorer`) — a full file manager for the Cockpit console: multi-tab browsing,
+> a two-pane mode, editing, transfers and search, without dropping to SSH.
+>
+> **📺 And another:** [**InFlight TV**](https://github.com/ismetozalp/iftv) (`ismetozalp/iftv`) —
+> an IPTV / live-TV player for the Cockpit console.
+>
+> **📊 And another:** [**ctop**](https://github.com/ismetozalp/ctop) (`ismetozalp/ctop`) —
+> a live system/process monitor for the Cockpit console.
+>
+> **⬇️ And another:** [**Manifest**](https://github.com/ismetozalp/manifest) (`ismetozalp/manifest`) —
+> a download manager for the Cockpit console (torrents, magnets, HTTP/FTP/Metalink via a
+> per-user `aria2c`).
+>
+> **💾 And another:** [**Hangar**](https://github.com/ismetozalp/hangar) (`ismetozalp/hangar`) —
+> scheduled, deduplicated, encrypted backups for the Cockpit console (restic-based) with
+> automatic retention thinning, a point-in-time file browser, and bare-metal disaster recovery.
+
 Two jobs, one screen:
 
 * **Provisioning.** A wizard that detects the target, shows you the exact plan it
