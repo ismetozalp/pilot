@@ -89,10 +89,11 @@ test('dual export and Pilot* global (house pattern)', () => {
 
 test('OPS: every entry has all required fields', () => {
     assert.ok(Array.isArray(S.OPS));
-    assert.equal(S.OPS.length, 10);
+    assert.equal(S.OPS.length, 11);
     const ids = S.OPS.map((o) => o.id);
     assert.deepEqual(ids, ['status', 'restart-hbbs', 'restart-hbbr', 'restart-api',
-        'relay-log', 'doctor', 'recheck-ports', 'update-api', 'update-server', 'rotate-key']);
+        'relay-log', 'doctor', 'recheck-ports', 'versions', 'update-api', 'update-server',
+        'rotate-key']);
     assert.equal(new Set(ids).size, ids.length, 'op ids must be unique');
     for (const op of S.OPS) {
         assert.equal(typeof op.id, 'string');
@@ -1241,4 +1242,116 @@ test('the dialog renders each option with its warning', () => {
     assert.match(t, /x-for="o in confirmOptions\(\)"/);
     assert.match(t, /x-model="confirm\.opts\[o\.key\]"/);
     assert.match(t, /x-text="o\.warn"/, 'the cost is shown beside the choice');
+});
+
+
+// ============================ the update CHECK: what is installed vs what exists
+
+test('parseVersions reads the report, and a missing component is empty not "none"', () => {
+    assert.deepEqual(S.parseVersions('arch=aarch64\napi=2.7\nhbbs=1.4.3'),
+        { arch: 'aarch64', api: '2.7', hbbs: '1.4.3' });
+    // 'none' is the op's own word for not-installed and must not leak out as a
+    // version string that then gets compared against a release tag.
+    assert.deepEqual(S.parseVersions('arch=x86_64\napi=none\nhbbs=none'),
+        { arch: 'x86_64', api: '', hbbs: '' });
+    // A report tolerates noise rather than throwing.
+    assert.deepEqual(S.parseVersions('junk\n\napi=2.7\n= \nhbbs=1.4.3'),
+        { arch: '', api: '2.7', hbbs: '1.4.3' });
+    for (const bad of [null, undefined, 42, {}])
+        assert.deepEqual(S.parseVersions(bad), { arch: '', api: '', hbbs: '' });
+});
+
+test('a release tag and an installed marker compare on the numbers, not the text', () => {
+    // The two traps: the leading v, and string ordering.
+    assert.equal(S.isNewer('v2.7', '2.7'), false, 'v2.7 IS 2.7 -- offering it would reinstall');
+    assert.equal(S.isNewer('v2.8', '2.7'), true);
+    assert.equal(S.isNewer('2.10', '2.9'), true, "'2.10' < '2.9' as text");
+    assert.equal(S.isNewer('2.6', '2.7'), false, 'never offer a downgrade');
+    assert.equal(S.isNewer('1.4.3', '1.4.3'), false);
+    // Nothing installed, or nothing published: not an update.
+    for (const [a, b] of [['', '2.7'], ['v2.8', ''], ['', '']])
+        assert.equal(S.isNewer(a, b), false, JSON.stringify([a, b]));
+});
+
+test('the asset filename comes from ostarget, which names ARM differently per project', () => {
+    // rustdesk-server publishes arm64v8, rustdesk-api publishes arm64, for the
+    // same machine. One shared guess 404s on half of all ARM installs.
+    const OT = require('../../js/core/ostarget.js');
+    assert.notEqual(OT.apiAsset('aarch64').name, OT.serverAsset('aarch64').name);
+    const apiRel = { assets: [{ name: OT.apiAsset('aarch64').name,
+        browser_download_url: 'https://x/a', digest: 'sha256:' + 'a'.repeat(64) }] };
+    const srvRel = { assets: [{ name: OT.serverAsset('aarch64').name,
+        browser_download_url: 'https://x/s', digest: 'sha256:' + 'b'.repeat(64) }] };
+    assert.equal(S.pickReleaseAsset(apiRel, 'aarch64', 'api').url, 'https://x/a');
+    assert.equal(S.pickReleaseAsset(srvRel, 'aarch64', 'server').url, 'https://x/s');
+    // ...and each refuses the other's archive.
+    assert.equal(S.pickReleaseAsset(apiRel, 'aarch64', 'server'), null);
+    assert.equal(S.pickReleaseAsset(srvRel, 'aarch64', 'api'), null);
+});
+
+test('an asset with no publisher checksum is refused, never installed unverified', () => {
+    // There is no pinned digest for a release that did not exist when Pilot was
+    // built, so the release document is the only trustworthy source.
+    const name = require('../../js/core/ostarget.js').apiAsset('aarch64').name;
+    for (const digest of [undefined, '', 'md5:abc', 'sha256:zz', 'sha256:' + 'a'.repeat(63)]) {
+        const rel = { assets: [{ name: name, browser_download_url: 'https://x/y', digest: digest }] };
+        assert.equal(S.pickReleaseAsset(rel, 'aarch64', 'api'), null, JSON.stringify(digest));
+    }
+});
+
+test('an unknown architecture yields no asset rather than a wrong one', () => {
+    const name = require('../../js/core/ostarget.js').apiAsset('aarch64').name;
+    const rel = { assets: [{ name: name, browser_download_url: 'https://x/y',
+        digest: 'sha256:' + 'a'.repeat(64) }] };
+    for (const arch of ['', 'sparc', null, undefined])
+        assert.equal(S.pickReleaseAsset(rel, arch, 'api'), null, String(arch));
+});
+
+test('the versions op reads hbbs from PATH or from Pilot\'s bin dir', () => {
+    // hbbs arrives two ways: Pilot unpacks the release zip into /usr/local/bin,
+    // a distribution package puts it in /usr/bin. Reading only one reported
+    // "no hbbs installed" on a server that plainly had one -- found by running
+    // this against the real deployment.
+    const cmd = S.opArgv('versions', REMOTE_WITH_CRED)[2];
+    assert.match(cmd, /command -v hbbs/, 'PATH first');
+    assert.match(cmd, /\/usr\/local\/bin\/hbbs/, 'then where Pilot installs it');
+    assert.match(cmd, /resources\/version/, 'the API version marker');
+    assert.match(cmd, /uname -m/, 'the arch that chooses the asset');
+});
+
+test('checking is a read-only op, so it needs no confirmation', () => {
+    const op = S.OPS.find((o) => o.id === 'versions');
+    assert.equal(op.danger, false);
+    assert.ok(!op.impact, 'a read needs no impact statement');
+    assert.equal(S.DANGER_OPS.indexOf('versions'), -1);
+});
+
+
+test('an update button is disabled until a check has found a release, and says why', () => {
+    const c = S.serverOpsUi({});
+    c.server = { id: 's', transport: 'ssh', host: 'h', hasCredential: true };
+    for (const id of ['update-api', 'update-server']) {
+        assert.equal(c.opDisabled(id), true, id + ' must not be clickable with no release chosen');
+        assert.match(c.reasonBlocked(id), /Check for updates/,
+            'the reason must name the action that unblocks it');
+    }
+    // The other ops are unaffected by the update state.
+    assert.equal(c.opDisabled('restart-hbbs'), false);
+    assert.equal(c.opDisabled('status'), false);
+    c.updates = { 'update-api': { latest: '2.8', installed: '2.7', repo: 'a/b',
+        url: 'https://x', sha256: 'f'.repeat(64) } };
+    assert.equal(c.opDisabled('update-api'), false, 'a found release unlocks it');
+    assert.equal(c.opDisabled('update-server'), true, 'and only the one that was found');
+});
+
+test('the report renders only after a check, and never claims "up to date" before one', () => {
+    const t = S.TEMPLATE;
+    assert.match(t, /x-if="installed\.arch"/,
+        'nothing may be reported until the target has actually been read');
+    assert.match(t, /data-testid="update-report"/);
+    assert.match(t, /data-testid="update-none"/);
+    // The version transition is shown, so the operator sees what would install.
+    assert.match(t, /updates\[op\.id\]\.installed/);
+    assert.match(t, /updates\[op\.id\]\.latest/);
+    assert.match(t, /updates\[op\.id\]\.repo/, 'and which repository it came from');
 });

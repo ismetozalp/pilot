@@ -37,6 +37,8 @@
     const Errors = need('PilotErrors', '../core/errors.js');
     const View = need('PilotConsoleView', '../core/console-view.js');
     const SetupUi = need('PilotSetupUi', './setup-ui.js');
+    const Semver = need('PilotSemver', '../core/semver.js');
+    const OsTarget = need('PilotOsTarget', '../core/ostarget.js');
     const EmptyState = need('PilotEmptyState', '../core/emptystate.js');
 
     const MOUNT_ID = 'pilot-server-ops';
@@ -117,6 +119,11 @@
         Object.freeze({
             id: 'recheck-ports', label: 'Re-check reachability', danger: false, needsCredential: true,
             why: 'Re-runs the port-reachability probe against this server.'
+        }),
+        Object.freeze({
+            id: 'versions', label: 'Check for updates', danger: false, needsCredential: true,
+            why: 'Reads the installed API and RustDesk server versions, then compares them with the ' +
+                'latest release of each configured repository.'
         }),
         Object.freeze({
             id: 'update-api', label: 'Update API server', danger: true, needsCredential: true,
@@ -263,6 +270,24 @@
             }
             case 'recheck-ports':
                 return ['ss', '-H', '-ltnu'];
+            case 'versions':
+                // One command, three facts, in a shape that survives a missing
+                // component: a server with no API installed still reports its
+                // arch and its hbbs version rather than failing the whole read.
+                // `|| true` on each line for the same reason -- this is a REPORT,
+                // and a partial answer is more useful than an error.
+                return ['sh', '-c',
+                    'echo "arch=$(uname -m)"; ' +
+                    'echo "api=$(cat ' + sq(API_DIR + '/resources/version') + ' 2>/dev/null || echo none)"; ' +
+                    // PATH first, then Pilot's own bin dir. hbbs can arrive two
+                    // ways -- Pilot unpacks the release zip into /usr/local/bin,
+                    // while a distribution package puts it in /usr/bin -- and
+                    // reading only one of them reported "no hbbs installed" on a
+                    // server that plainly had one. Caught by running this against
+                    // the real deployment rather than trusting the happy path.
+                    'echo "hbbs=$({ command -v hbbs >/dev/null 2>&1 && hbbs --version || ' +
+                        sq(BIN_DIR + '/hbbs') + ' --version; } 2>/dev/null | ' +
+                        "awk '{print $NF}' || echo none)\""];
             case 'update-api': {
                 const p = (plan && typeof plan === 'object') ? plan : {};
                 const url = str(p.url), sha = str(p.sha256);
@@ -337,6 +362,80 @@
             default:
                 return null;
         }
+    }
+
+    // ================================================================
+    // parseVersions / updateFor — pure.
+    // ================================================================
+
+    // The `versions` op prints key=value lines. Anything unrecognised is ignored
+    // rather than throwing: this is a report, and a partial answer beats an
+    // error. 'none' is the op's own word for "not installed" and becomes ''.
+    function parseVersions(text) {
+        const out = { arch: '', api: '', hbbs: '' };
+        const lines = str(text).split(/\r?\n/);
+        for (const raw of lines) {
+            const m = /^(arch|api|hbbs)=(.*)$/.exec(raw.trim());
+            if (!m) continue;
+            const v = m[2].trim();
+            out[m[1]] = (v === '' || v === 'none') ? '' : v.slice(0, 64);
+        }
+        return out;
+    }
+
+    // A release tag is 'v2.7' or '1.4.3' depending on the project; the installed
+    // marker never carries the v. Compared on the bare numbers so 'v2.7' and
+    // '2.7' are correctly the same version rather than an endless "update
+    // available" that installs what is already there.
+    function bareVersion(v) {
+        const s = str(v).trim();
+        return /^[vV]/.test(s) ? s.slice(1) : s;
+    }
+
+    // Is `latest` newer than `installed`? Delegates the ordering to PilotSemver
+    // rather than comparing strings, because '2.10' > '2.9' is false as text.
+    function isNewer(latest, installed) {
+        const a = bareVersion(latest), b = bareVersion(installed);
+        if (!a || !b) return false;
+        // No early equality check: both paths below already answer false for
+        // equal versions -- compare() returns 0, and the fallback is a !== b. One
+        // was here and a mutation could not kill it, which is the definition of
+        // code that is not doing anything.
+        if (Semver && typeof Semver.compare === 'function') {
+            try { return Semver.compare(a, b) > 0; } catch (e) { /* fall through */ }
+        }
+        return a !== b;
+    }
+
+    // Which asset in a release belongs on this machine, and its checksum.
+    //
+    // The FILENAME comes from js/core/ostarget.js rather than being spelled
+    // again here: the two projects name their ARM builds differently for the
+    // same machine (arm64v8 vs arm64), and one shared guess produces a 404 on
+    // half of all ARM installs. That module already got this right and is
+    // asserted on it.
+    //
+    // The DIGEST comes from the release document -- GitHub publishes
+    // "sha256:<hex>" per asset. There is no pinned digest for a release that did
+    // not exist when Pilot was built, so this is the only trustworthy source,
+    // and an asset without one is refused rather than installed unverified.
+    function pickReleaseAsset(release, arch, kind) {
+        const rel = (release && typeof release === 'object') ? release : {};
+        const assets = Array.isArray(rel.assets) ? rel.assets : [];
+        let want = '';
+        try {
+            const a = (kind === 'api') ? OsTarget.apiAsset(arch) : OsTarget.serverAsset(arch);
+            want = str(a && a.name);
+        } catch (e) { return null; }
+        if (!want) return null;
+        for (const a of assets) {
+            if (!a || str(a.name) !== want) continue;
+            const url = str(a.browser_download_url);
+            const m = /^sha256:([0-9a-f]{64})$/i.exec(str(a.digest));
+            if (!url || !m) return null;
+            return { name: want, url: url, sha256: m[1].toLowerCase() };
+        }
+        return null;
     }
 
     // ================================================================
@@ -560,6 +659,7 @@
             confirm: null,           // { opId, typed } while a danger confirmation is open
             unitStates: [],          // [{key,unit,label,state}] from the last 'status' run
             updates: {},              // { 'update-api': {latest,url,sha256,installed,stamp} }
+            installed: { arch: '', api: '', hbbs: '' },
             relaySessions: [],        // from the last 'relay-log' run
             relaySummary: null,
             output: {}               // free-text output per op id (doctor/recheck-ports/rotate-key)
@@ -758,7 +858,14 @@
             },
 
             isOpAllowed: function (opId) { return isOpAllowed(opId, this.server); },
-            opDisabled: function (opId) { return !this.isOpAllowed(opId) || !!this.opBusy[opId]; },
+            opDisabled: function (opId) {
+                if (!this.isOpAllowed(opId) || this.opBusy[opId]) return true;
+                // An update with no release chosen would refuse in opArgv anyway;
+                // disabling it here says so BEFORE the click, and points at the
+                // check as the thing to do first.
+                if (opId === 'update-api' || opId === 'update-server') return !this.updateAvailable(opId);
+                return false;
+            },
             isBusy: function (opId) { return !!this.opBusy[opId]; },
             // The label says what is happening, not only that something is. A
             // spinner alone is invisible to a screen reader and ambiguous next
@@ -772,6 +879,8 @@
 
             reasonBlocked: function (opId) {
                 if (!this.server) return 'No server is configured yet.';
+                if ((opId === 'update-api' || opId === 'update-server') && !this.updateAvailable(opId))
+                    return 'Run "Check for updates" first — nothing is known about newer releases yet.';
                 const op = findOp(opId);
                 if (!op) return 'Unknown operation.';
                 if (op.needsCredential && this.server.hasCredential !== true)
@@ -855,6 +964,77 @@
                 const op = c ? findOp(c.opId) : null;
                 return op || { id: '', label: '', why: '', impact: [], reversible: true, options: [] };
             },
+
+            // The repositories to check, from the operator's settings. Read
+            // fresh each time rather than cached: the Settings tab can change
+            // them while this surface is open.
+            async updateRepos() {
+                const S = root.PilotSettings ||
+                    (typeof require === 'function' ? require('../core/settings.js') : null);
+                if (!S || typeof S.read !== 'function') return { api: '', server: '' };
+                try {
+                    const doc = await S.read();
+                    const u = (doc && doc.update) ? doc.update : {};
+                    return { api: str(u.apiRepo), server: str(u.serverRepo) };
+                } catch (e) { return { api: '', server: '' }; }
+            },
+
+            // One GitHub release document, fetched the only way this plugin can:
+            // through the host. manifest.json sets connect-src 'self', so a
+            // browser fetch() to api.github.com is blocked outright -- it appears
+            // to work in a unit test and fails silently in the browser, which is
+            // the note js/features/update.js opens with.
+            async latestRelease(repo) {
+                const Upd = root.PilotUpdate ||
+                    (typeof require === 'function' ? require('./update.js') : null);
+                const api = (Upd && typeof Upd.releasesApiUrl === 'function')
+                    ? Upd.releasesApiUrl(repo) : '';
+                if (!api) return null;
+                if (typeof cockpit === 'undefined' || !cockpit || typeof cockpit.spawn !== 'function')
+                    return null;
+                const out = await cockpit.spawn(
+                    ['curl', '-fsSL', '--max-time', '20', '-H', 'Accept: application/vnd.github+json', api],
+                    { err: 'message' });
+                try { return JSON.parse(str(out)); } catch (e) { return null; }
+            },
+
+            // Reads what is installed on the target, then asks each configured
+            // repository what the newest release is. Populates this.updates, which
+            // is what unlocks the two update buttons -- until it runs they refuse,
+            // because opArgv() will not build a command without a release.
+            async checkUpdates() {
+                this.opAlerts.versions = null;
+                const ok = await this.execute('versions');
+                if (!ok) return false;
+                const inst = parseVersions(this.opOutput('versions'));
+                this.installed = inst;
+                const repos = await this.updateRepos();
+                const stamp = runIdFor();
+                const found = {};
+                const pairs = [
+                    { op: 'update-api', repo: repos.api, kind: 'api', have: inst.api },
+                    { op: 'update-server', repo: repos.server, kind: 'server', have: inst.hbbs }
+                ];
+                for (const p of pairs) {
+                    if (!p.repo || !p.have) continue;
+                    let rel = null;
+                    try { rel = await this.latestRelease(p.repo); } catch (e) { rel = null; }
+                    if (!rel) continue;
+                    const tag = str(rel.tag_name);
+                    if (!isNewer(tag, p.have)) continue;
+                    const asset = pickReleaseAsset(rel, inst.arch, p.kind);
+                    // A newer release with no usable asset for this architecture
+                    // is NOT an update -- offering the button would produce a 404
+                    // against a stopped service.
+                    if (!asset) continue;
+                    found[p.op] = { latest: bareVersion(tag), installed: p.have, repo: p.repo,
+                        url: asset.url, sha256: asset.sha256, stamp: stamp };
+                }
+                this.updates = found;
+                return true;
+            },
+
+            updateAvailable: function (opId) { return !!(this.updates && this.updates[opId]); },
 
             // What a given update op should install. Populated by checkUpdates();
             // null until then, which is what blocks the op -- opArgv() refuses to
@@ -1016,7 +1196,7 @@
         '                    :class="op.danger ? \'btn-outline-danger\' : \'btn-outline-secondary\'"',
         '                    :disabled="opDisabled(op.id)" :aria-busy="isBusy(op.id)"',
         '                    :data-testid="\'op-\' + op.id" :title="op.why"',
-        '                    @click="request(op.id)">',
+        '                    @click="op.id === \'versions\' ? checkUpdates() : request(op.id)">',
         // These operations reach a remote host over SSH; several seconds is
         // normal and a dozen is not unusual. A button that only greys out looks
         // broken -- and the honest report was exactly that: "nothing happens".
@@ -1088,6 +1268,38 @@
         '                  data-testid="server-ops-confirm-cancel">Cancel</button>',
         '        </div>',
         '      </template>',
+        // What the check found. Rendered ONLY after one has run: before that
+        // there is nothing truthful to say, and "up to date" would be a claim
+        // Pilot has not earned.
+        '      <template x-if="installed.arch">',
+        '        <div class="card mb-3" data-testid="update-report">',
+        '          <div class="card-body">',
+        '            <h3 class="h6">Installed</h3>',
+        '            <p class="mb-1 small">',
+        '              <span>API server: </span><strong x-text="installed.api || \'not installed\'"></strong>',
+        '              <span> · RustDesk server: </span><strong x-text="installed.hbbs || \'not installed\'"></strong>',
+        '              <span> · </span><span x-text="installed.arch"></span>',
+        '            </p>',
+        '            <template x-for="op in OPS" :key="op.id + \'-upd\'">',
+        '              <template x-if="updateAvailable(op.id)">',
+        '                <p class="mb-1 small" :data-testid="\'update-\' + op.id">',
+        '                  <span x-text="op.label"></span>',
+        '                  <span>: </span>',
+        '                  <strong x-text="updates[op.id].installed"></strong>',
+        '                  <span> → </span>',
+        '                  <strong x-text="updates[op.id].latest"></strong>',
+        '                  <span class="text-secondary"> from </span>',
+        '                  <span class="text-secondary" x-text="updates[op.id].repo"></span>',
+        '                </p>',
+        '              </template>',
+        '            </template>',
+        '            <template x-if="!updateAvailable(\'update-api\') && !updateAvailable(\'update-server\')">',
+        '              <p class="mb-0 small text-secondary" data-testid="update-none">',
+        '                No newer release was found in the configured repositories.</p>',
+        '            </template>',
+        '          </div>',
+        '        </div>',
+        '      </template>',
         '      <template x-for="op in OPS" :key="op.id + \'-alert\'">',
         '        <template x-if="opAlert(op.id)">',
         '          <div class="alert alert-danger" role="alert" :data-testid="\'op-\' + op.id + \'-alert\'">',
@@ -1152,6 +1364,8 @@
         OPS: OPS, DANGER_OPS: DANGER_OPS,
         isOpAllowed: isOpAllowed, opArgv: opArgv, hbbsDataDirFor: hbbsDataDirFor,
         parseUnitState: parseUnitState, unitStatesFrom: unitStatesFrom, STATUS_UNITS: STATUS_UNITS,
+        parseVersions: parseVersions, bareVersion: bareVersion, isNewer: isNewer,
+        pickReleaseAsset: pickReleaseAsset,
         parseRelayLog: parseRelayLog, summarise: summarise,
         blankState: blankState, serverOpsUi: serverOpsUi, serverEmptyState: serverEmptyState,
         envelopeFor: envelopeFor,

@@ -37,6 +37,22 @@ truth, read by the Makefile and by the self-updater.
   to the admin console anyway — so the button had never opened the web client,
   and now says so.
 
+- **A Settings tab**, with the update repository for each of the three components
+  Pilot installs: Pilot itself (`ismetozalp/pilot`), the API server
+  (`lejianwen/rustdesk-api`) and the RustDesk server (`wy414012/rustdesk-server`).
+  Each accepts `owner/name` or a github.com URL; clearing one stops checking that
+  component. Having the server repo here makes returning to the official
+  `rustdesk/rustdesk-server` a setting rather than a code edit.
+- **Server Ops can update the API server and the RustDesk server.** "Check for
+  updates" reads what is installed on the target and compares it with the latest
+  release of each configured repository; the update buttons stay disabled until it
+  finds something, and say so. The download is checksum-verified against the
+  publisher's own digest **before** the service is stopped or anything is unpacked.
+  The API tarball ships its own `conf/config.yaml`, so by default that archive
+  member is excluded and the configured file is never written — replacing it with
+  the upstream default is an explicit, clearly-costed opt-in, and a timestamped
+  copy is taken either way.
+
 ### Fixed
 
 - Renaming a device now also updates its **address-book alias**. A device name lives
