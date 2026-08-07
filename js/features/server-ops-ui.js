@@ -1226,17 +1226,28 @@
         '              </template>',
         '              <span x-text="opLabel(op)"></span>',
         '            </button>',
-        // Shown whenever the button is disabled, not only when the op is
-        // disallowed. The update ops ARE allowed -- they have a credential --
-        // and are disabled for a different reason, so this condition rendered
-        // nothing and the operator got a greyed-out button with no explanation.
-        // Excluded while running: "why can't I click this" is answered by the
-        // spinner then, not by a sentence.
-        '            <div class="small text-secondary" x-show="opDisabled(op.id) && !isBusy(op.id)"',
-        '                 :data-testid="\'op-\' + op.id + \'-reason\'" x-text="reasonBlocked(op.id)"></div>',
         '          </div>',
         '        </template>',
         '      </div>',
+        // The reasons live BELOW the row, not inside each button's flex item.
+        // Inline, a sentence like "Already at the latest release (1.4.3) in
+        // wy414012/rustdesk-server." stretched its own cell to the width of the
+        // text and shoved the neighbouring buttons apart -- the row read as
+        // randomly spaced rather than as a toolbar.
+        //
+        // Still shown rather than hidden behind a tooltip: a disabled control
+        // that will not say why is the bug this text was added to fix. It is
+        // suppressed while an op runs, because the spinner answers "why can't I
+        // click this" better than a sentence does.
+        '      <template x-for="op in OPS" :key="op.id + \'-why\'">',
+        '        <template x-if="opDisabled(op.id) && !isBusy(op.id)">',
+        '          <div class="small text-secondary" :data-testid="\'op-\' + op.id + \'-reason\'">',
+        '            <strong x-text="op.label"></strong>',
+        '            <span> — </span>',
+        '            <span x-text="reasonBlocked(op.id)"></span>',
+        '          </div>',
+        '        </template>',
+        '      </template>',
         '      <template x-if="confirm">',
         '        <div class="alert alert-warning" role="alertdialog" data-testid="server-ops-confirm">',
         // Name the action being confirmed. "Are you sure?" over an unnamed

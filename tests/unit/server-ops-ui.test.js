@@ -1400,7 +1400,29 @@ test('the reason renders whenever the button is disabled, not only when disallow
     const t = S.TEMPLATE;
     // The bug: these ops ARE allowed (they hold a credential) and are disabled
     // for a different reason, so a condition on isOpAllowed rendered nothing.
-    assert.match(t, /x-show="opDisabled\(op\.id\) && !isBusy\(op\.id\)"/);
+    assert.match(t, /opDisabled\(op\.id\) && !isBusy\(op\.id\)/,
+        'the reason is gated on DISABLED, not on disallowed');
     assert.ok(!/x-show="!isOpAllowed\(op\.id\)"/.test(t),
         'gating on isOpAllowed alone leaves the update ops unexplained');
+});
+
+test('the reasons sit below the toolbar, not inside each button cell', () => {
+    // A sentence inside the button's own flex item stretched that cell to the
+    // width of the text and shoved the neighbouring buttons apart, so the row
+    // read as randomly spaced rather than as a toolbar.
+    const t = S.TEMPLATE;
+    const rowStart = t.indexOf('x-for="op in OPS" :key="op.id"');
+    const rowEnd = t.indexOf('op.id + \'-why\'');
+    assert.ok(rowStart !== -1 && rowEnd !== -1 && rowEnd > rowStart, 'both loops must exist');
+    const row = t.slice(rowStart, rowEnd);
+    assert.ok(row.indexOf('-reason') === -1,
+        'no reason text inside the button loop, or the buttons space unevenly');
+    // ...and each reason still names the op it belongs to, since it is no
+    // longer sitting under its own button. Scoped to the reason block itself:
+    // slicing to the end of the template also caught the update report's own
+    // op.label, so this assertion passed while the label was gone.
+    const whyEnd = t.indexOf('</template>', t.indexOf('reasonBlocked(op.id)'));
+    const why = t.slice(rowEnd, whyEnd);
+    assert.match(why, /x-text="op\.label"/, 'a detached reason must say which op it is about');
+    assert.match(why, /x-text="reasonBlocked\(op\.id\)"/);
 });
