@@ -89,10 +89,10 @@ test('dual export and Pilot* global (house pattern)', () => {
 
 test('OPS: every entry has all required fields', () => {
     assert.ok(Array.isArray(S.OPS));
-    assert.equal(S.OPS.length, 8);
+    assert.equal(S.OPS.length, 10);
     const ids = S.OPS.map((o) => o.id);
     assert.deepEqual(ids, ['status', 'restart-hbbs', 'restart-hbbr', 'restart-api',
-        'relay-log', 'doctor', 'recheck-ports', 'rotate-key']);
+        'relay-log', 'doctor', 'recheck-ports', 'update-api', 'update-server', 'rotate-key']);
     assert.equal(new Set(ids).size, ids.length, 'op ids must be unique');
     for (const op of S.OPS) {
         assert.equal(typeof op.id, 'string');
@@ -155,8 +155,13 @@ test('isOpAllowed: every op is allowed on the local target, which needs no crede
 test('opArgv returns the exact argv for every op, and it never carries a credential', () => {
     const SECRET = 'hunter2-super-secret-pem-or-password';
     const serverWithSecretLookingField = Object.assign({}, REMOTE_WITH_CRED, { password: SECRET, pem: SECRET });
+    // The update ops cannot build a command without a release to install, so
+    // they are given a plan here; without one they correctly return null, which
+    // is asserted separately below.
+    const PLAN = { url: 'https://github.com/o/n/releases/download/v9/a.tar.gz',
+        sha256: 'c'.repeat(64), stamp: '20260807' };
     for (const op of S.OPS) {
-        const argv = S.opArgv(op.id, serverWithSecretLookingField);
+        const argv = S.opArgv(op.id, serverWithSecretLookingField, PLAN);
         assert.ok(Array.isArray(argv), op.id + ' must produce an argv array');
         const joined = argv.join(' ');
         assert.equal(joined.indexOf(SECRET), -1, op.id + ' argv must never contain a credential');
@@ -1112,4 +1117,128 @@ test('the spinner is x-if, not x-show -- a display utility would override it', (
     assert.ok(spinnerTag, 'spinner span not found');
     assert.ok(!/x-show/.test(spinnerTag[0]), 'x-show cannot hide a display-utility element');
     assert.match(t, /:aria-busy="isBusy\(op\.id\)"/, 'the busy state must reach assistive tech');
+});
+
+
+// ================== FIELD REPORT: updating the API and the RustDesk server
+//
+// "add an update mechanism for updating api server from git", and then, on
+// discovering the release tarball ships its own conf/config.yaml:
+// "user may want to reset config.yaml thats why i said it" and
+// "if user says update it but dont touch config.yaml exclude it".
+//
+// So keeping the configured file is the DEFAULT and is achieved by never
+// writing it -- the archive member is excluded from the unpack rather than
+// restored afterwards, because "never happened" cannot half-fail. Replacing it
+// is opt-in and states what it costs.
+//
+// Verified against the real v2.7 archive: with the exclude, a configured
+// config.yaml is byte-identical afterwards, data/rustdeskapi.db is untouched
+// (the archive's data/ is an empty directory carrying no .db at all), and
+// apimain plus resources/version are updated.
+
+const UPD_SRV = { id: 's', transport: 'ssh', host: 'h', sshPort: 22, hasCredential: true };
+const UPD_PLAN = { url: 'https://github.com/o/n/releases/download/v2.8/linux-arm64.tar.gz',
+    sha256: 'd'.repeat(64), version: '2.8', stamp: '20260807T120000Z' };
+
+test('an update refuses to run without a release and a checksum', () => {
+    // A command built from an empty URL would curl nothing over a live server.
+    for (const bad of [null, undefined, {}, { url: 'https://x/y' }, { sha256: 'd'.repeat(64) },
+        { url: 'https://x/y', sha256: 'not-a-digest' }]) {
+        assert.equal(S.opArgv('update-api', UPD_SRV, bad), null, JSON.stringify(bad));
+        assert.equal(S.opArgv('update-server', UPD_SRV, bad), null, JSON.stringify(bad));
+    }
+});
+
+test('by default the configured config.yaml is never written', () => {
+    const cmd = S.opArgv('update-api', UPD_SRV, UPD_PLAN)[2];
+    assert.match(cmd, /--exclude='\.\/release\/conf\/config\.yaml'/,
+        'the upstream file must be excluded, not restored afterwards');
+});
+
+test('replacing config.yaml is opt-in, and only then is the exclude dropped', () => {
+    const reset = S.opArgv('update-api', UPD_SRV, Object.assign({}, UPD_PLAN, { resetConfig: true }))[2];
+    assert.ok(reset.indexOf('--exclude') === -1, 'the operator asked for the upstream file');
+    // ...and a copy is still taken, so "reset" is recoverable.
+    assert.match(reset, /cp -a '\/opt\/rustdesk-api\/conf\/config\.yaml'/);
+});
+
+test('the checksum is verified BEFORE the service is stopped or anything unpacked', () => {
+    const cmd = S.opArgv('update-api', UPD_SRV, UPD_PLAN)[2];
+    const verify = cmd.indexOf('sha256sum -c -');
+    const stop = cmd.indexOf('systemctl stop');
+    const unpack = cmd.indexOf('tar xzf');
+    assert.ok(verify > 0 && stop > 0 && unpack > 0, 'all three steps must be present');
+    assert.ok(verify < stop, 'a corrupt download must not reach a running server');
+    assert.ok(verify < unpack, 'and must never be unpacked');
+});
+
+test('the update backs up the config and the database before touching anything', () => {
+    const cmd = S.opArgv('update-api', UPD_SRV, UPD_PLAN)[2];
+    assert.match(cmd, /cp -a '\/opt\/rustdesk-api\/conf\/config\.yaml' '\/opt\/rustdesk-api\/conf\/config\.yaml\.20260807T120000Z'/);
+    assert.match(cmd, /rustdeskapi\.db\.20260807T120000Z/);
+    // The db copy must not abort the update if the file is not there yet.
+    assert.match(cmd, /rustdeskapi\.db[^;]*\|\| true/);
+});
+
+test('the update fails loudly rather than leaving a half-installed server', () => {
+    for (const id of ['update-api', 'update-server']) {
+        const cmd = S.opArgv(id, UPD_SRV, UPD_PLAN)[2];
+        assert.ok(cmd.indexOf('set -e') === 0, id + ' must stop at the first failing command');
+        assert.match(cmd, /systemctl is-active/, id + ' must prove the service came back');
+    }
+});
+
+test('the server update keeps the keypair and the old binaries', () => {
+    const cmd = S.opArgv('update-server', UPD_SRV, UPD_PLAN)[2];
+    // The keypair lives in the data directory, not beside the binaries.
+    assert.ok(cmd.indexOf('id_ed25519') === -1, 'nothing may touch the keypair');
+    assert.match(cmd, /cp -a '\/usr\/local\/bin'\/\$b/, 'the old binaries are kept');
+    assert.match(cmd, /test -x '\/usr\/local\/bin\/hbbs'/, 'and the new one is proven executable');
+});
+
+test('both updates are destructive ops, so they inherit the confirmation', () => {
+    for (const id of ['update-api', 'update-server']) {
+        const op = S.OPS.find((o) => o.id === id);
+        assert.equal(op.danger, true, id + ' restarts a live service');
+        assert.ok(S.DANGER_OPS.indexOf(id) !== -1);
+        assert.ok(Array.isArray(op.impact) && op.impact.length >= 3);
+        assert.equal(typeof op.reversible, 'boolean');
+    }
+});
+
+test('the config choice is declared, defaults off, and states its cost', () => {
+    const op = S.OPS.find((o) => o.id === 'update-api');
+    assert.equal(op.options.length, 1);
+    assert.equal(op.options[0].key, 'resetConfig');
+    assert.match(op.options[0].warn, /id-server|key/i,
+        'the warning must name what is lost, not merely say "settings"');
+    const c = S.serverOpsUi({});
+    c.server = UPD_SRV;
+    c.request('update-api');
+    assert.equal(c.confirm.opts.resetConfig, false, 'every option starts off');
+    assert.deepEqual(c.confirmOptions().map((o) => o.key), ['resetConfig']);
+});
+
+test('an op with no options renders none', () => {
+    const c = S.serverOpsUi({});
+    c.server = UPD_SRV;
+    c.request('restart-hbbs');
+    assert.deepEqual(c.confirmOptions(), []);
+    assert.deepEqual(c.confirm.opts, {});
+});
+
+test('the plan comes from the check, and is null until one has run', () => {
+    const c = S.serverOpsUi({});
+    assert.equal(c.updatePlanFor('update-api'), null, 'no check, no release, no command');
+    c.updates = { 'update-api': { latest: '2.8', url: 'https://x/y', sha256: 'e'.repeat(64), stamp: 'z' } };
+    assert.deepEqual(c.updatePlanFor('update-api'),
+        { url: 'https://x/y', sha256: 'e'.repeat(64), version: '2.8', stamp: 'z' });
+});
+
+test('the dialog renders each option with its warning', () => {
+    const t = S.TEMPLATE;
+    assert.match(t, /x-for="o in confirmOptions\(\)"/);
+    assert.match(t, /x-model="confirm\.opts\[o\.key\]"/);
+    assert.match(t, /x-text="o\.warn"/, 'the cost is shown beside the choice');
 });

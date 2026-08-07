@@ -119,6 +119,45 @@
             why: 'Re-runs the port-reachability probe against this server.'
         }),
         Object.freeze({
+            id: 'update-api', label: 'Update API server', danger: true, needsCredential: true,
+            why: 'Downloads the configured API release, verifies its checksum, and installs it over ' +
+                'the running server.',
+            impact: Object.freeze([
+                'The API, admin console and address book are unavailable for a few seconds.',
+                'Screen-sharing sessions are NOT affected -- they never touch the API.',
+                'Your config.yaml is never written: the upstream one is excluded from the unpack, ' +
+                    'and a timestamped copy is taken first anyway.',
+                'The database is untouched -- the archive ships an empty data/ directory.'
+            ]),
+            reversible: true,
+            // A choice, not a policy. Keeping the configured file is right almost
+            // always -- it carries the id-server, the key and the TLS wiring, and
+            // losing it breaks every signed-in client. But a new API version can
+            // add keys the old file has never heard of, and an operator who wants
+            // to start from the shipped defaults should not have to edit the
+            // server by hand to get them. Default is KEEP; taking the upstream
+            // file is opt-in and says what it costs.
+            options: Object.freeze([Object.freeze({
+                key: 'resetConfig',
+                label: 'Also replace config.yaml with the upstream default',
+                warn: 'This discards the id-server, relay, key, TLS and web-client settings ' +
+                    'Pilot wrote. Signed-in clients stop working until the server is ' +
+                    'reconfigured. A timestamped copy of the current file is kept either way.'
+            })])
+        }),
+        Object.freeze({
+            id: 'update-server', label: 'Update RustDesk server', danger: true, needsCredential: true,
+            why: 'Downloads the configured hbbs/hbbr release, verifies its checksum, and replaces the ' +
+                'binaries.',
+            impact: Object.freeze([
+                'hbbs and hbbr restart, so devices re-register and relayed sessions are cut.',
+                'The id_ed25519 keypair is NOT touched, so no client needs reconfiguring.',
+                'Established direct sessions keep running -- they need neither daemon.',
+                'The previous binaries are kept beside the new ones with a .bak suffix.'
+            ]),
+            reversible: true
+        }),
+        Object.freeze({
             id: 'rotate-key', label: 'Rotate server keypair', danger: true, needsCredential: true,
             why: 'Regenerates the hbbs id_ed25519 keypair. Every already-deployed client ' +
                 'breaks until it is reconfigured with the new key — this cannot be undone ' +
@@ -177,7 +216,25 @@
         return u === '' ? 'root' : u;
     }
 
-    function opArgv(op, server) {
+    // Where downloads land, matching js/core/provision-plan.js's own cache so a
+    // re-run reuses the file instead of refetching it.
+    const CACHE_DIR = '/var/cache/pilot';
+    const API_DIR = '/opt/rustdesk-api';
+    const API_USER = 'rustdesk-api';
+    const BIN_DIR = '/usr/local/bin';
+
+    // The upstream config.yaml inside the API tarball. EXCLUDED from the unpack
+    // rather than restored afterwards: never writing it cannot half-fail, and a
+    // restore step can. Verified against the real v2.7 archive -- with this
+    // exclude the configured file is byte-identical afterwards, the database is
+    // untouched (the archive's data/ is an empty directory carrying no .db), and
+    // apimain and resources/version are updated.
+    const API_TAR_CONFIG = './release/conf/config.yaml';
+
+    // `plan` carries what the CHECK produced -- the asset url, its sha256 from
+    // the release metadata, and the version -- because an update command cannot
+    // be built without knowing which release it is installing.
+    function opArgv(op, server, plan) {
         const found = findOp(op);
         if (!found) return null;
         switch (found.id) {
@@ -206,6 +263,60 @@
             }
             case 'recheck-ports':
                 return ['ss', '-H', '-ltnu'];
+            case 'update-api': {
+                const p = (plan && typeof plan === 'object') ? plan : {};
+                const url = str(p.url), sha = str(p.sha256);
+                // No release chosen means nothing to install. Returning null
+                // blocks the op rather than running a command with an empty URL.
+                if (!url || !/^[0-9a-f]{64}$/.test(sha)) return null;
+                const tgz = CACHE_DIR + '/rustdesk-api-update.tar.gz';
+                const stamp = str(p.stamp) || 'bak';
+                return ['sh', '-c',
+                    'set -e; ' +
+                    'install -d -m 0755 ' + sq(CACHE_DIR) + '; ' +
+                    'curl -fsSL ' + sq(url) + ' -o ' + sq(tgz) + '; ' +
+                    // Verified BEFORE anything is stopped or unpacked: a corrupt
+                    // or substituted download must not reach a running server.
+                    'printf %s ' + sq(sha + '  ' + tgz) + ' | sha256sum -c -; ' +
+                    'cp -a ' + sq(API_DIR + '/conf/config.yaml') + ' ' +
+                        sq(API_DIR + '/conf/config.yaml.' + stamp) + '; ' +
+                    'cp -a ' + sq(API_DIR + '/data/rustdeskapi.db') + ' ' +
+                        sq(API_DIR + '/data/rustdeskapi.db.' + stamp) + ' 2>/dev/null || true; ' +
+                    'systemctl stop ' + UNIT.api + '; ' +
+                    // The exclude is what protects the configured file: it is
+                    // never written, rather than written and restored, because
+                    // "never happened" cannot half-fail. Dropping the exclude is
+                    // how the operator asks for the upstream file instead.
+                    'tar xzf ' + sq(tgz) + ' -C ' + sq(API_DIR) + ' --strip-components=2' +
+                        (p.resetConfig === true ? '' : ' --exclude=' + sq(API_TAR_CONFIG)) + '; ' +
+                    'test -x ' + sq(API_DIR + '/apimain') + '; ' +
+                    'chown -R ' + API_USER + ':' + API_USER + ' ' + sq(API_DIR) + '; ' +
+                    'systemctl start ' + UNIT.api + '; ' +
+                    'systemctl is-active ' + UNIT.api];
+            }
+            case 'update-server': {
+                const p = (plan && typeof plan === 'object') ? plan : {};
+                const url = str(p.url), sha = str(p.sha256);
+                if (!url || !/^[0-9a-f]{64}$/.test(sha)) return null;
+                const zip = CACHE_DIR + '/rustdesk-server-update.zip';
+                const stamp = str(p.stamp) || 'bak';
+                // The keypair lives in the DATA directory, not beside the
+                // binaries, so replacing the binaries cannot disturb it -- which
+                // is why no client needs reconfiguring after this.
+                return ['sh', '-c',
+                    'set -e; ' +
+                    'install -d -m 0755 ' + sq(CACHE_DIR) + '; ' +
+                    'curl -fsSL ' + sq(url) + ' -o ' + sq(zip) + '; ' +
+                    'printf %s ' + sq(sha + '  ' + zip) + ' | sha256sum -c -; ' +
+                    'for b in hbbs hbbr rustdesk-utils; do ' +
+                        'if [ -e ' + sq(BIN_DIR) + '/$b ]; then ' +
+                        'cp -a ' + sq(BIN_DIR) + '/$b ' + sq(BIN_DIR) + '/$b.' + stamp + '; fi; done; ' +
+                    'systemctl stop ' + UNIT.hbbs + ' ' + UNIT.hbbr + '; ' +
+                    'unzip -o -j ' + sq(zip) + ' -d ' + sq(BIN_DIR) + '; ' +
+                    'test -x ' + sq(BIN_DIR + '/hbbs') + '; ' +
+                    'systemctl start ' + UNIT.hbbs + ' ' + UNIT.hbbr + '; ' +
+                    'systemctl is-active ' + UNIT.hbbs + ' ' + UNIT.hbbr];
+            }
             case 'rotate-key': {
                 // `rm -f` on a missing path exits 0 — this op would otherwise
                 // report SUCCESS while rotating nothing, which is worse than an
@@ -448,6 +559,7 @@
             opBusy: {},             // per-op busy flag, keyed by op id
             confirm: null,           // { opId, typed } while a danger confirmation is open
             unitStates: [],          // [{key,unit,label,state}] from the last 'status' run
+            updates: {},              // { 'update-api': {latest,url,sha256,installed,stamp} }
             relaySessions: [],        // from the last 'relay-log' run
             relaySummary: null,
             output: {}               // free-text output per op id (doctor/recheck-ports/rotate-key)
@@ -526,7 +638,7 @@
     // caller and the stored secret carried no auth-type tag at all. A stored
     // PEM would have been sent to pilot-exec AS A PASSWORD (a clean
     // SSH_AUTH_FAILED, but with no way to explain the real cause).
-    function envelopeFor(opId, server, credential) {
+    function envelopeFor(opId, server, credential, plan) {
         const op = findOp(opId);
         const remote = server && server.transport === 'ssh';
         const authType = (credential && typeof credential.authType === 'string') ? credential.authType : 'password';
@@ -570,7 +682,7 @@
                 title: op.label,
                 mutating: !!op.danger,
                 why: op.why,
-                argv: opArgv(opId, server),
+                argv: opArgv(opId, server, plan),
                 write: null,
                 check: null,
                 sha256: null,
@@ -719,7 +831,15 @@
                 this.clearOpAlert(opId);
                 if (!isOpAllowed(opId, this.server)) return false;
                 const op = findOp(opId);
-                if (op.danger) { this.confirm = { opId: opId, typed: '' }; return true; }
+                if (op.danger) {
+                    // Options start FALSE: every one of them is a widening of
+                    // what the operation does, so the safe answer is the one the
+                    // operator gets without choosing.
+                    const opts = {};
+                    for (const o of (op.options || [])) opts[o.key] = false;
+                    this.confirm = { opId: opId, typed: '', opts: opts };
+                    return true;
+                }
                 return this.execute(opId);
             },
 
@@ -733,7 +853,28 @@
             confirmOp: function () {
                 const c = this.confirm;
                 const op = c ? findOp(c.opId) : null;
-                return op || { id: '', label: '', why: '', impact: [], reversible: true };
+                return op || { id: '', label: '', why: '', impact: [], reversible: true, options: [] };
+            },
+
+            // What a given update op should install. Populated by checkUpdates();
+            // null until then, which is what blocks the op -- opArgv() refuses to
+            // build a command without a release and a checksum.
+            updatePlanFor: function (opId) {
+                const found = (this.updates && this.updates[opId]) ? this.updates[opId] : null;
+                if (!found) return null;
+                return {
+                    url: found.url, sha256: found.sha256, version: found.latest,
+                    stamp: found.stamp || 'bak'
+                };
+            },
+
+            confirmOptions: function () {
+                const op = this.confirmOp();
+                return Array.isArray(op.options) ? op.options : [];
+            },
+
+            confirmOptOn: function (key) {
+                return !!(this.confirm && this.confirm.opts && this.confirm.opts[key]);
             },
 
             confirmDisabled: function () {
@@ -747,14 +888,15 @@
             confirmRun: function () {
                 if (this.confirmDisabled()) return false;
                 const opId = this.confirm.opId;
+                const opts = Object.assign({}, this.confirm.opts || {});
                 this.confirm = null;
-                return this.execute(opId);
+                return this.execute(opId, opts);
             },
 
             // The one method that touches the bridge. Every failure here is
             // recorded under opAlerts[opId] only — a failing op never taints
             // any other op or the surface's own alert (spec §7.2).
-            execute: function (opId) {
+            execute: function (opId, opts) {
                 const self = this;
                 const server = this.server;
                 if (!isOpAllowed(opId, server)) return Promise.resolve(false);
@@ -779,7 +921,11 @@
                 return credP.then(function (credential) {
                     if (!hasSpawn()) throw fail('GENERIC', 'This page cannot reach the system helper.', null);
                     let envelope;
-                    try { envelope = envelopeFor(opId, server, credential); }
+                    // The plan an update needs -- which release, its checksum --
+                    // comes from updatePlanFor(); the operator's choices from the
+                    // confirmation dialog are merged on top.
+                    const plan = Object.assign({}, self.updatePlanFor(opId), opts || {});
+                    try { envelope = envelopeFor(opId, server, credential, plan); }
                     catch (e) { throw describeError(e); }
 
                     const p = cockpit.spawn([EXEC, '--run'], { superuser: 'require', err: 'message' });
@@ -912,6 +1058,22 @@
         '                    ? \'This cannot be undone.\'',
         '                    : \'This is reversible: the service comes back on its own.\'"></strong>',
         '          </p>',
+        // Per-op choices. Each one WIDENS what the operation does, so each is off
+        // until chosen, and the cost is shown next to it rather than in a
+        // footnote -- "replace config.yaml" reads harmless until you know it
+        // discards the id-server and the key.
+        '          <template x-for="o in confirmOptions()" :key="o.key">',
+        '            <div class="form-check mb-2">',
+        '              <input class="form-check-input" type="checkbox"',
+        '                     :id="\'pilot-ops-opt-\' + o.key" :data-testid="\'confirm-opt-\' + o.key"',
+        '                     x-model="confirm.opts[o.key]">',
+        '              <label class="form-check-label" :for="\'pilot-ops-opt-\' + o.key" x-text="o.label"></label>',
+        '              <template x-if="confirmOptOn(o.key)">',
+        '                <div class="text-danger small" :data-testid="\'confirm-opt-\' + o.key + \'-warn\'"',
+        '                     x-text="o.warn"></div>',
+        '              </template>',
+        '            </div>',
+        '          </template>',
         '          <template x-if="confirm.opId === \'rotate-key\'">',
         '            <div class="mb-2">',
         '              <label class="form-label small" for="pilot-server-ops-confirm-id">',
