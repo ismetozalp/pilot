@@ -185,3 +185,108 @@ test('the page routes to Server Ops rather than only describing it', () => {
     assert.match(t, /pilot:open-tab/);
     assert.match(t, /id: 'server-ops'/);
 });
+
+
+// ===== FIELD REPORT: "put somewhere check for updates for api server and rustdesk server repository"
+//
+// The Server Ops check answers "is there something newer than what is
+// INSTALLED", and needs the target host to do it. This one is narrower and
+// belongs beside the fields: does this repository exist, can Pilot reach it,
+// and what is the newest thing in it. That catches a typo'd repo immediately
+// instead of it staying silent until an update check quietly finds nothing.
+
+function fakeSpawn(handler) {
+    const calls = [];
+    globalThis.cockpit = { spawn: (argv, opts) => { calls.push(argv); return handler(argv, opts); } };
+    return calls;
+}
+
+test('checkRepos looks up each configured repository and reports the newest release', async () => {
+    const calls = fakeSpawn(async () => JSON.stringify({ tag_name: 'v2.7', published_at: '2025-09-28T15:12:00Z' }));
+    try {
+        const c = UI.settingsUi({ settings: fakeStore() });
+        await c.load();
+        await c.checkRepos();
+        assert.equal(calls.length, 3, 'one lookup per configured field');
+        for (const k of UI.FIELD_KEYS) {
+            assert.equal(c.latestFor(k).ok, true, k);
+            assert.equal(c.latestFor(k).tag, 'v2.7');
+            assert.equal(c.latestFor(k).published, '2025-09-28', 'the date is trimmed to a day');
+        }
+        // Every request must go through the host: manifest.json sets
+        // connect-src 'self', so a browser fetch() to api.github.com is blocked.
+        for (const argv of calls) {
+            assert.equal(argv[0], 'curl');
+            assert.ok(argv.some((a) => /^https:\/\/api\.github\.com\/repos\//.test(a)), argv.join(' '));
+        }
+    } finally { delete globalThis.cockpit; }
+});
+
+test('an empty field is skipped, not reported as a failure', async () => {
+    const calls = fakeSpawn(async () => JSON.stringify({ tag_name: 'v1' }));
+    try {
+        const c = UI.settingsUi({ settings: fakeStore() });
+        await c.load();
+        c.values.apiRepo = '';
+        await c.checkRepos();
+        assert.equal(c.latestFor('apiRepo'), null, 'an opt-out is not an error');
+        assert.equal(calls.length, 2, 'and it costs no request');
+    } finally { delete globalThis.cockpit; }
+});
+
+test('a repository that does not exist says so plainly, not "curl exited 22"', async () => {
+    fakeSpawn(async () => { throw new Error('curl: (22) The requested URL returned error: 404'); });
+    try {
+        const c = UI.settingsUi({ settings: fakeStore() });
+        await c.load();
+        await c.checkRepos();
+        const r = c.latestFor('apiRepo');
+        assert.equal(r.ok, false);
+        assert.match(r.message, /No such repository, or it is private/,
+            'the operator needs the cause, not curl\'s exit status');
+    } finally { delete globalThis.cockpit; }
+});
+
+test('a repository with no releases is distinguished from one that is missing', async () => {
+    fakeSpawn(async () => JSON.stringify({ message: 'Not Found' }));
+    try {
+        const c = UI.settingsUi({ settings: fakeStore() });
+        await c.load();
+        await c.checkRepos();
+        assert.equal(c.latestFor('repo').ok, false);
+        assert.match(c.latestFor('repo').message, /published no release/);
+    } finally { delete globalThis.cockpit; }
+});
+
+test('checking never throws, and always clears its busy flag', async () => {
+    fakeSpawn(async () => { throw new Error('network is unreachable'); });
+    try {
+        const c = UI.settingsUi({ settings: fakeStore() });
+        await c.load();
+        await c.checkRepos();
+        assert.equal(c.checking, false, 'a failed check must not leave the button spinning');
+        assert.equal(c.latestFor('repo').ok, false);
+    } finally { delete globalThis.cockpit; }
+});
+
+test('with no cockpit the check reports it rather than crashing the surface', async () => {
+    const c = UI.settingsUi({ settings: fakeStore() });
+    await c.load();
+    await c.checkRepos();
+    assert.equal(c.latestFor('repo').ok, false);
+    assert.match(c.latestFor('repo').message, /Cockpit is not available/);
+});
+
+test('the result renders per field, and distinguishes success from failure', () => {
+    const t = UI.TEMPLATE;
+    assert.match(t, /data-testid="settings-check"/, 'the button exists');
+    assert.ok(t.indexOf("'settings-' + f.key + '-latest'") !== -1,
+        'each field shows its own result');
+    assert.match(t, /text-success/);
+    assert.match(t, /text-danger/, 'a failure must not read like a success');
+    assert.match(t, /Latest release: /);
+    // Same spinner trap as everywhere else in this codebase.
+    const spinners = t.match(/<span class="spinner-border[^>]*>/g) || [];
+    assert.ok(spinners.length >= 2, 'both the check and the save button spin');
+    for (const sp of spinners) assert.ok(!/x-show/.test(sp), 'x-show loses to a display utility');
+});

@@ -113,6 +113,14 @@
             values: { repo: '', apiRepo: '', serverRepo: '' },
             checkOnStartup: true,
             errors: { repo: '', apiRepo: '', serverRepo: '' },
+            // The newest release each configured repository publishes, looked up
+            // on demand. Deliberately does NOT compare against what is installed:
+            // that needs the target host, and lives on Server Ops. What this
+            // answers is narrower and useful right here -- does this repository
+            // exist, can Pilot reach it, and what is the newest thing in it. A
+            // typo'd repo is otherwise silent until an update check finds nothing.
+            latest: { repo: null, apiRepo: null, serverRepo: null },
+            checking: false,
             busy: false,
             notice: null,
             error: null
@@ -149,6 +157,54 @@
             },
 
             fieldError(key) { return this.errors[key] || ''; },
+            latestFor(key) { return this.latest[key] || null; },
+
+            // One release document, fetched through the host: manifest.json sets
+            // connect-src 'self', so a browser fetch() to api.github.com is
+            // blocked outright -- it appears to work in a unit test and fails
+            // silently in the browser.
+            async fetchLatest(repo) {
+                const Upd = root.PilotUpdate ||
+                    (typeof require === 'function' ? require('./update.js') : null);
+                const api = (Upd && typeof Upd.releasesApiUrl === 'function')
+                    ? Upd.releasesApiUrl(repo) : '';
+                if (!api) return { ok: false, message: 'Not a repository Pilot can query.' };
+                if (typeof cockpit === 'undefined' || !cockpit || typeof cockpit.spawn !== 'function')
+                    return { ok: false, message: 'Cockpit is not available to make the request.' };
+                try {
+                    const out = await cockpit.spawn(
+                        ['curl', '-fsSL', '--max-time', '20',
+                            '-H', 'Accept: application/vnd.github+json', api],
+                        { err: 'message' });
+                    const doc = JSON.parse(str(out));
+                    const tag = str(doc && doc.tag_name);
+                    if (!tag) return { ok: false, message: 'The repository published no release.' };
+                    return { ok: true, tag: tag, published: str(doc.published_at).slice(0, 10) };
+                } catch (e) {
+                    // A 404 from curl -f is the common case and means the repo
+                    // does not exist or is private -- worth saying plainly rather
+                    // than echoing curl's exit status.
+                    const m = str(e && e.message);
+                    return { ok: false, message: /404/.test(m)
+                        ? 'No such repository, or it is private.'
+                        : (m || 'The request failed.') };
+                }
+            },
+
+            async checkRepos() {
+                this.checking = true;
+                this.notice = null;
+                try {
+                    for (const k of FIELD_KEYS) {
+                        const v = str(this.values[k]).trim();
+                        // An empty field is a deliberate opt-out, not a failure.
+                        this.latest[k] = v === '' ? null : await this.fetchLatest(v);
+                    }
+                } finally {
+                    this.checking = false;
+                }
+                return true;
+            },
 
             // Validation runs per field on the way in, so a bad value is reported
             // where it was typed rather than as one message for the whole form.
@@ -250,6 +306,14 @@
         '                 :class="fieldError(f.key) ? \'is-invalid\' : \'\'"',
         '                 placeholder="owner/name">',
         '          <div class="form-text" x-text="f.why"></div>',
+        '          <template x-if="latestFor(f.key)">',
+        '            <div class="small" :data-testid="\'settings-\' + f.key + \'-latest\'"',
+        '                 :class="latestFor(f.key).ok ? \'text-success\' : \'text-danger\'"',
+        '                 x-text="latestFor(f.key).ok',
+        '                   ? \'Latest release: \' + latestFor(f.key).tag +',
+        '                     (latestFor(f.key).published ? \' (\' + latestFor(f.key).published + \')\' : \'\')',
+        '                   : latestFor(f.key).message"></div>',
+        '          </template>',
         '          <template x-if="fieldError(f.key)">',
         '            <div class="invalid-feedback d-block" :data-testid="\'settings-\' + f.key + \'-error\'"',
         '                 x-text="fieldError(f.key)"></div>',
@@ -262,6 +326,13 @@
         '        <label class="form-check-label" for="pilot-set-startup">',
         '          Check for updates when Pilot opens</label>',
         '      </div>',
+        '      <button type="button" class="btn btn-outline-primary me-2" data-testid="settings-check"',
+        '              @click="checkRepos()" :disabled="checking || !canSave()">',
+        '        <template x-if="checking">',
+        '          <span class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span>',
+        '        </template>',
+        '        <span x-text="checking ? \'Checking…\' : \'Check repositories\'"></span>',
+        '      </button>',
         '      <button type="button" class="btn btn-primary me-2" data-testid="settings-save"',
         '              @click="save()" :disabled="!canSave()">',
         '        <template x-if="busy">',
