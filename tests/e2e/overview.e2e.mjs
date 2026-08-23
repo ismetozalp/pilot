@@ -541,6 +541,80 @@ export default async function run(ctx) {
             await page.ctx.close();
         }
     });
+
+    // The whole round trip for an expired token, in a real browser: the surface
+    // that reported the failure is the one that recovers from it. Before this,
+    // Overview printed "Recommended: sign in again on this server." and offered
+    // nowhere to do it -- the token is minted once, at provisioning handover,
+    // and the server's token-expire retires it a week later.
+    await check('overview: an expired token can be signed back in from the surface that reports it', async () => {
+        const page = await openOverview(ctx);
+        try {
+            await page.evaluate(() => {
+                window.__login = [];
+                window.__written = [];
+                // What rustdesk-api actually answers for an expired token: HTTP
+                // 200, with the real status in the BODY. Measured on a live
+                // server, and the reason api-client.js reads the body code
+                // before it reads any prose.
+                const expired = { status: 200,
+                    body: { code: 403, message: 'Please log in first.', data: null } };
+                let signedIn = false;
+                window.PilotApi.setTransport(async (req) => {
+                    const path = (req && req.path) || '';
+                    if (path.indexOf('/api/admin/login') === 0) {
+                        // api-client.js serialises the body to JSON before any
+                        // transport sees it, so this is the literal wire text.
+                        window.__login.push(String(req.body || ''));
+                        signedIn = true;
+                        return { status: 200, body: { code: 0, message: '', data: { token: 'minted' } } };
+                    }
+                    if (!signedIn) return expired;
+                    return { status: 200, body: { code: 0, message: '', data:
+                        { list: [{ id: '1', alias: 'a', online: true, last_online: 1754222400 }],
+                          page: 1, total: 1, page_size: 50 } } };
+                });
+                window.PilotOverview.setRegistry({
+                    list: async () => [{ id: 'alpha', name: 'Head office',
+                        domain: 'rd.example.com', tlsTier: 'own' }],
+                    active: async () => 'alpha',
+                    setActive: async () => {},
+                    writeSecret: async (id, kind, value) => { window.__written.push([id, kind, value]); }
+                });
+                // js/app.js owns the transport and re-reads the token on this
+                // event. Here it stands in for that re-wire.
+                document.addEventListener('pilot:credentials-changed', () => { window.__rewired = true; });
+            });
+            await page.click('#pilot-overview [data-test="refresh"]');
+
+            assertOk(await visible(page, '#pilot-overview [data-test="sign-in"]'),
+                'an expired token offers a way back in, not just an explanation');
+            await shot(page, 'overview-signin-needed');
+
+            await page.fill('#pilot-overview [data-test="sign-in-password"]', 'hunter2');
+            await page.click('#pilot-overview [data-test="sign-in-submit"]');
+
+            await waitTotal(page, '1', 'after signing back in');
+            const out = await page.evaluate(() => ({
+                login: window.__login, written: window.__written,
+                rewired: !!window.__rewired,
+                left: document.querySelector('#pilot-overview [data-test="sign-in-password"]').value
+            }));
+            assertEqual(out.login.length, 1, 'exactly one sign-in was attempted');
+            const sent = JSON.parse(out.login[0]);
+            assertEqual(sent.username, 'admin', 'signs in as the one administrator');
+            assertEqual(sent.password, 'hunter2', 'with the password that was typed');
+            assertEqual(JSON.stringify(out.written), JSON.stringify([['alpha', 'token', 'minted']]),
+                'the new token is stored as the server token sidecar');
+            assertOk(out.rewired, 'the shell is told to re-read the token it just stored');
+            assertEqual(out.left, '', 'the password is not left sitting in the DOM');
+            assertOk(!(await visible(page, '#pilot-overview [data-test="sign-in"]')),
+                'the card goes away once the server accepts the new token');
+            await shot(page, 'overview-signin-recovered');
+        } finally {
+            await page.ctx.close();
+        }
+    });
 }
 
 if (isMain(import.meta.url)) process.exit(await runScenario(run, name) ? 1 : 0);

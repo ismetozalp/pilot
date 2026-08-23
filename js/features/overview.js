@@ -26,6 +26,13 @@
 
     const MOUNT_ID = 'pilot-overview';
     const WIZARD_EVENT = 'pilot:open-wizard';
+    // js/app.js listens for this and re-runs wireApi(), which re-reads the
+    // token from disk. It exists because a freshly stored token was otherwise
+    // never picked up: the transport is built once, at load.
+    const CREDENTIALS_EVENT = 'pilot:credentials-changed';
+    // rustdesk-api has exactly one administrator account, and setup-ui.js signs
+    // in as this same name at handover.
+    const ADMIN_USER = 'admin';
     const SUMMARY_PAGE_SIZE = 200;
     const MAX_FIELD = 200;
 
@@ -175,6 +182,14 @@
         return true;
     }
 
+    function notifyCredentialsChanged(target) {
+        const t = target || root.document || null;
+        if (!t || typeof t.dispatchEvent !== 'function') return false;
+        if (typeof root.CustomEvent !== 'function') return false;
+        t.dispatchEvent(new root.CustomEvent(CREDENTIALS_EVENT, { detail: {}, bubbles: true }));
+        return true;
+    }
+
     // ------------------------------------------------------------ errors
 
     function errorMessage(e) {
@@ -216,6 +231,22 @@
     function remediationLabel(e) {
         const r = remediationOf(e);
         return has(REMEDIATION_LABEL, r) ? REMEDIATION_LABEL[r] : '';
+    }
+
+    // `captcha-threshold: 3` in the provisioned config means the fourth wrong
+    // password does not answer "wrong password" -- it answers
+    //     {"code":101,"message":"Captcha error.","data":null}
+    // and then answers that for the CORRECT password too, because the counter is
+    // per account and does not care that the credentials are now right. Handing
+    // the raw string through leaves someone retyping a password that already
+    // works. Restarting the API server clears the count (the counter is in
+    // memory: the config declares no cache backend and none is written to disk).
+    function signInFailure(e) {
+        if (errorMessage(e).toLowerCase().indexOf('captcha') === -1) return e;
+        return fail('API_AUTH_FAILED',
+            'The API server is asking for a captcha. It does that after three failed ' +
+            'sign-ins, and then keeps asking even when the password is right. Restart ' +
+            'the API server from Server Ops to clear it, then sign in here again.');
     }
 
     function fail(kind, message, detail) {
@@ -267,6 +298,9 @@
             summaryError: null,
             registryError: null,
             actionError: null,
+            signInPassword: '',
+            signInBusy: false,
+            signInError: null,
 
             hasApi() {
                 return !!(this.api && this.api.devices && typeof this.api.devices.list === 'function');
@@ -274,6 +308,59 @@
             errorText(e) { return errorMessage(e); },
             errorRemediation(e) { return remediationOf(e); },
             errorRemediationLabel(e) { return remediationLabel(e); },
+
+            // Pilot has printed "Recommended: sign in again on this server."
+            // since the first release while offering nowhere to do it. The token
+            // is minted once, at provisioning handover, and `token-expire: 168h`
+            // retires it a week later; from then on every admin call answers
+            //     200  {"code":403,"message":"Please log in first."}
+            // and the console is stuck -- the only way back was to re-run the
+            // wizard. This is the missing half of that remediation.
+            needsSignIn() {
+                return kindOf(this.summaryError) === 'API_AUTH_FAILED';
+            },
+
+            async signIn() {
+                const pw = str(this.signInPassword);
+                if (!pw) {
+                    this.signInError = fail('API_AUTH_FAILED',
+                        'Enter the administrator password for this API server.');
+                    return false;
+                }
+                const reg = this.currentRegistry();
+                const id = str(this.activeId);
+                if (!this.api || !this.api.users || typeof this.api.users.login !== 'function' ||
+                    !reg || typeof reg.writeSecret !== 'function' || !id) {
+                    this.signInError = fail('GENERIC',
+                        'Pilot cannot store a token for this server.');
+                    return false;
+                }
+                this.signInBusy = true;
+                this.signInError = null;
+                try {
+                    const session = await this.api.users.login(ADMIN_USER, pw);
+                    const token = session && (session.token || (session.data && session.data.token));
+                    if (!token) {
+                        throw fail('API_AUTH_FAILED',
+                            'The API server accepted the sign-in but returned no token.');
+                    }
+                    await reg.writeSecret(id, 'token', str(token));
+                    // The shell owns the transport (js/app.js wireApi()), and
+                    // this event is what makes it re-read the token. Building one
+                    // here would be a SECOND place that decides the endpoint --
+                    // the duplication that once left password changes talking to
+                    // host:21114 instead of the domain behind Caddy.
+                    notifyCredentialsChanged(this.doc || root.document || null);
+                    this.signInPassword = '';
+                    await this.refresh(true);
+                    return true;
+                } catch (e) {
+                    this.signInError = signInFailure(e);
+                    return false;
+                } finally {
+                    this.signInBusy = false;
+                }
+            },
 
             // See the comment above pilotOverview(): only an EXPLICIT registry
             // (passed as a constructor dep, including explicit null) is fixed;
@@ -495,6 +582,37 @@
         '    <button type="button" class="btn btn-sm btn-outline-dark ms-2" data-test="summary-retry"',
         '            @click="refresh(true)">Try again</button>',
         '  </div>',
+        // Placed directly under the error that provokes it: the banner says
+        // "sign in again on this server", and this is where that happens.
+        // <template x-if> rather than x-show for the busy line -- x-show sets an
+        // inline `display`, which any Bootstrap d-* utility overrides with
+        // !important, and that is what once left the "not connected" banner on
+        // screen after connecting.
+        '  <div class="card border-warning mb-3" data-test="sign-in" x-show="needsSignIn()">',
+        '    <div class="card-body">',
+        '      <h3 class="h6">Sign in to this server</h3>',
+        '      <p class="text-secondary small mb-2">',
+        '        Pilot signs in once when it provisions a server and stores the token it is',
+        '        handed. That token expires, and this server has stopped accepting it, which',
+        '        is why nothing above could be counted. Enter the administrator password to',
+        '        get a new one.</p>',
+        '      <div class="row g-2">',
+        '        <div class="col-sm-6">',
+        '          <label class="form-label" for="pilot-signin-password">Administrator password</label>',
+        '          <input class="form-control form-control-sm" type="password" id="pilot-signin-password"',
+        '                 autocomplete="current-password" data-test="sign-in-password"',
+        '                 x-model="signInPassword" @keydown.enter="signIn()" :disabled="signInBusy">',
+        '        </div>',
+        '      </div>',
+        '      <button type="button" class="btn btn-sm btn-primary mt-2" data-test="sign-in-submit"',
+        '              @click="signIn()" :disabled="signInBusy">Sign in</button>',
+        '      <template x-if="signInBusy">',
+        '        <span class="text-secondary small ms-2" data-test="sign-in-busy">Signing in…</span>',
+        '      </template>',
+        '      <div class="alert alert-danger mt-2 mb-0" data-test="sign-in-error" x-show="signInError"',
+        '           x-text="errorText(signInError)"></div>',
+        '    </div>',
+        '  </div>',
         '  <div class="card">',
         '    <div class="card-body">',
         '      <h3 class="h6">Administration</h3>',
@@ -544,6 +662,7 @@
         MOUNT_ID, WIZARD_EVENT, TEMPLATE, REASON, FALLBACK_SERVER,
         validDomain, normTier, serverRow, normalizeServers, webClientLink,
         wizardDetail, openWizardTls, emptySummary,
+        CREDENTIALS_EVENT, ADMIN_USER, notifyCredentialsChanged, signInFailure,
         setRegistry, registry, pilotOverview, mount
     };
     root.PilotOverview = PilotOverview;

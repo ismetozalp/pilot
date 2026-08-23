@@ -13,6 +13,14 @@ RustDesk client that would not connect.
 
 ### Changed
 
+- **Sessions last a year rather than a week** (`app.token-expire` and
+  `jwt.expire-duration`, both raised from the upstream `168h` to `8760h`). The two
+  bound the same session from different ends, so the shorter one silently wins and
+  they are now pinned equal by a test. This governs every token the server issues:
+  Pilot's own, and every signed-in RustDesk client — which previously had to sign
+  in again weekly. Existing servers keep whatever is in their `config.yaml`;
+  nothing rewrites it.
+
 - **`hbbs`/`hbbr` are now installed from
   [`wy414012/rustdesk-server`](https://github.com/wy414012/rustdesk-server) 1.4.3
   instead of the official `rustdesk/rustdesk-server` 1.1.16.** Official `hbbs`
@@ -56,6 +64,23 @@ RustDesk client that would not connect.
   copy is taken either way.
 
 ### Fixed
+
+- **An expired token can now be signed back in, from Overview.** Pilot mints its
+  admin token once, at provisioning handover, and the server's `token-expire`
+  retires it. From that moment every admin call answered HTTP 200 with
+  `{"code":403,"message":"Please log in first."}` and the console was stuck —
+  while printing "Recommended: sign in again on this server.", a remediation that
+  had never had anywhere to happen. Overview now shows a sign-in card when, and
+  only when, the failure is an authentication failure; it stores the new token in
+  the same 0600 sidecar and asks the shell to re-read it, so the transport is
+  still built in exactly one place. Measured on a live deployment: provisioned
+  2026-08-06, dead 2026-08-13.
+- **The captcha lockout is explained instead of passed through.** `captcha-threshold: 3`
+  means the fourth wrong password stops answering "wrong password" and starts
+  answering `{"code":101,"message":"Captcha error."}` — and keeps answering it
+  for the *right* password, because the counter does not care that the
+  credentials are now correct. The raw string sent people back to retype a
+  password that already worked.
 
 - Renaming a device now also updates its **address-book alias**. A device name lives
   in two tables on a rustdesk-api server and only the peer row was being written, so

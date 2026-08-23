@@ -66,7 +66,7 @@ app:
   captcha-threshold: 3
   ban-threshold: 0
   show-swagger: 1
-  token-expire: 168h
+  token-expire: 8760h
   web-sso: true
   disable-pwd-login: false
 admin:
@@ -89,7 +89,7 @@ logger:
   report-caller: true
 jwt:
   key: ""
-  expire-duration: 168h
+  expire-duration: 8760h
 proxy:
   enable: false
 rustdesk:

@@ -976,6 +976,28 @@ test('config.yaml carries the release defaults, because an omitted key is a ZERO
 });
 
 
+test('the two session lifetimes are set together, because the shorter one wins', () => {
+    // app.token-expire and jwt.expire-duration bound the SAME session from
+    // different ends: raising one alone changes nothing, silently. Both govern
+    // every user token the server issues -- Pilot's own admin token and every
+    // signed-in RustDesk client.
+    //
+    // Upstream ships 168h. Pilot mints its admin token exactly once, at
+    // provisioning handover, so at a week the console locked itself out with no
+    // way back: measured on a live deployment, provisioned 2026-08-06, expired
+    // 2026-08-13, and every admin call then answered HTTP 200 with
+    // {"code":403,"message":"Please log in first."} on a healthy server.
+    const cfg = byId(P.build(detAdopt(), choices()), 'configure').write.content;
+    const token = /\n  token-expire: (\d+)h\n/.exec(cfg);
+    const jwt = /\n  expire-duration: (\d+)h\n/.exec(cfg);
+    assert.ok(token, 'app.token-expire is missing');
+    assert.ok(jwt, 'jwt.expire-duration is missing');
+    assert.equal(token[1], jwt[1],
+        'the shorter of the two wins, so a change to one alone does nothing');
+    assert.ok(Number(token[1]) > 168,
+        'a week is what expired the console in the field: ' + token[1] + 'h');
+});
+
 test('the download step names the fork, so an operator approving the plan sees the origin', () => {
     const OT = require('../../js/core/ostarget.js');
     const plan = P.build(detFresh(), choices({ installHbbs: true }));

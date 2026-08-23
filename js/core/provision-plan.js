@@ -255,7 +255,17 @@
             '  captcha-threshold: 3\n' +
             '  ban-threshold: 0\n' +
             '  show-swagger: 1\n' +
-            '  token-expire: 168h\n' +
+            // A YEAR, not the upstream week. This governs every user token the
+            // server issues -- Pilot's admin token AND every signed-in RustDesk
+            // client -- and Pilot mints its own exactly once, at handover. At
+            // 168h that token was dead seven days later, after which every admin
+            // call answered 200 {"code":403,"message":"Please log in first."}
+            // on a server that was otherwise healthy. Measured on a live
+            // deployment: provisioned 2026-08-06, expired 2026-08-13, and the
+            // console had no way back because nothing re-mints it. Overview's
+            // sign-in card is the recovery; this is what stops needing it weekly,
+            // and it also stops signing every RustDesk user out once a week.
+            '  token-expire: 8760h\n' +
             '  web-sso: true\n' +
             '  disable-pwd-login: false\n' +
             'admin:\n' +
@@ -278,7 +288,9 @@
             '  report-caller: true\n' +
             'jwt:\n' +
             '  key: ""\n' +
-            '  expire-duration: 168h\n' +
+            // Kept equal to app.token-expire above: these two bound the same
+            // session from different ends, and the shorter one silently wins.
+            '  expire-duration: 8760h\n' +
             'proxy:\n' +
             '  enable: false\n' +
             'rustdesk:\n' +

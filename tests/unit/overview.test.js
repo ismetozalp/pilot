@@ -697,3 +697,134 @@ test('the disabled reasons talk about the admin console, not the web client', ()
         assert.ok(!/web client/.test(r), 'reason still mentions the web client: ' + r);
     }
 });
+
+// --- signing in again ----------------------------------------------------
+//
+// The token is minted once, at provisioning handover, and the server's
+// `token-expire` retires it. Until now the console printed "Recommended: sign
+// in again on this server." and offered nowhere to do it, so an expired token
+// meant re-running the wizard. Measured on a live deployment: provisioned
+// 2026-08-06, expired 2026-08-13, and every admin call from then on answered
+// HTTP 200 with {"code":403,"message":"Please log in first."}.
+
+function signInHarness(over) {
+    const o = over || {};
+    const fired = [];
+    const written = [];
+    const doc = { dispatchEvent: (ev) => { fired.push(ev); return true; }, addEventListener() {} };
+    const api = fakeApi({ alpha: DEVICES });
+    api.users = {
+        login: o.login || (async (u, p) => { api.loginCalls.push([u, p]); return { token: 'fresh-token' }; })
+    };
+    api.loginCalls = [];
+    const reg = fakeRegistry();
+    reg.writeSecret = o.writeSecret ||
+        (async (id, kind, value) => { written.push([id, kind, value]); });
+    const c = O.pilotOverview({ api, registry: reg, doc, now: () => NOW });
+    c.activeId = 'alpha';
+    return { c, api, reg, doc, fired, written };
+}
+
+function withCustomEvent(fn) {
+    const had = typeof globalThis.CustomEvent === 'function';
+    if (!had) globalThis.CustomEvent = function (n, o) { this.type = n; this.detail = o && o.detail; };
+    try { return fn(); } finally { if (!had) delete globalThis.CustomEvent; }
+}
+
+test('the sign-in card appears for an expired token, and for nothing else', () => {
+    const { c } = signInHarness();
+    assert.equal(c.needsSignIn(), false);
+    c.summaryError = Errors.create('API_UNREACHABLE', 'down');
+    assert.equal(c.needsSignIn(), false);
+    c.summaryError = Errors.create('API_AUTH_FAILED', 'Please log in first.');
+    assert.equal(c.needsSignIn(), true);
+});
+
+test('signing in stores the new token and tells the shell to re-read it', async () => {
+    await withCustomEvent(async () => {
+        const { c, api, fired, written } = signInHarness();
+        c.signInPassword = 'hunter2';
+        assert.equal(await c.signIn(), true);
+        // Signed in as the one administrator rustdesk-api has.
+        assert.deepEqual(api.loginCalls, [['admin', 'hunter2']]);
+        assert.deepEqual(written, [['alpha', 'token', 'fresh-token']]);
+        // The shell (js/app.js wireApi()) owns the transport. This event is the
+        // ONLY thing that makes it re-read the token; building a transport here
+        // would be a second place that decides the endpoint.
+        assert.equal(fired.length, 1);
+        assert.equal(fired[0].type, 'pilot:credentials-changed');
+        assert.equal(fired[0].type, O.CREDENTIALS_EVENT);
+        // Never left in the DOM after it has been spent.
+        assert.equal(c.signInPassword, '');
+        assert.equal(c.signInBusy, false);
+        assert.equal(c.signInError, null);
+    });
+});
+
+test('a token nested under data is accepted too', async () => {
+    await withCustomEvent(async () => {
+        const { c, written } = signInHarness({ login: async () => ({ data: { token: 'nested' } }) });
+        c.signInPassword = 'pw';
+        assert.equal(await c.signIn(), true);
+        assert.deepEqual(written, [['alpha', 'token', 'nested']]);
+    });
+});
+
+test('an empty password never reaches the server', async () => {
+    const { c, api, written } = signInHarness();
+    assert.equal(await c.signIn(), false);
+    assert.deepEqual(api.loginCalls, []);
+    assert.deepEqual(written, []);
+    assert.equal(Errors.normalize(c.signInError.kind), 'API_AUTH_FAILED');
+});
+
+test('a sign-in that returns no token is a failure, not a stored empty string', async () => {
+    const { c, written } = signInHarness({ login: async () => ({ code: 0 }) });
+    c.signInPassword = 'pw';
+    assert.equal(await c.signIn(), false);
+    assert.deepEqual(written, []);
+    assert.equal(Errors.normalize(c.signInError.kind), 'API_AUTH_FAILED');
+    assert.equal(c.signInBusy, false);
+});
+
+test('the captcha lockout is explained, not passed through raw', async () => {
+    const { c } = signInHarness({
+        login: async () => { throw Errors.create('GENERIC', 'Captcha error.'); }
+    });
+    c.signInPassword = 'pw';
+    assert.equal(await c.signIn(), false);
+    const m = c.signInError.message;
+    // `captcha-threshold: 3` starts answering "Captcha error." for the RIGHT
+    // password too, so the raw string sends people back to retype a password
+    // that already works.
+    assert.ok(/three failed sign-ins/.test(m), m);
+    assert.ok(/Server Ops/.test(m), m);
+    assert.equal(Errors.normalize(c.signInError.kind), 'API_AUTH_FAILED');
+});
+
+test('any other sign-in failure is reported as itself', async () => {
+    const boom = Errors.create('API_UNREACHABLE', 'connection refused');
+    const { c } = signInHarness({ login: async () => { throw boom; } });
+    c.signInPassword = 'pw';
+    assert.equal(await c.signIn(), false);
+    assert.equal(c.signInError, boom);
+});
+
+test('the busy flag is cleared even when the write fails', async () => {
+    const { c } = signInHarness({ writeSecret: async () => { throw new Error('EACCES'); } });
+    c.signInPassword = 'pw';
+    assert.equal(await c.signIn(), false);
+    assert.equal(c.signInBusy, false);
+});
+
+test('the template carries the sign-in controls the card needs', () => {
+    const t = O.TEMPLATE;
+    assert.ok(t.includes('data-test="sign-in"'));
+    assert.ok(t.includes('data-test="sign-in-password"'));
+    assert.ok(t.includes('data-test="sign-in-submit"'));
+    assert.ok(t.includes('x-show="needsSignIn()"'));
+    assert.ok(/type="password"/.test(t));
+    // x-show sets an inline display, which a Bootstrap d-* utility overrides
+    // with !important -- the bug that once left the "not connected" banner up.
+    assert.ok(t.includes('<template x-if="signInBusy">'));
+});
