@@ -5,6 +5,21 @@ All notable changes to Pilot are recorded here. The format follows
 [semantic versioning](https://semver.org/) — `VERSION` is the single source of
 truth, read by the Makefile and by the self-updater.
 
+## 1.0.2 — 2026-08-23
+
+### Fixed
+
+- **The theme picker's colour swatches are legible.** Each swatch was a single
+  square filled with that theme's `--bs-body-bg` alone — and every dark palette's
+  background sits between `#1a1b26` and `#2e3440`, so the picker offered ten
+  near-black squares that nothing but the label distinguished. Each swatch is now
+  three bands — background, surface and accent — taken from that palette's own
+  block, with the accent given the widest band because it is the part that
+  actually differs: Aqua's teal, Gruvbox's orange, Dracula's purple, Rosé Pine's
+  rose. Two tests pin it, since a swatch is the one piece of CSS whose entire job
+  is to be recognisable and nothing else fails when it drifts: every swatch must
+  carry its own palette's accent, and no two swatches may be identical.
+
 ## 1.0.1 — 2026-08-23
 
 The first published build. Everything here came from running 1.0.0 against a live

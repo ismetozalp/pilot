@@ -160,6 +160,50 @@ test('every theme has a swatch colour for the picker', () => {
         assert.ok(css.includes('.pl-swatch-' + id), 'no swatch for ' + id);
 });
 
+// The picker used to show one square per theme, filled with that theme's
+// --bs-body-bg alone. Every dark palette's background sits between #1a1b26 and
+// #2e3440, so on screen they were ten indistinguishable near-black squares and
+// only the label told them apart -- reported from the running console. The
+// swatch now carries the palette's accent too, which is the part that actually
+// differs. These two tests pin that, because a swatch is the one piece of CSS
+// whose whole job is to be *recognisable*: nothing else fails when it drifts.
+
+function swatchRule(css, id) {
+    const m = new RegExp('\\.pl-swatch-' + id + '\\s*\\{([^}]*)\\}').exec(css);
+    return m ? m[1].replace(/\s+/g, ' ').trim() : null;
+}
+
+test('each theme swatch shows that palette\u2019s own accent, not just its background', () => {
+    const css = fs.readFileSync(CSS, 'utf8');
+    for (const id of T.ids()) {
+        // 'system' resolves to light or dark at runtime and has no palette of
+        // its own; its swatch is the split square that says exactly that.
+        if (id === 'system' || id === 'light' || id === 'dark') continue;
+        const block = new RegExp('\\[data-bs-theme="' + id + '"\\]\\s*\\{([^}]*)\\}').exec(css);
+        assert.ok(block, id + ' has no palette block');
+        const accent = /--bs-primary:\s*(#[0-9a-fA-F]{3,8})/.exec(block[1]);
+        assert.ok(accent, id + ' declares no --bs-primary');
+        const rule = swatchRule(css, id);
+        assert.ok(rule, 'no swatch rule for ' + id);
+        assert.ok(rule.toLowerCase().includes(accent[1].toLowerCase()),
+            id + ' swatch omits its own accent ' + accent[1] + ': ' + rule);
+    }
+});
+
+test('no two theme swatches are identical', () => {
+    const css = fs.readFileSync(CSS, 'utf8');
+    const seen = new Map();
+    for (const id of T.ids()) {
+        const rule = swatchRule(css, id);
+        assert.ok(rule, 'no swatch rule for ' + id);
+        const prev = seen.get(rule);
+        assert.equal(prev, undefined,
+            'the picker cannot tell ' + id + ' from ' + prev + ': both are ' + rule);
+        seen.set(rule, id);
+    }
+    assert.equal(seen.size, T.ids().length);
+});
+
 test('css/themes.css contains no literal control byte', () => {
     // Invisible in an editor, survives copy-paste unpredictably.
     const css = fs.readFileSync(CSS, 'utf8');
