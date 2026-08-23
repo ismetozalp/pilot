@@ -884,3 +884,64 @@ test('only ONE place builds an ab.addPeer request', () => {
     assert.equal(hits, 1, "ab.addPeer must be built in exactly one place; " +
         'call PilotApi.addressbook.addPeer() instead of re-issuing it');
 });
+
+
+// ========== FIELD REPORT: "Please log in first." shown as an unexplained error
+//
+// Overview and Devices both rendered the API's raw sentence
+// "Please log in first. (/api/admin/peer/list?page=1&page_size=200)" with a
+// "Try again" button -- a generic failure with no remediation, for what is
+// simply an expired or unreadable token.
+//
+// Measured against the real server: an auth failure arrives as HTTP **200**
+// with the real status buried in the BODY.
+//
+//     200  {"code":403,"message":"Please log in first.","data":null}
+//
+// The status checks therefore never fire, and classification fell through to a
+// regex over the English message -- which missed, because /login/ does not match
+// "log in". Two separate reasons it was fragile, and the second is the worse
+// one: `app.lang` makes that message localizable, so matching prose would have
+// broken again for any non-English server even after fixing the spelling.
+
+test('an auth failure carried in the BODY code is recognised, whatever the prose', () => {
+    // Exactly what this server sends.
+    assert.equal(C.errorKindFor(200, 403, 'Please log in first.'), 'API_AUTH_FAILED');
+    // The same code with a message in another language must classify identically:
+    // the number is the only part of the response that is not localizable.
+    assert.equal(C.errorKindFor(200, 403, '请先登录'), 'API_AUTH_FAILED');
+    assert.equal(C.errorKindFor(200, 403, ''), 'API_AUTH_FAILED');
+    assert.equal(C.errorKindFor(200, 401, 'anything at all'), 'API_AUTH_FAILED');
+});
+
+test('a body code of 404/501 is a version mismatch, matching the HTTP-status rule', () => {
+    assert.equal(C.errorKindFor(200, 404, 'no such route'), 'API_VERSION_MISMATCH');
+    assert.equal(C.errorKindFor(200, 501, ''), 'API_VERSION_MISMATCH');
+});
+
+test('the message fallback still works, and now covers both spellings', () => {
+    // For a server that sends a bare non-zero code with a descriptive message.
+    assert.equal(C.errorKindFor(200, 1, 'token expired'), 'API_AUTH_FAILED');
+    assert.equal(C.errorKindFor(200, 1, 'please log in first'), 'API_AUTH_FAILED');
+    assert.equal(C.errorKindFor(200, 1, 'login required'), 'API_AUTH_FAILED');
+    assert.equal(C.errorKindFor(200, 1, 'permission denied'), 'API_AUTH_FAILED');
+});
+
+test('nothing else moved: success, generic failure, and the HTTP-status rules', () => {
+    assert.equal(C.errorKindFor(200, 0, ''), 'OK');
+    assert.equal(C.errorKindFor(200, null, ''), 'OK');
+    assert.equal(C.errorKindFor(200, 1, 'disk full'), 'GENERIC');
+    assert.equal(C.errorKindFor(401, null, ''), 'API_AUTH_FAILED');
+    assert.equal(C.errorKindFor(403, null, ''), 'API_AUTH_FAILED');
+    assert.equal(C.errorKindFor(404, null, ''), 'API_VERSION_MISMATCH');
+    assert.equal(C.errorKindFor(500, null, ''), 'API_UNREACHABLE');
+    assert.equal(C.errorKindFor(0, null, ''), 'API_UNREACHABLE');
+});
+
+test('an auth failure now carries a remediation, which is the point of classifying it', () => {
+    // GENERIC recommends nothing; API_AUTH_FAILED tells the operator to sign in
+    // again. That difference is the whole reason the misclassification mattered.
+    const E = require('../../js/core/errors.js');
+    assert.notEqual(E.remediation('API_AUTH_FAILED'), E.remediation('GENERIC'));
+    assert.equal(E.remediation('API_AUTH_FAILED'), 'reauthorize');
+});

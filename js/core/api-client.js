@@ -236,8 +236,24 @@
         if (code === null || code === undefined) return 'OK';
         const n = numeric(code);
         if (n === 0) return 'OK';
+        // rustdesk-api answers an auth failure with HTTP 200 and puts the real
+        // status in the BODY:
+        //
+        //     200  {"code":403,"message":"Please log in first.","data":null}
+        //
+        // So the numeric code is checked first. It is the only part of that
+        // response that is not localizable -- `app.lang` changes the message, and
+        // matching English prose means every other locale silently degrades to
+        // GENERIC. Which is what happened here: "Please log in first." never
+        // matched /login/ because the API writes "log in" with a space, so a
+        // plain auth failure surfaced as an unexplained generic error with the
+        // raw server sentence and no remediation.
+        if (n === 401 || n === 403) return 'API_AUTH_FAILED';
+        if (n === 404 || n === 501) return 'API_VERSION_MISMATCH';
         const m = str(message).toLowerCase();
-        if (/token|unauthor|login|permission|forbidden|expired|credential/.test(m)) {
+        // Kept as a fallback for servers that send a bare non-zero code with a
+        // descriptive message. "log ?in" covers both spellings.
+        if (/token|unauthor|log ?in|permission|forbidden|expired|credential/.test(m)) {
             return 'API_AUTH_FAILED';
         }
         return 'GENERIC';
