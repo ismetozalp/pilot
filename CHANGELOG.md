@@ -5,11 +5,39 @@ All notable changes to Pilot are recorded here. The format follows
 [semantic versioning](https://semver.org/) — `VERSION` is the single source of
 truth, read by the Makefile and by the self-updater.
 
-## 1.0.0 — 2026-08-07
+## 1.0.1 — 2026-08-23
 
-First stable release. Everything below was found by running Pilot against a real
-deployment rather than by review: four devices, a remote EC2 target, and a
-RustDesk client that would not connect.
+The first published build. Everything here came from running 1.0.0 against a live
+deployment for a fortnight: a token quietly expired, and the console had no way
+to say so or to recover.
+
+### Fixed
+
+- **An expired token can now be signed back in, from Overview.** Pilot mints its
+  admin token once, at provisioning handover, and the server's `token-expire`
+  retires it. From that moment every admin call answered HTTP 200 with
+  `{"code":403,"message":"Please log in first."}` and the console was stuck —
+  while printing "Recommended: sign in again on this server.", a remediation that
+  had never had anywhere to happen. Overview now shows a sign-in card when, and
+  only when, the failure is an authentication failure; it stores the new token in
+  the same 0600 sidecar and asks the shell to re-read it, so the transport is
+  still built in exactly one place. Measured on a live deployment: provisioned
+  2026-08-06, dead 2026-08-13.
+- **The captcha lockout is explained instead of passed through.** `captcha-threshold: 3`
+  means the fourth wrong password stops answering "wrong password" and starts
+  answering `{"code":101,"message":"Captcha error."}` — and keeps answering it
+  for the *right* password, because the counter does not care that the
+  credentials are now correct. The raw string sent people back to retype a
+  password that already worked.
+- **An authentication failure is now recognised as one.** `rustdesk-api` reports
+  an expired or missing token as **HTTP 200** with the real status in the body —
+  `{"code":403,"message":"Please log in first.","data":null}`. Pilot classified on
+  the HTTP status and then pattern-matched English prose, and its pattern was
+  `/login/`, which never matches "log in" with a space. Every auth failure was
+  therefore rendered as a generic error offering "Try again", which could not work.
+  The body's numeric code is now read first, so the classification does not depend
+  on the server's `app.lang` — matching English would have degraded silently on any
+  other locale.
 
 ### Changed
 
@@ -20,6 +48,15 @@ RustDesk client that would not connect.
   Pilot's own, and every signed-in RustDesk client — which previously had to sign
   in again weekly. Existing servers keep whatever is in their `config.yaml`;
   nothing rewrites it.
+
+
+## 1.0.0 — 2026-08-07
+
+First stable release. Everything below was found by running Pilot against a real
+deployment rather than by review: four devices, a remote EC2 target, and a
+RustDesk client that would not connect.
+
+### Changed
 
 - **`hbbs`/`hbbr` are now installed from
   [`wy414012/rustdesk-server`](https://github.com/wy414012/rustdesk-server) 1.4.3
@@ -64,23 +101,6 @@ RustDesk client that would not connect.
   copy is taken either way.
 
 ### Fixed
-
-- **An expired token can now be signed back in, from Overview.** Pilot mints its
-  admin token once, at provisioning handover, and the server's `token-expire`
-  retires it. From that moment every admin call answered HTTP 200 with
-  `{"code":403,"message":"Please log in first."}` and the console was stuck —
-  while printing "Recommended: sign in again on this server.", a remediation that
-  had never had anywhere to happen. Overview now shows a sign-in card when, and
-  only when, the failure is an authentication failure; it stores the new token in
-  the same 0600 sidecar and asks the shell to re-read it, so the transport is
-  still built in exactly one place. Measured on a live deployment: provisioned
-  2026-08-06, dead 2026-08-13.
-- **The captcha lockout is explained instead of passed through.** `captcha-threshold: 3`
-  means the fourth wrong password stops answering "wrong password" and starts
-  answering `{"code":101,"message":"Captcha error."}` — and keeps answering it
-  for the *right* password, because the counter does not care that the
-  credentials are now correct. The raw string sent people back to retype a
-  password that already worked.
 
 - Renaming a device now also updates its **address-book alias**. A device name lives
   in two tables on a rustdesk-api server and only the peer row was being written, so

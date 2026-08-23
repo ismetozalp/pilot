@@ -608,8 +608,13 @@ export default async function run(ctx) {
                 'the new token is stored as the server token sidecar');
             assertOk(out.rewired, 'the shell is told to re-read the token it just stored');
             assertEqual(out.left, '', 'the password is not left sitting in the DOM');
-            assertOk(!(await visible(page, '#pilot-overview [data-test="sign-in"]')),
-                'the card goes away once the server accepts the new token');
+            // waitForSelector('hidden') waits for the card to GO, which is the
+            // claim. visible() returns false only after its whole timeout
+            // elapses, so it would instead demand the card be hidden for the
+            // full window -- and one stale in-flight expired response landing
+            // late is enough to fail that without anything being wrong.
+            await page.waitForSelector('#pilot-overview [data-test="sign-in"]',
+                { state: 'hidden', timeout: WAIT });
             await shot(page, 'overview-signin-recovered');
         } finally {
             await page.ctx.close();
